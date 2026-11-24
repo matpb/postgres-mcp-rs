@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="postgres-mcp-rs">
+  <defs>
+    <linearGradient id="pgmcp-bg" x1="0" y1="0" x2="0" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2a6f9e"/>
+      <stop offset="1" stop-color="#1b4a70"/>
+    </linearGradient>
+  </defs>
+  <rect width="100" height="100" rx="22" fill="url(#pgmcp-bg)"/>
+  <ellipse cx="50" cy="32" rx="26" ry="10" fill="#fff"/>
+  <circle cx="50" cy="32" r="5.5" fill="#1b4a70"/>
+  <path d="M24 39A26 10 0 0 0 76 39V50A26 10 0 0 1 24 50Z" fill="#fff"/>
+  <path d="M24 57A26 10 0 0 0 76 57V68A26 10 0 0 1 24 68Z" fill="#f08a4b"/>
+</svg>

@@ -1,0 +1,95 @@
+# Security
+
+This document describes what postgres-mcp-rs defends against, how each defence is built, and what remains open. Read it before you expose the server to anything beyond your own machine.
+
+## Threat model
+
+**Trusted:** the operator. The operator chooses the database role, writes the configuration, decides which network the server listens on, and runs the process.
+
+**Not trusted:**
+
+- The AI client, and anything that can make it send SQL. That includes text the model reads from the database or from other tools, which can carry instructions (prompt injection).
+- Other web pages open in a browser on the same machine. A page can send requests to `127.0.0.1` unless the Origin check stops it (see the residual risks below).
+- The data in the database. Its contents are returned to the model as data, and nothing in them is executed.
+- The network between the server and the database, unless TLS with verification is used.
+
+**Goal:** a client that sends any SQL, from any source, cannot change data, change session state, reach the server's files or processes, or read anything the database role cannot read. Within what the role can read, the client may read all of it, one capped page at a time. That exposure is by design, and the role is how you limit it.
+
+## Defence layers
+
+Each layer is independent. None is claimed to be sufficient alone. The code location is given for each one.
+
+**1. Database role (operator).** The role's privileges are the final limit on what can be read. A role with only `SELECT` cannot write, and cannot see tables it was not granted. The README gives the recipe. `default_transaction_read_only` is set for the role, and the server also requests it at connect time. Locations: README "Create a read-only role"; `connect_config` in `src/config.rs`.
+
+**2. Session pinning.** Every connection starts with fixed parameters: `DateStyle`, `IntervalStyle`, `TimeZone`, `bytea_output`, `extra_float_digits`, `standard_conforming_strings` and `default_transaction_read_only`. Before any user SQL runs on a checked-out connection, the server reads those values back, along with `client_encoding` and `current_user = session_user`. A mismatch closes the connection. Pinning `standard_conforming_strings` keeps the server's string parsing the same as the parser gate's. Locations: `connect_config` in `src/config.rs`; `SESSION_CHECK` and `verify_session` in `src/pg/session.rs`.
+
+**3. Read-only transaction.** Each call runs inside `BEGIN READ ONLY` with the timeouts described in layer 4, and the transaction is always rolled back. PostgreSQL refuses writes in a read-only transaction, so a statement that slipped past the gate still cannot write. Location: `begin_sql` and `run_held` in `src/pg/session.rs`.
+
+**4. Time limits.** Each statement is limited by `statement_timeout` (default 30 seconds). Lock waits are limited by `lock_timeout` (default 5 seconds). `idle_in_transaction_session_timeout` is the statement limit plus 10 seconds, and on PostgreSQL 17 and later `transaction_timeout` is the statement limit plus 5 seconds. The client waits for the statement limit plus a 5-second grace period, then sends a server-side cancel request and closes the connection instead of reusing it. Location: `begin_sql`, `run_held`, `stop_query` and `CLIENT_GRACE_MS` in `src/pg/session.rs`; `CancelHandle` in `src/pg/wire.rs`.
+
+**5. Session reset.** After a call, the connection gets `ROLLBACK` and then `DISCARD ALL`, sent as two messages, and must return to the idle state. Only then is it returned to the pool. A failed reset closes the connection. This stops session state from reaching the next caller: `SET`, prepared statements, temporary tables, session-level locks and `LISTEN`. Location: `reset`, `reset_and_release` in `src/pg/session.rs`.
+
+**6. Parser gate.** Before anything reaches the database, the SQL is parsed with PostgreSQL's own parser (`pg_query`). The gate then accepts only:
+
+- exactly one statement, of at most `MAX_SQL_BYTES` bytes, with no NUL byte;
+- statements built only from node types on an allow-list (`ALLOWED_NODES`), so an unknown construct is refused;
+- `SELECT`, `EXPLAIN` of a `SELECT` with options from an allow-list, and `SHOW`;
+- no `SELECT ... INTO`, no `FOR UPDATE` or `FOR SHARE`, and no data-modifying statement inside `WITH`;
+- no parameter placeholders, except that `explain_query` with `generic_plan` may contain them, and the tool then cannot bind them;
+- no function on the deny-list (`DENIED_FUNCTIONS`), matched by name or prefix, and no cron scheduling function when called as `cron.`;
+- a parse tree no deeper than 5000 levels, walked without recursion.
+
+Location: `check`, `analyse`, `walk`, `check_node`, `check_function` in `src/gate.rs`. The accept and reject corpus is in `tests/gate_corpus/allow.sql` and `tests/gate_corpus/deny.sql`, and `tests/gate.rs` also runs property tests that mutate the corpus.
+
+**7. Credential catalogs and secret settings.** Relations that hold credentials (`pg_authid`, `pg_shadow`, `pg_user_mapping`, `pg_subscription`, `pg_settings` and the file-settings views) are refused by name. Settings that can expose credentials or local paths (`primary_conninfo`, `ssl_key_file`, the archive and restore commands and similar) are refused in `SHOW` and in `current_setting`. `SHOW ALL` results drop the rows for those settings. Location: `CREDENTIAL_RELATIONS`, `SECRET_SETTINGS`, `check_relation`, `check_setting` in `src/gate.rs`; `is_secret_row` in `src/tools/envelope.rs`. The `server_info` tool reads a fixed list of settings that hold no credentials: `SERVER_INFO_SETTINGS` in `src/tools/core.rs`.
+
+**8. Result caps.** A call returns at most `MAX_ROWS` rows (default 1000), and the raw bytes of its values are capped by `MAX_RESPONSE_BYTES` (default 48000). Each value is cut at `MAX_VALUE_BYTES` (default 4096), and each `bytea` value at `MAX_BINARY_PREVIEW_BYTES` (default 256). A cut is always marked, and `truncated` tells the caller the result is partial. When a row or byte cap is reached, the client sends a cancel request so the server stops producing rows, then reads the connection back to a known state. Location: `keep_row` in `src/pg/wire.rs`; `build` in `src/tools/envelope.rs`; `src/encode/mod.rs`.
+
+**9. API key.** When `API_KEY` or `API_KEY_FILE` is set, `/mcp` requires the key. A key shorter than 16 characters stops startup. The presented key is hashed with SHA-256, and the digest is compared with the configured key's digest in constant time, so the comparison does not depend on the key's length or content. Location: `ApiKey` and `guard` in `src/http_guard.rs`; `MIN_API_KEY_CHARS` in `src/config.rs`.
+
+**10. Origin and Host validation.** The Origin check runs first. A request with an `Origin` header must come from a loopback origin (`localhost`, `127.0.0.1` or `[::1]`) or from an entry in `ALLOWED_ORIGINS`, and anything else gets 403. Requests without an `Origin` header are not checked by this layer. The Host check runs in the MCP layer and accepts `localhost`, `127.0.0.1`, `::1` and the entries in `ALLOWED_HOSTS`. Together these stop DNS rebinding and cross-site requests from ordinary web pages. Location: `origin_allowed` and `guard` in `src/http_guard.rs`; `build_router` in `src/server.rs`.
+
+**11. Loopback bind.** The HTTP listener binds `127.0.0.1` unless `MCP_HOST` says otherwise. The server logs a warning when it binds a non-loopback address without an API key. Location: `MCP_HOST` default in `src/config.rs`; the warning in `serve_http` in `src/server.rs`. The example compose file publishes the port on `127.0.0.1` only.
+
+**12. Container hardening.** The image is built on a distroless base, runs as `nonroot` (UID 65532), and has no shell. The example compose file runs it with a read-only root filesystem, all capabilities dropped, `no-new-privileges`, a process limit and a memory limit. Location: `Dockerfile`, `docker-compose.yml`. `scripts/docker-smoke.sh` checks these settings on the built image.
+
+**13. Audit line (detection, not prevention).** Each tool call writes one `audit` line. It holds the tool name, the database name, success, duration, row count, the SQLSTATE of a database error, and the first 16 hex characters of the SHA-256 of the SQL text. It holds no SQL text, values, error text, client address or key. Location: `record` in `src/audit.rs`, called from `call_tool` in `src/tools/mod.rs`.
+
+**14. Limits on work.** `MAX_CONCURRENT_REQUESTS` (default 16) bounds the requests handled at once on `/mcp`, and `MAX_REQUEST_BYTES` (default 1 MiB) bounds each request body. Each database has a bounded pool (4 connections by default, 1 to 64 in the JSON form), and a call waits at most 10 seconds for a free connection. Location: `limits` in `src/config.rs`; `POOL_WAIT` in `src/tools/mod.rs`; `Pool` in `src/pg/pool.rs`.
+
+**15. TLS.** `verify-full` checks the chain and the host name, `verify-ca` checks the chain only, and `require` and `prefer` verify nothing. The trusted roots are the `sslrootcert` file when given, and otherwise the bundled webpki roots. Location: `client_config` and `Verifier` in `src/pg/tls.rs`.
+
+**16. Log masking (best effort).** Passwords that appear in server log text, such as `PASSWORD` literals, `password=` pairs and URL passwords, are replaced with `***` before the text is returned. This is a convenience, not a guarantee. Location: `src/tools/logs/mask.rs`.
+
+## Residual risks
+
+These are the things the layers above do not stop. Read them as the boundary of the design.
+
+- **Functions the gate allows run inside the read-only transaction.** The gate decides by name and by node type. It cannot know what an arbitrary function does. A function that PUBLIC may execute, a user-defined function, or an extension function that is not on the deny-list can still run, including `pg_sleep`, `lo_get`, `pg_ls_logdir` and `pg_ls_waldir`. A function in an untrusted procedural language can act outside the database, for example on the server's files or network, with the operating system account of the PostgreSQL server. The read-only transaction stops ordinary writes, but it does not stop effects like these. Restrict `EXECUTE` on functions that the role must not run.
+- **Table ownership and volatile functions.** A role that owns tables, or that owns functions with side effects, has more ability than a reader. The gate blocks `ALTER`, `DROP` and `GRANT` statements, and the read-only transaction blocks writes, but the operator should not give the server's role ownership of anything.
+- **Remote data.** `dblink`, `dblink_exec` and `query_to_xml`-style functions are denied by name. A foreign table that the role can read is not denied: a `SELECT` on it reaches the remote server with the credentials in the user mapping. Do not give the role access to foreign tables that point at systems it should not reach.
+- **Exfiltration by design.** Whatever the role can read, the model can read, capped per call and repeatable page by page. There is no per-client quota and no record of what was read beyond the audit line's row count.
+- **Other people's query text.** With `pg_read_all_stats`, the role can see other sessions' statements (`list_activity`, `query_stats`). Those statements can contain literal values, including secrets that users typed into SQL.
+- **Server log content.** The log reader returns log text, which can contain statements with data values, and masking is best effort.
+- **Loopback origins.** The Origin check always allows loopback origins. A web page served from any loopback origin, such as a local development server, passes the Origin check. If no API key is set, such a page can call the tools. Set `API_KEY` on any machine where you run other web software.
+- **Denial of service.** Timeouts, pool limits, the request limit and the body limit bound the damage, but a client can keep every connection busy with expensive queries up to those limits. There is no per-client rate limit.
+- **Network and certificates.** `prefer` and `require` do not verify the server, so a network attacker can read or change traffic between the server and the database. Use `verify-full`.
+- **Shared API key.** One key is shared by every caller. The server cannot tell callers apart, so the audit line does not identify the person.
+- **Uncommon PostgreSQL features.** A gate allow-list is only as good as the node types it lists. New PostgreSQL versions can add syntax; the gate refuses unknown node types, but the corpus and the tests need updating for each new version.
+
+## Operator checklist
+
+1. Create a dedicated role with only the privileges it needs (see the README). Do not make it a superuser, a database owner or a member of a role that can write. Set `CONNECTION LIMIT`, and never share the role with an application.
+2. Use `PGSSLMODE=verify-full` (or `sslmode=verify-full`) for any database reached over a network. Set `sslrootcert` for a private certificate authority.
+3. When the server listens beyond loopback, set `API_KEY_FILE` to a random key of at least 32 characters, and keep it out of shell history and process listings.
+4. Put TLS in front of the server with a reverse proxy when it is reached over a network, and list the public host name in `ALLOWED_HOSTS`. Keep `MCP_HOST` on loopback when the proxy runs on the same machine.
+5. Rotate the API key by changing it and restarting the server. Rotate the database password with `ALTER ROLE`, and update the configuration.
+6. Revoke `EXECUTE` on functions that the role must never run, such as `pg_logical_emit_message`, if you do not want the server to be able to write WAL records.
+7. Keep `AUDIT_LOG` on, and send the server's stderr to your log system.
+8. Keep the container settings from the example compose file, and pin the image you deploy by digest.
+9. Do not put the server behind a connection pooler in transaction mode. It is not supported.
+10. Grant the log functions only to roles that need them. The `read_log_file` function exposes everything in the log directory that the role can name.
+
+## Reporting a vulnerability
+
+Report vulnerabilities privately through GitHub's private vulnerability reporting: open the repository's **Security** tab on `https://github.com/matpb/postgres-mcp-rs`, then choose **Report a vulnerability**. Do not open a public issue or pull request for a vulnerability. Include the version (`postgres-mcp --version`), the configuration you used with the secrets removed, and the steps to reproduce.
