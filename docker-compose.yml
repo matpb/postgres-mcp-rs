@@ -4,9 +4,9 @@ services:
     build: .
     image: postgres-mcp:local
     environment:
-      # Example: postgres://reader:<password>@db.example.com:5432/app?sslmode=require
+      # Example: postgres://reader:<password>@db.example.com:5432/app?sslmode=verify-full
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
-      # Optional bearer key, at least 16 characters; empty leaves the endpoint open.
+      # Optional API key, at least 16 characters; empty leaves the endpoint open.
       API_KEY: ${API_KEY:-}
       # Optional limits, uncomment to pass them through from the host environment.
       # MAX_ROWS: ${MAX_ROWS:-}

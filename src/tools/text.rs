@@ -141,15 +141,16 @@ pub const LIST_ACTIVITY_TITLE: &str = "Current sessions and locks";
 pub const LIST_ACTIVITY: &str = "Show what the server is doing now, from pg_stat_activity: each session's pid, user, database, \
      application, client address, state, wait event, how long its transaction and current query have been \
      running, the query text (cut to a preview), and blocked_by: the pids holding locks it waits for. \
-     Filter by state, minimum duration, user or database; set only_blocked to see lock waits and their \
-     blockers. Background workers are left out unless include_background is true. Without \
+     Filter by state, minimum duration or user; all_databases widens it beyond the current database; \
+     set only_blocked to see lock waits and their blockers. Background workers are left out unless include_background is true. Without \
      pg_read_all_stats (or pg_monitor) PostgreSQL hides other users' query text, application and state, \
      which then show as null. Passwords in query text are masked on a best-effort basis.";
 
 pub const QUERY_STATS_TITLE: &str = "Statement statistics";
 pub const QUERY_STATS: &str = "Top statements from pg_stat_statements: normalized query text, calls, total and mean execution \
      time, rows, shared blocks hit and read, and temp blocks written. order_by chooses the ranking \
-     (total_time, mean_time, calls, rows, io). Reports clearly when the extension is not installed, not \
+     (total_time, mean_time, calls, rows, io, temp); min_calls and contains narrow it, and all_databases \
+     includes statements from other databases. Reports clearly when the extension is not installed, not \
      in shared_preload_libraries, or when the role may not see other users' statements.";
 
 pub const DATABASE_STATS_TITLE: &str = "Database and server statistics";
@@ -163,7 +164,7 @@ pub const TABLE_STATS_TITLE: &str = "Table and index usage statistics";
 pub const TABLE_STATS: &str = "Per-table activity from pg_stat_user_tables and pg_statio_user_tables: sequential and index \
      scans, rows inserted, updated and deleted since the last reset, live and dead row estimates, last \
      vacuum and analyze times, sizes, and each index's scan count (unused indexes have 0). Limit it to a \
-     schema or a table; order_by picks the ranking (size, seq_scan, dead_rows, writes).";
+     schema or a table; order_by picks the ranking (size, seq_scan, idx_scan, dead_rows, writes, last_autovacuum).";
 
 pub const REPLICATION_STATUS_TITLE: &str = "Replication status";
 pub const REPLICATION_STATUS: &str = "Replication state of this server: whether it is in recovery, connected standbys with their lag, \
