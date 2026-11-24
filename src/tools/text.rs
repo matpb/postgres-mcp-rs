@@ -169,7 +169,7 @@ pub const REPLICATION_STATUS: &str = "Replication state of this server: whether 
 pub const READ_SERVER_LOG_TITLE: &str = "Read the PostgreSQL server log";
 pub const READ_SERVER_LOG: &str = "Read entries from the PostgreSQL server log files, newest first. Without filters it returns the \
      latest entries; filter with since/until (ISO timestamps), min_severity (DEBUG, INFO, NOTICE, WARNING, \
-     ERROR, FATAL, PANIC), contains (case-insensitive text), database, user and pid. Each entry has \
+     ERROR, FATAL, PANIC), contains (case-insensitive text), entry_database, user and pid. Each entry has \
      timestamp, severity, message and, when the log format provides them, user, database, pid, SQLSTATE, \
      detail, hint and the statement. jsonlog and csvlog files are parsed into fields; plain stderr logs are \
      returned line by line with the severity parsed from the line prefix when possible. Set list_files to \

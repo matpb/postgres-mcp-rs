@@ -5,7 +5,7 @@ pub mod envelope;
 pub mod logs;
 pub mod monitor;
 pub mod schema;
-// text.rs is committed unformatted and must not be edited; rustfmt leaves it alone.
+// text.rs holds every client-facing string; rustfmt leaves its layout alone.
 #[rustfmt::skip]
 pub mod text;
 pub mod timescale;
