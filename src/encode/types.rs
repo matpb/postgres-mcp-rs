@@ -186,7 +186,7 @@ pub fn builtin_type(oid: u32) -> Option<TypeInfo> {
         let elem = builtin_type(elem)?;
         return Some(TypeInfo {
             oid,
-            name: name.to_string(),
+            name: format!("{}[]", name.trim_start_matches('_')),
             kind: TypeKind::Array {
                 elem: Box::new(elem),
                 delim,

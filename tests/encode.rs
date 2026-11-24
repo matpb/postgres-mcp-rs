@@ -47,7 +47,7 @@ fn builtin_type_spot_checks() {
     assert_eq!(int4.kind, TypeKind::Int);
 
     let arr = ty(1007);
-    assert_eq!(arr.name, "_int4");
+    assert_eq!(arr.name, "int4[]");
     assert_eq!(
         arr.kind,
         TypeKind::Array {
@@ -84,7 +84,7 @@ fn builtin_type_spot_checks() {
     );
 
     let ra = ty(3905);
-    assert_eq!(ra.name, "_int4range");
+    assert_eq!(ra.name, "int4range[]");
     assert_eq!(
         ra.kind,
         TypeKind::Array {

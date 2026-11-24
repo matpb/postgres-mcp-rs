@@ -555,7 +555,7 @@ async fn types_resolved_for_non_builtin() {
         info(22, "int2vector", TypeKind::Text),
         info(
             1020,
-            "_box",
+            "box[]",
             TypeKind::Array {
                 elem: Box::new(info(603, "box", TypeKind::Text)),
                 delim: ';',
@@ -607,7 +607,7 @@ async fn builtin_types_need_no_lookup() {
     assert_eq!(pool.type_cache().lookups(), 0);
     assert_eq!(
         types.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-        ["int4", "text", "_box"]
+        ["int4", "text", "box[]"]
     );
 }
 

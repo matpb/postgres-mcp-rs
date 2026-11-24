@@ -38,7 +38,7 @@ pub const EXECUTE_QUERY: &str = "Run ONE read-only SQL statement and return its 
      - real, double precision: number; \"NaN\", \"Infinity\", \"-Infinity\" as strings.\n\
      - date, time, timestamp: ISO strings (\"2024-02-29 13:00:00.123456\"). timestamptz is always \
      shown in UTC and ends in \"+00\". \"infinity\", \"-infinity\" and a \" BC\" suffix can appear.\n\
-     - interval: ISO 8601 duration (\"P1Y2M3DT4H5M6S\").\n\
+     - interval: ISO 8601 duration (\"P1Y2M3DT4H5M6.789S\"; parts can be negative, \"P-1M2DT-3H\").\n\
      - json, jsonb: inlined as real JSON, numbers kept exact. A json value with duplicate keys comes \
      back as its original text.\n\
      - arrays: nested JSON arrays with elements encoded by the same rules, NULL as null. An array \
@@ -47,7 +47,8 @@ pub const EXECUTE_QUERY: &str = "Run ONE read-only SQL statement and return its 
      {\"empty\": true}; multiranges are arrays of those.\n\
      - bytea: \"\\x\" followed by hex, capped with a truncation marker.\n\
      - everything else (uuid, inet, money, enum, composite, geometric, tsvector, hstore, vector, \
-     PostGIS geometry, any extension type): the text PostgreSQL itself prints. Use to_jsonb(col), \
+     PostGIS geometry, any extension type): the text PostgreSQL itself prints. A domain is encoded \
+     as its base type. Use to_jsonb(col), \
      ST_AsGeoJSON(col) or col::text when you want another shape.\n\
      - Oversized text is cut and ends with \"…[truncated: X of Y bytes]\"; truncatedValues counts \
      them. Re-query with substr() for the rest. rawFallbacks counts values returned as raw text \
@@ -107,11 +108,13 @@ pub const LIST_OBJECTS: &str = "List objects in a database, optionally limited t
 
 pub const DESCRIBE_TABLE_TITLE: &str = "Describe a table or view";
 pub const DESCRIBE_TABLE: &str = "Full definition of one table, partitioned table, view, materialized view or foreign table. \
-     Give 'table' as a bare name with 'schema', or as schema.name. Returns: columns in order (type, \
+     Give 'table' as a bare name with 'schema', or as schema.name; a bare name found in several schemas \
+     is an error that lists them. Returns: columns in order (type, \
      nullability, default, identity, generated expression, collation, comment), primary key, unique and \
      check constraints, foreign keys in both directions (what it references and what references it), \
      indexes (definition, uniqueness, validity, size, number of scans), triggers, row-level security \
-     policies, partitioning (key, partitions, parent), inheritance, the view definition for views, owner, \
+     policies, partitioning (key, parent, and up to 200 partitions, with partitionsTruncated when there \
+     are more), inheritance, the view definition for views, owner, \
      comment, sizes in bytes, the estimated row count and when it was last vacuumed and analyzed. A section \
      the role may not read is null with a matching '<section>Error', never silently empty.";
 
@@ -139,8 +142,9 @@ pub const LIST_ACTIVITY: &str = "Show what the server is doing now, from pg_stat
      application, client address, state, wait event, how long its transaction and current query have been \
      running, the query text (cut to a preview), and blocked_by: the pids holding locks it waits for. \
      Filter by state, minimum duration, user or database; set only_blocked to see lock waits and their \
-     blockers. Without pg_read_all_stats (or pg_monitor) other users' query text is hidden by PostgreSQL \
-     and shows as null.";
+     blockers. Background workers are left out unless include_background is true. Without \
+     pg_read_all_stats (or pg_monitor) PostgreSQL hides other users' query text, application and state, \
+     which then show as null. Passwords in query text are masked on a best-effort basis.";
 
 pub const QUERY_STATS_TITLE: &str = "Statement statistics";
 pub const QUERY_STATS: &str = "Top statements from pg_stat_statements: normalized query text, calls, total and mean execution \

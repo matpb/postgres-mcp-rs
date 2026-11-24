@@ -268,7 +268,7 @@ async fn execute_query_encodes_every_type_exactly() {
             "numeric",
             "float8",
             "bool",
-            "_int4",
+            "int4[]",
             "int4range",
             "jsonb",
             "bytea"
