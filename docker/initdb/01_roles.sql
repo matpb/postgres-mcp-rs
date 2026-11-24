@@ -1,3 +1,4 @@
+\set ON_ERROR_STOP on
 -- Test-only roles. Never reuse these passwords.
 CREATE ROLE mcp_ro LOGIN PASSWORD 'test-only-ro' CONNECTION LIMIT 20;
 GRANT pg_read_all_data, pg_monitor TO mcp_ro;

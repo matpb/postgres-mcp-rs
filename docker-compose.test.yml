@@ -28,6 +28,7 @@ services:
       - "127.0.0.1:15432:5432"
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - ./sql:/sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d appdb && psql -U postgres -d appdb -Atc 'select 1 from pgmcp_seed_done' "]
       interval: 2s
@@ -49,6 +50,7 @@ services:
       - "127.0.0.1:15433:5432"
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - ./sql:/sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d appdb && psql -U postgres -d appdb -Atc 'select 1 from pgmcp_seed_done' "]
       interval: 2s
@@ -60,8 +62,10 @@ services:
     environment: *pg-env
     ports:
       - "127.0.0.1:15434:5432"
+    command: [postgres, -c, logging_collector=on, -c, log_destination=stderr, -c, log_min_duration_statement=0]
     volumes:
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+      - ./sql:/sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d appdb && psql -U postgres -d appdb -Atc 'select 1 from pgmcp_seed_done' "]
       interval: 2s
