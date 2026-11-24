@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 
 IMAGE=postgres-mcp:smoke
 NAME=pgmcp-smoke
+STDIO_NAME=pgmcp-smoke-stdio
 COMPOSE=(docker compose -f docker-compose.test.yml)
 DATABASE_URL='postgres://mcp_ro:test-only-ro@pg19:5432/appdb?sslmode=disable'
 API_KEY_VALUE='smoke-test-key-0123456789'
@@ -45,6 +46,9 @@ TMP=$(mktemp -d)
 cleanup() {
     if docker container inspect "$NAME" >/dev/null 2>&1; then
         docker rm -f "$NAME" >/dev/null
+    fi
+    if docker container inspect "$STDIO_NAME" >/dev/null 2>&1; then
+        docker rm -f "$STDIO_NAME" >/dev/null
     fi
     rm -rf "$TMP"
     if [ "$STARTED_STACK" -eq 1 ] && [ "$KEEP" -eq 0 ]; then
@@ -172,5 +176,36 @@ echo "==> docker exec id fails (no shell in image)"
 readonly_rootfs=$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$NAME")
 [ "$readonly_rootfs" = true ] || fail "ReadonlyRootfs is '$readonly_rootfs', expected true"
 echo "==> ReadonlyRootfs true"
+
+# stdio: requests are fed until the id 2 reply appears (at most 30 s), then stdin closes and the server exits.
+STDIO_INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0.0.0"}}}'
+STDIO_INITIALIZED='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+STDIO_CALL='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute_query","arguments":{"sql":"SELECT 42 AS answer"}}}'
+STDIO_OUT="$TMP/stdio.out"
+STDIO_ERR="$TMP/stdio.err"
+: >"$STDIO_OUT"
+stdio_status=0
+# shellcheck disable=SC2094 # the subshell reads the reply file that docker writes, on purpose
+(
+    printf '%s\n' "$STDIO_INIT" "$STDIO_INITIALIZED" "$STDIO_CALL"
+    waited=0
+    until grep -qF '"id":2' "$STDIO_OUT" || [ "$waited" -ge 300 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+) | timeout 30 docker run --rm -i --name "$STDIO_NAME" --network pgmcp-test_default \
+    -e "DATABASE_URL=$DATABASE_URL" "$IMAGE" stdio >"$STDIO_OUT" 2>"$STDIO_ERR" || stdio_status=$?
+[ "$stdio_status" -eq 0 ] || fail "stdio run exited $stdio_status, expected 0 (124 is the 30 s timeout)"
+command -v python3 >/dev/null || fail "python3 is needed to check the stdio output"
+python3 -c '
+import json, sys
+lines = sys.stdin.read().splitlines()
+if not lines:
+    sys.exit("no stdout lines")
+for line in lines:
+    json.loads(line)
+' <"$STDIO_OUT" || fail "stdio stdout has a line that is not JSON"
+grep -qF '"answer":42' "$STDIO_OUT" || fail "stdio reply does not contain \"answer\":42"
+echo "==> stdio tools/call SELECT 42 -> \"answer\":42"
 
 echo "docker-smoke: OK image=${size_mib} MiB"

@@ -254,3 +254,11 @@ pub const EXPLAIN_QUERY_WAL_PARAM: &str = "Include WAL usage; needs analyze (Pos
 pub const EXPLAIN_QUERY_MEMORY_PARAM: &str = "Include planner memory usage (PostgreSQL 17 or newer).";
 pub const EXPLAIN_QUERY_SERIALIZE_PARAM: &str = "Measure the time to convert the output for transfer; needs analyze (PostgreSQL 17 or newer).";
 pub const EXPLAIN_QUERY_GENERIC_PLAN_PARAM: &str = "Plan with generic parameters so the statement may contain $1 placeholders (PostgreSQL 16 or newer); not with analyze.";
+
+pub const RESOURCE_DATABASE_TITLE: &str = "Database";
+pub const RESOURCE_DATABASE_DESCRIPTION: &str = "Summary of this database: PostgreSQL version, TimescaleDB version when installed, schemas with their object counts, and installed extensions.";
+pub const RESOURCE_SCHEMA_TITLE: &str = "Schema";
+pub const RESOURCE_SCHEMA_DESCRIPTION: &str = "Tables, views, materialized views, sequences and functions of one schema, with comments, estimated rows and sizes. Same content as the list_objects tool.";
+pub const RESOURCE_TABLE_TITLE: &str = "Table or view";
+pub const RESOURCE_TABLE_DESCRIPTION: &str = "Full definition of one table or view: columns, keys, indexes, policies and statistics. Same content as the describe_table tool.";
+pub const UNKNOWN_RESOURCE_URI: &str = "Unknown resource URI. Use postgres://<database>, postgres://<database>/<schema> or postgres://<database>/<schema>/<table>.";

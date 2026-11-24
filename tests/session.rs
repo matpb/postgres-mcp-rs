@@ -724,3 +724,82 @@ async fn stale_idle_connection_is_replaced() {
     assert_ne!(new, old);
     assert_eq!(one(&pool, "SELECT 1").await, "1");
 }
+
+/// Prepared statements, cursors, LISTEN, temp tables, work_mem and advisory locks, in the order of `LEFTOVER_SQL`.
+const LEFTOVER_SQL: [&str; 6] = [
+    "SELECT count(*) FROM pg_catalog.pg_prepared_statements",
+    // Named cursors only: an extended-protocol query lists its own unnamed portal in pg_cursors.
+    "SELECT count(*) FROM pg_catalog.pg_cursors WHERE name <> ''",
+    "SELECT count(*) FROM pg_catalog.pg_listening_channels()",
+    "SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace = pg_catalog.pg_my_temp_schema()",
+    "SELECT pg_catalog.current_setting('work_mem')",
+    "SELECT count(*) FROM pg_catalog.pg_locks WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid()",
+];
+
+/// Every value of `LEFTOVER_SQL` on an open connection.
+async fn leftovers_on(conn: &mut Connection) -> Vec<String> {
+    let mut values = Vec::new();
+    for sql in LEFTOVER_SQL {
+        let result = conn.simple_query(sql).await.expect("leftover query");
+        values.push(result.rows[0][0].clone().expect("non-null value"));
+    }
+    values
+}
+
+/// The leftovers of `leave_state()` run as an ordinary function, and the same function run on the pooled
+/// read-only connection, whose next caller must see none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn state_left_by_a_function_is_gone_for_the_next_caller() {
+    for (port, major) in VERSIONS {
+        let work_mem_default = scalar(port, "SHOW work_mem").await;
+
+        // Control: on a plain superuser connection the function's changes persist, so the check can see them.
+        let mut plain = Connection::connect(&superuser_config(port))
+            .await
+            .expect("superuser connect");
+        let plain_steps = plain
+            .simple_query("SELECT sess_test.leave_state()")
+            .await
+            .expect("control call");
+        assert_eq!(
+            plain_steps.rows[0][0].as_deref(),
+            Some("7"),
+            "control on PostgreSQL {major}"
+        );
+        assert_eq!(
+            leftovers_on(&mut plain).await,
+            ["1", "1", "1", "1", "9MB", "1"],
+            "control leftovers on PostgreSQL {major}"
+        );
+        // DISCARD ALL releases the advisory lock the control took, so the pooled call below can take it too.
+        plain.simple_query("DISCARD ALL").await.expect("discard");
+        drop(plain);
+
+        // Call 1 runs read-only through the pool; the steps PostgreSQL refuses there do not count.
+        let pool = pool(port, 1);
+        let pid = one(&pool, "SELECT pg_backend_pid()").await;
+        let steps = one(&pool, "SELECT sess_test.leave_state()").await;
+        assert_eq!(
+            steps, "6",
+            "steps that succeeded inside the read-only transaction on PostgreSQL {major}"
+        );
+
+        // Call 2 reuses the same backend and must find every leftover gone.
+        assert_eq!(
+            one(&pool, "SELECT pg_backend_pid()").await,
+            pid,
+            "PostgreSQL {major}"
+        );
+        for (sql, expected) in
+            LEFTOVER_SQL
+                .iter()
+                .zip(["0", "0", "0", "0", work_mem_default.as_str(), "0"])
+        {
+            assert_eq!(
+                one(&pool, sql).await,
+                expected,
+                "{sql} on PostgreSQL {major}"
+            );
+        }
+    }
+}

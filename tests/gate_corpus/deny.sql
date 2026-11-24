@@ -519,3 +519,147 @@ SELECT move_chunk('t');
 --;;
 -- code: function_denied
 SELECT enable_chunk_skipping('t');
+--;;
+-- code: function_denied
+SELECT pg_rotate_logfile();
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_rotate_logfile();
+--;;
+-- code: function_denied
+SELECT pg_switch_wal();
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_switch_wal();
+--;;
+-- code: function_denied
+SELECT pg_create_restore_point('x');
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_create_restore_point('x');
+--;;
+-- code: function_denied
+SELECT pg_promote();
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_promote();
+--;;
+-- code: function_denied
+SELECT pg_stat_reset();
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_stat_reset();
+--;;
+-- code: function_denied
+SELECT pg_stat_reset_shared('bgwriter');
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_stat_reset_shared('bgwriter');
+--;;
+-- code: function_denied
+SELECT lo_put(1, 0, 'x');
+--;;
+-- code: function_denied
+SELECT pg_catalog.lo_put(1, 0, 'x');
+--;;
+-- code: function_denied
+SELECT lo_from_bytea(0, 'x');
+--;;
+-- code: function_denied
+SELECT pg_catalog.lo_from_bytea(0, 'x');
+--;;
+-- code: function_denied
+SELECT lowrite(1, 'x');
+--;;
+-- code: function_denied
+SELECT pg_catalog.lowrite(1, 'x');
+--;;
+-- code: function_denied
+SELECT lo_export(1, '/tmp/x');
+--;;
+-- code: function_denied
+SELECT pg_catalog.lo_export(1, '/tmp/x');
+--;;
+-- code: function_denied
+SELECT pg_export_snapshot();
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_export_snapshot();
+--;;
+-- code: function_denied
+SELECT table_to_xml('t', true, false, '');
+--;;
+-- code: function_denied
+SELECT pg_catalog.table_to_xml('t', true, false, '');
+--;;
+-- code: function_denied
+SELECT schema_to_xml('s', true, false, '');
+--;;
+-- code: function_denied
+SELECT pg_catalog.schema_to_xml('s', true, false, '');
+--;;
+-- code: function_denied
+SELECT database_to_xml(true, false, '');
+--;;
+-- code: function_denied
+SELECT pg_catalog.database_to_xml(true, false, '');
+--;;
+-- code: function_denied
+SELECT query_to_xmlschema('SELECT 1', true, false, '');
+--;;
+-- code: function_denied
+SELECT pg_catalog.query_to_xmlschema('SELECT 1', true, false, '');
+--;;
+-- code: function_denied
+SELECT cursor_to_xml('c', 1, true, false, '');
+--;;
+-- code: function_denied
+SELECT pg_catalog.cursor_to_xml('c', 1, true, false, '');
+--;;
+-- code: function_denied
+SELECT pg_advisory_xact_lock(1);
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_advisory_xact_lock(1);
+--;;
+-- code: function_denied
+SELECT pg_try_advisory_lock(1);
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_try_advisory_lock(1);
+--;;
+-- code: function_denied
+SELECT txid_current();
+--;;
+-- code: function_denied
+SELECT pg_catalog.txid_current();
+--;;
+-- code: function_denied
+SELECT pg_replication_slot_advance('s', '0/0');
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_replication_slot_advance('s', '0/0');
+--;;
+-- code: function_denied
+SELECT pg_create_logical_replication_slot('s', 'test_decoding');
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_create_logical_replication_slot('s', 'test_decoding');
+--;;
+-- code: function_denied
+SELECT pg_drop_replication_slot('s');
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_drop_replication_slot('s');
+--;;
+-- code: function_denied
+SELECT dblink_exec('x', 'y');
+--;;
+-- code: function_denied
+SELECT pg_catalog.dblink_exec('x', 'y');
+--;;
+-- code: function_denied
+SELECT dblink_connect('x');
+--;;
+-- code: function_denied
+SELECT pg_catalog.dblink_connect('x');

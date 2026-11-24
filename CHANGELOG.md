@@ -22,6 +22,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `get_privileges` reports database privileges under `databasePrivileges`.
 - `describe_table` lists at most 200 partitions of a partitioned table, and reports `partitionsTruncated` when there are more.
 - `require_auth` for URLs, JSON entries and the `PG*` form (`PGREQUIREAUTH`).
+- MCP resources and completions when the `schema` toolset is on: `postgres://<database>` (a summary), `postgres://<database>/<schema>` and `postgres://<database>/<schema>/<table>`, with completion for the template arguments. Each read writes one audit line.
 
 ### Changed
 

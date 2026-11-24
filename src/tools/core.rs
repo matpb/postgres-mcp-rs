@@ -65,9 +65,12 @@ const MEMBERSHIP_SQL: &str = "WITH RECURSIVE member_of(roleid) AS (\
     UNION SELECT a.roleid FROM pg_catalog.pg_auth_members a JOIN member_of m ON a.member = m.roleid) \
     SELECT r.rolname AS role_name FROM member_of m JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
     ORDER BY r.rolname";
-const EXTENSIONS_SQL: &str = "SELECT e.extname AS name, e.extversion AS version, \
+/// Installed extensions; the schema column is read by the database resource, server_info ignores it.
+pub(crate) const EXTENSIONS_SQL: &str = "SELECT e.extname AS name, e.extversion AS version, \
+    n.nspname::text AS schema, \
     CASE WHEN a.default_version <> e.extversion THEN a.default_version END AS available_version \
     FROM pg_catalog.pg_extension e \
+    JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
     LEFT JOIN pg_catalog.pg_available_extensions a ON a.name = e.extname ORDER BY e.extname";
 const TIMESCALE_SQL: &str =
     "SELECT extversion AS timescaledb FROM pg_catalog.pg_extension WHERE extname = 'timescaledb'";

@@ -860,3 +860,68 @@ proptest! {
         }
     }
 }
+
+/// Every name the function deny list must refuse, each one of the corpus's denied names.
+const NESTED_DENIED: [&str; 24] = [
+    "pg_rotate_logfile",
+    "pg_switch_wal",
+    "pg_create_restore_point",
+    "pg_promote",
+    "pg_stat_reset",
+    "pg_stat_reset_shared",
+    "lo_put",
+    "lo_from_bytea",
+    "lowrite",
+    "lo_export",
+    "pg_export_snapshot",
+    "table_to_xml",
+    "schema_to_xml",
+    "database_to_xml",
+    "query_to_xmlschema",
+    "cursor_to_xml",
+    "pg_advisory_xact_lock",
+    "pg_try_advisory_lock",
+    "txid_current",
+    "pg_replication_slot_advance",
+    "pg_create_logical_replication_slot",
+    "pg_drop_replication_slot",
+    "dblink_exec",
+    "dblink_connect",
+];
+
+/// One call of a denied function inside seven positions: subquery, CTE, LATERAL, FILTER, CASE, argument, ORDER BY.
+fn nested_statements(call: &str) -> [String; 7] {
+    [
+        format!("SELECT * FROM (SELECT {call}) AS s"),
+        format!("WITH c AS (SELECT {call}) SELECT * FROM c"),
+        format!("SELECT * FROM generate_series(1, 1) AS g, LATERAL {call} AS l"),
+        format!(
+            "SELECT count(*) FILTER (WHERE {call} IS NOT NULL) OVER () FROM generate_series(1, 1) AS g"
+        ),
+        format!("SELECT CASE WHEN {call} IS NULL THEN 1 ELSE 2 END"),
+        format!("SELECT length({call}::text)"),
+        format!("SELECT 1 AS v ORDER BY {call}"),
+    ]
+}
+
+#[test]
+fn denied_names_are_rejected_when_nested() {
+    for name in NESTED_DENIED {
+        for call in [format!("{name}()"), format!("pg_catalog.{name}()")] {
+            for sql in nested_statements(&call) {
+                match gate(&sql) {
+                    Err(rejection) => {
+                        assert_eq!(rejection.code, "function_denied", "{sql}");
+                        let prefix = format!("Function {name}() is not allowed: ");
+                        assert!(
+                            rejection.message.starts_with(&prefix),
+                            "{sql}: {}",
+                            rejection.message
+                        );
+                    }
+                    Ok(accepted) => panic!("{sql} accepted as {accepted:?}"),
+                }
+            }
+        }
+    }
+}

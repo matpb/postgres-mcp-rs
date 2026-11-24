@@ -121,6 +121,24 @@ The stdio form, with the absolute path to the binary:
 }
 ```
 
+### Claude Desktop
+
+Claude Desktop starts the server itself over stdio with the entry below. Add it to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "/path/to/postgres-mcp",
+      "args": ["stdio"],
+      "env": {
+        "DATABASE_URL": "postgres://mcp_reader:change-me-reader-password@db.example.com:5432/appdb?sslmode=verify-full"
+      }
+    }
+  }
+}
+```
+
 ## Create a read-only role
 
 Give the server its own database role and grant it read access only. Run this as an administrator, replacing `appdb`, the schema and the password:
@@ -333,6 +351,10 @@ The server exposes 20 tools in five toolsets. `core` is always on. Every tool ex
 
 The hypertable and job list tools report `timescaledb: false` with a note when the extension is not installed in the database. The monitoring and TimescaleDB tools report what is missing, such as a grant, an extension or a server version, rather than failing silently.
 
+### Resources
+
+Clients that support MCP resources can read three read-only views, which need the `schema` toolset (on by default). Each configured database is listed as `postgres://<database>`, and reading it returns a summary: the PostgreSQL version, the TimescaleDB version when installed, the schemas with their object counts, and the installed extensions. `postgres://<database>/<schema>` returns the `list_objects` result for one schema, its first page, with `nextCursor` when more objects follow. `postgres://<database>/<schema>/<table>` returns the `describe_table` result for one table or view. A name that contains `/` is written with `%2F`, and other names are percent-decoded as usual. The `database`, `schema` and `table` arguments of the two templates have completion. With `TOOLSETS=core` the server offers neither resources nor completions.
+
 ### Switching toolsets
 
 `TOOLSETS` takes a comma-separated list. Only the listed groups are enabled, plus `core`:
@@ -354,6 +376,55 @@ Tools are called with JSON arguments. A call to `execute_query` looks like this:
 ```
 
 Successful results come back as structured JSON, and also as the same JSON in one text block. A database or gate error is a tool result with `isError` set to true, and its text gives the reason. Invalid arguments and unknown tool names are JSON-RPC errors instead.
+
+### Examples
+
+One call per tool, as the JSON a client sends in `tools/call`. The examples use the `appdb` database, and the names are those of the test stack. Each row says what the call returns.
+
+**Core**
+
+| Call | Returns |
+|------|---------|
+| `{"name": "list_databases", "arguments": {}}` | The configured connections, with reachability and versions. |
+| `{"name": "execute_query", "arguments": {"database": "appdb", "sql": "SELECT status, count(*) AS orders FROM shop.orders GROUP BY status ORDER BY status"}}` | Typed columns and rows of the query. |
+| `{"name": "explain_query", "arguments": {"database": "appdb", "sql": "SELECT * FROM shop.orders WHERE customer_id = 7", "format": "json"}}` | The plan of the statement as JSON, without running it. |
+| `{"name": "server_info", "arguments": {"database": "appdb"}}` | The server version, uptime, role, extensions and settings. |
+
+**Schema**
+
+| Call | Returns |
+|------|---------|
+| `{"name": "list_schemas", "arguments": {"database": "appdb"}}` | The non-system schemas with owner and object counts. |
+| `{"name": "list_objects", "arguments": {"database": "appdb", "schema": "shop", "kinds": ["table", "view"], "limit": 50}}` | One page of tables and views in `shop`. |
+| `{"name": "describe_table", "arguments": {"database": "appdb", "table": "orders", "schema": "shop"}}` | Columns, keys, indexes and policies of `shop.orders`. |
+| `{"name": "describe_function", "arguments": {"database": "appdb", "function": "order_total", "schema": "shop"}}` | The signature, volatility and source of `shop.order_total`. |
+| `{"name": "search_schema", "arguments": {"database": "appdb", "query": "order", "kinds": ["table", "column"]}}` | Tables and columns whose name or comment contains "order". |
+| `{"name": "get_privileges", "arguments": {"database": "appdb"}}` | What the connected role may read, and which monitoring features work. |
+
+**Monitor**
+
+| Call | Returns |
+|------|---------|
+| `{"name": "list_activity", "arguments": {"database": "appdb", "state": "active", "min_duration_ms": 1000}}` | Sessions that have been active for at least one second. |
+| `{"name": "query_stats", "arguments": {"database": "appdb", "order_by": "total_time", "limit": 10}}` | The ten statements with the most total time. |
+| `{"name": "database_stats", "arguments": {"database": "appdb", "sections": ["database", "wal"]}}` | Database counters and WAL statistics. |
+| `{"name": "table_stats", "arguments": {"database": "appdb", "schema": "shop", "order_by": "dead_rows", "limit": 10}}` | The ten tables in `shop` with the most dead rows. |
+| `{"name": "replication_status", "arguments": {"database": "appdb"}}` | Recovery state, standbys with their lag, and replication slots. |
+
+**Logs**
+
+| Call | Returns |
+|------|---------|
+| `{"name": "read_server_log", "arguments": {"database": "appdb", "min_severity": "ERROR", "contains": "deadlock", "limit": 50}}` | Up to 50 ERROR entries that mention "deadlock", newest first. |
+
+**TimescaleDB**
+
+| Call | Returns |
+|------|---------|
+| `{"name": "list_hypertables", "arguments": {"database": "appdb", "schema": "metrics"}}` | The hypertables in `metrics`, with chunk counts and sizes. |
+| `{"name": "describe_hypertable", "arguments": {"database": "appdb", "hypertable": "readings", "schema": "metrics"}}` | Dimensions, policies and the newest chunks of `metrics.readings`. |
+| `{"name": "list_continuous_aggregates", "arguments": {"database": "appdb", "schema": "metrics"}}` | Continuous aggregates with their source and refresh policy. |
+| `{"name": "list_jobs", "arguments": {"database": "appdb", "history": true, "only_failures": true, "limit": 20}}` | Recent failed job runs. |
 
 ## What queries are accepted
 
@@ -496,9 +567,11 @@ The threat model and every layer are described in [SECURITY.md](SECURITY.md). In
 - **Bind.** The HTTP listener binds `127.0.0.1` unless `MCP_HOST` says otherwise.
 - **Origin, key and Host.** A request to `/mcp` is checked in this order. An `Origin` header must be a loopback origin or one in `ALLOWED_ORIGINS`, or the request gets 403. The API key comes next. Then the `Host` header must name a loopback host or one in `ALLOWED_HOSTS`, or the request is refused. Loopback origins are always allowed, so a web page served from the same machine can send requests to the server when no API key is set. It cannot read the responses, but it can still make the calls. When a browser runs on the same machine as the server, set `API_KEY` even on loopback.
 - **API key.** When `API_KEY` is set, `/mcp` requires it in `X-API-Key` or `Authorization: Bearer`. The key is compared in constant time as SHA-256 digests. `GET /health` stays open for probes.
-- **Audit.** With `AUDIT_LOG` on (the default), each tool call writes one `audit` line to stderr. It holds the tool name, the database name, whether the call succeeded, its duration, the row count, the SQLSTATE of a database error, and the first 16 hex characters of the SHA-256 of the SQL text. It never holds the SQL text, values, error messages, client addresses or keys.
+- **Audit.** With `AUDIT_LOG` on (the default), each tool call, and each resource read, writes one `audit` line to stderr. It holds the tool name, the database name, whether the call succeeded, its duration, the row count, the SQLSTATE of a database error, and the first 16 hex characters of the SHA-256 of the SQL text. It never holds the SQL text, values, error messages, client addresses or keys.
 
 Deliberately absent: no write tool, no flag or setting that enables writes, and no multi-user authentication. One API key is shared by everyone who holds it, and there is no per-user identity or per-user policy inside the server.
+
+For per-person access, policies and audit across many MCP servers, put a gateway in front of it, such as [Doorward](https://github.com/matpb/doorward).
 
 ## Development and tests
 
@@ -506,11 +579,35 @@ Three scripts prove a change. None of them needs a CI service, because the proje
 
 - **`scripts/verify.sh`** needs no database. It runs `cargo fmt --check`, `cargo clippy` with warnings as errors, the library and non-database test targets (`lib`, `config`, `encode`, `gate` and `http_guard`), `cargo audit` and `cargo deny check`. The last two need `cargo-audit` and `cargo-deny` installed.
 - **`scripts/integration.sh`** starts [`docker-compose.test.yml`](docker-compose.test.yml), runs every cargo test target with `--test-threads=4`, and removes the stack afterwards. Pass `--keep` to leave the stack running for the next run. The stack has three PostgreSQL servers on loopback: `timescaledb-ha` on PostgreSQL 18 with TimescaleDB 2.32.1 on port 15432, `postgres` 19 on port 15433 (csvlog) and `postgres` 15 on port 15434. The TimescaleDB server also preloads `pg_stat_statements` and pgaudit. The databases are seeded with the `app`, `shop` and `types` schemas, a `metrics` schema on the TimescaleDB server, and test roles with throwaway passwords: `mcp_ro`, which has the broad profile (`pg_read_all_data` and `pg_monitor`), `mcp_strict`, which has per-schema `SELECT` grants and `pg_read_all_stats`, and `mcp_min`, which may select only from `app.items`.
-- **`scripts/docker-smoke.sh`** builds the image as `postgres-mcp:smoke`, runs it against the test database on PostgreSQL 19, and checks the health route, the 401 without a key, `tools/list`, a `SELECT`, a refused `INSERT`, the absence of a shell and the read-only root filesystem.
+- **`scripts/docker-smoke.sh`** builds the image as `postgres-mcp:smoke`, runs it against the test database on PostgreSQL 19, and checks the health route, the 401 without a key, `tools/list`, a `SELECT`, a refused `INSERT`, one stdio `tools/call` round trip, the absence of a shell and the read-only root filesystem.
 
-The cargo test targets are these. `lib` (the unit tests in `src/`), `config`, `encode`, `gate`, `http_guard`, `tls` and `wire_fake` need no database. `wire`, `session`, `types_exact`, `hardening`, `schema_tools`, `monitor_tools`, `timescale_tools`, `logs_tools`, `mcp_http` and `mcp_stdio` need the test stack. `tests/types_exact.rs` checks the value-encoding table above against PostgreSQL 15, 18 and 19. `tls` runs a server in-process with certificates made at test time, and `wire_fake` runs the wire client against scripted servers. The test databases are seeded from [`docker/initdb`](docker/initdb), and the tests do not run DDL, so an object that a test needs belongs in the seed.
+The cargo test targets are these. `lib` (the unit tests in `src/`), `config`, `encode`, `gate`, `http_guard`, `tls` and `wire_fake` need no database. `wire`, `session`, `types_exact`, `hardening`, `schema_tools`, `monitor_tools`, `timescale_tools`, `logs_tools`, `mcp_http`, `mcp_stdio` and `resources` need the test stack. `tests/types_exact.rs` checks the value-encoding table above against PostgreSQL 15, 18 and 19. `tls` runs a server in-process with certificates made at test time, and `wire_fake` runs the wire client against scripted servers. The test databases are seeded from [`docker/initdb`](docker/initdb), and the tests do not run DDL, so an object that a test needs belongs in the seed.
 
 Tests that need a database connect only to the test stack on loopback ports 15432 to 15434. The library and non-database tests run without any database.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Startup stops with `configuration error: no database configured: set PG_DATABASES, DATABASE_URL, or PGDATABASE with PGHOST and PGUSER` (exit 2) | No database is configured. | Set `PG_DATABASES`, `DATABASE_URL`, or `PGDATABASE` with `PGHOST` and `PGUSER`. See [Databases](#databases). |
+| HTTP 401 from `/mcp`, with `"error":"unauthorized"` | `API_KEY` is set, and the request sends no key or a different one. | Send the key in `X-API-Key` or `Authorization: Bearer`. `GET /health` needs no key. |
+| Startup stops with `configuration error: API_KEY: must not start or end with whitespace` (exit 2) | The `API_KEY` value has a leading or trailing space. | Remove the space. A key read from `API_KEY_FILE` is trimmed instead. |
+| HTTP 403 from `/mcp`, with `"message":"Origin not allowed"` | The `Origin` header is neither a loopback origin nor in `ALLOWED_ORIGINS`. | Add the origin to `ALLOWED_ORIGINS`. Loopback origins need no entry. See [HTTP and authentication](#http-and-authentication). |
+| HTTP 403 with `Forbidden: Host header is not allowed`, typically behind a reverse proxy | The `Host` header names a host that is neither loopback nor in `ALLOWED_HOSTS`. | Add the public host name to `ALLOWED_HOSTS`. |
+| `Database "appdb" is unavailable: authentication failed` | The password or user is wrong, or the server asks for MD5 or cleartext and `require_auth` does not allow that method. | Check the credentials. If the server uses MD5 or cleartext, list the method in `require_auth`; cleartext also needs TLS. See [Authentication to PostgreSQL](#authentication-to-postgresql). |
+| `Database "appdb" is unavailable: TLS negotiation failed` | The TLS handshake failed: the server does not offer TLS, or its certificate did not verify. | Use an `sslmode` the server supports. For `verify-ca` or `verify-full`, set `sslrootcert` to the CA that signed the server certificate; a private CA needs it. See [TLS](#tls). |
+| Startup stops with `sslmode=verify-ca needs sslrootcert` | `verify-ca` checks the chain against a root certificate, and none was given. | Set `sslrootcert` to the CA file. |
+| `Query rejected: Parameter placeholders ($1) are not supported. Inline the value.` | The SQL contains `$1`. `execute_query` takes no bind values. | Write the values into the SQL. |
+| `Query rejected: Send exactly one statement per call; found 2.` | The call holds more than one statement. | Send one statement per call. One trailing `;` is fine. |
+| `Query rejected: Only read-only statements are accepted`, or `Function NAME() is not allowed: ...` | The statement writes or changes state, or it calls a function the gate denies. The message names the construct or the reason. | Rewrite the call as a read. Writes are not offered. |
+| Result has `"truncated": true` with `truncatedReason` `row_limit` or `response_size` | The rows passed `MAX_ROWS`, or the response passed `MAX_RESPONSE_BYTES`. | Add a `LIMIT`, an aggregate or fewer columns, and an `ORDER BY` for a stable page. The limits are in [Limits and timeouts](#limits-and-timeouts). |
+| `The query exceeded the N ms time limit and was cancelled on the server.` | The statement ran past `STATEMENT_TIMEOUT_MS`, or the database's `statement_timeout_ms`. | Narrow the query with `WHERE`, `LIMIT` or an aggregate, or raise the limit. |
+| `Database "appdb" is unavailable: all connections are busy, retry shortly` | Every pooled connection to that database stayed in use for 10 seconds. The pool size is the database's `max_connections`. | Retry after a few seconds, or raise `max_connections` for that database. `MAX_CONCURRENT_REQUESTS` caps the requests in flight, and the rest wait. |
+| Other sessions' query text is `null` in `list_activity` | The role lacks `pg_read_all_stats`, so PostgreSQL hides other users' statement text. | Grant it: `GRANT pg_read_all_stats TO mcp_reader;`. The tool's note names the same grant. |
+| `query_stats` reports `"available": false` | `pg_stat_statements` is not created, or it is created but not in `shared_preload_libraries`. | Add `pg_stat_statements` to `shared_preload_libraries`, restart the server, then run `CREATE EXTENSION pg_stat_statements;`. |
+| `read_server_log` reports `The log reader functions are not installed in this database.` | The setup steps under [Server log access](#server-log-access) were not done. | Run the three steps: `logging_collector`, `sql/log_reader.sql` as a superuser, and the grants. |
+| TimescaleDB tools report `"timescaledb": false` with `TimescaleDB is not installed in this database.` | The extension is not installed in the database that was named. | Name the database that has it. `list_databases` shows the TimescaleDB version of each. |
+| A client cannot parse the stdio replies, or reports text before the first message | Something other than the server writes to stdout, such as a wrapper script or a shell profile. Logs go to stderr. | Send that output to stderr. Stdout carries only JSON-RPC messages. |
 
 ## Limitations
 

@@ -15,8 +15,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CompleteRequestMethod,
+    CompleteRequestParams, CompleteResult, ContentBlock, Implementation,
+    ListResourceTemplatesRequestMethod, ListResourceTemplatesResult, ListResourcesRequestMethod,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestMethod,
+    ReadResourceRequestParams, ReadResourceResponse, ResourcesCapability, ServerCapabilities,
+    ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -33,6 +37,7 @@ use crate::pg::session::{
     RunError, RunOutput, SessionSettings, run_readonly, run_readonly_explain_generic,
 };
 use crate::pg::wire::{DbError, FetchLimits};
+use crate::resources;
 use crate::server::AppState;
 use envelope::QueryEnvelope;
 
@@ -357,6 +362,13 @@ fn success(value: Value) -> CallToolResult {
     result
 }
 
+impl PgMcp {
+    /// Resources and completions follow the schema toolset.
+    fn resources_enabled(&self) -> bool {
+        Toolset::Schema.enabled(&self.state.config.toolsets)
+    }
+}
+
 impl ServerHandler for PgMcp {
     fn get_info(&self) -> ServerConfig {
         let names: Vec<String> = self
@@ -366,12 +378,65 @@ impl ServerHandler for PgMcp {
             .iter()
             .map(|d| d.name.clone())
             .collect();
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        if self.resources_enabled() {
+            capabilities.resources = Some(ResourcesCapability::default());
+            capabilities.completions = Some(serde_json::Map::new());
+        }
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
                 "postgres-mcp",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(text::server_instructions(&names))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        if !self.resources_enabled() {
+            return Err(McpError::method_not_found::<ListResourcesRequestMethod>());
+        }
+        Ok(resources::list(&self.state))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        if !self.resources_enabled() {
+            return Err(McpError::method_not_found::<
+                ListResourceTemplatesRequestMethod,
+            >());
+        }
+        Ok(resources::templates())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if !self.resources_enabled() {
+            return Err(McpError::method_not_found::<ReadResourceRequestMethod>());
+        }
+        resources::read(&self.state, &request.uri, &context.ct)
+            .await
+            .map(ReadResourceResponse::from)
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, McpError> {
+        if !self.resources_enabled() {
+            return Err(McpError::method_not_found::<CompleteRequestMethod>());
+        }
+        Ok(resources::complete(&self.state, request, &context.ct).await)
     }
 
     async fn list_tools(

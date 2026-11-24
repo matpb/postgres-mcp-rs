@@ -46,6 +46,7 @@ Tests that need PostgreSQL expect the test stack on `127.0.0.1` ports 15432 (Tim
 - `src/pg/tls.rs`: sslmode handling and certificate verifiers.
 - `src/encode/`: value encoding; `mod.rs` decodes, `types.rs` holds the built-in OID table, `array.rs`, `range.rs`, `json.rs`, `columns.rs`.
 - `src/typeinfo.rs`: type lookups for non-built-in OIDs, cached per database.
+- `src/resources.rs`: MCP resources (database summary, schema and table views) and completions; enabled with the `schema` toolset.
 - `src/tools/mod.rs`: `Runner`, `ToolError`, the MCP handler (`list_tools`, `call_tool`).
 - `src/tools/text.rs`: tool titles, descriptions, parameter descriptions and server instructions.
 - `src/tools/mask.rs`: best-effort masking of passwords in log text and statement text.

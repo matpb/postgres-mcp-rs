@@ -343,6 +343,85 @@ fn audit_line_per_tool_call_without_sql_text() {
 }
 
 #[test]
+fn stdio_resources_list_and_read_round_trip() {
+    let mut child = command(&["stdio"])
+        .env("DATABASE_URL", database_url(PORT_19))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary starts");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let stderr_reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+
+    let messages = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": PROTOCOL_2025, "capabilities": {}, "clientInfo": {"name": "test-client", "version": "0.0.0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "resources/list"}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "postgres://appdb"}}),
+    ];
+    for message in &messages {
+        writeln!(stdin, "{message}").expect("request is written");
+    }
+    stdin.flush().expect("request is flushed");
+    drop(stdin);
+
+    let mut output = String::new();
+    stdout
+        .read_to_string(&mut output)
+        .expect("stdout is readable");
+    let stderr = stderr_reader.join().expect("stderr reader finishes");
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.is_some_and(|s| s.success()), "{stderr}");
+
+    let replies: Vec<Value> = output
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("stdout line is not JSON: {line}: {e}"))
+        })
+        .collect();
+    let reply = |id: u64| {
+        replies
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("no reply {id} in {output}"))
+            .clone()
+    };
+    let listed = &reply(2)["result"]["resources"];
+    assert_eq!(listed[0]["uri"], "postgres://appdb", "{output}");
+    assert_eq!(listed[0]["mimeType"], "application/json", "{output}");
+
+    let read = reply(3);
+    let text = read["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in {read}"));
+    let summary: Value = serde_json::from_str(text).expect("summary is JSON");
+    assert_eq!(
+        summary["serverVersionNum"].as_u64().map(|n| n / 10_000),
+        Some(19)
+    );
+
+    let audit_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("audit") && l.contains("tool=\"resource:database\""))
+        .collect();
+    assert_eq!(audit_lines.len(), 1, "{stderr}");
+    assert!(audit_lines[0].contains("ok=true"), "{}", audit_lines[0]);
+    assert!(
+        audit_lines[0].contains("database=\"appdb\""),
+        "{}",
+        audit_lines[0]
+    );
+}
+
+#[test]
 fn log_format_json_writes_only_json_lines_to_stderr() {
     let mut child = command(&["stdio"])
         .env("DATABASE_URL", database_url(PORT_19))

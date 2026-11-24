@@ -1,7 +1,7 @@
 //! Schema introspection: list_schemas, list_objects, describe_table, describe_function, search_schema and get_privileges.
 
-mod describe;
-mod listing;
+pub(crate) mod describe;
+pub(crate) mod listing;
 mod privileges;
 mod search;
 
@@ -27,7 +27,7 @@ const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 500;
 
 /// Predicate on n.nspname: false for catalogs, TimescaleDB internals and temporary schemas.
-const NON_SYSTEM: &str = "NOT (n.nspname IN ('pg_catalog', 'information_schema', 'pg_toast', \
+pub(crate) const NON_SYSTEM: &str = "NOT (n.nspname IN ('pg_catalog', 'information_schema', 'pg_toast', \
     'timescaledb_information', 'timescaledb_experimental', 'toolkit_experimental') \
     OR n.nspname::text ~ '^(pg_temp_|pg_toast_temp_|_timescaledb_)')";
 

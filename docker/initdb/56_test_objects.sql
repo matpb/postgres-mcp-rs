@@ -20,6 +20,52 @@ CREATE DOMAIN sess_test.dchain10 AS sess_test.dchain9;
 GRANT USAGE ON SCHEMA sess_test TO mcp_ro;
 GRANT SELECT ON sess_test.typed TO mcp_ro;
 
+-- Tries each session-level change a read-only transaction may still make; returns how many succeeded.
+CREATE FUNCTION sess_test.leave_state() RETURNS int LANGUAGE plpgsql AS $fn$
+DECLARE
+  steps int := 0;
+BEGIN
+  BEGIN
+    EXECUTE 'PREPARE pgmcp_leak AS SELECT 1';
+    steps := steps + 1;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    EXECUTE 'DECLARE pgmcp_cur CURSOR WITH HOLD FOR SELECT 1';
+    steps := steps + 1;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    EXECUTE 'LISTEN pgmcp_chan';
+    steps := steps + 1;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    EXECUTE 'CREATE TEMP TABLE pgmcp_tmp(x int)';
+    steps := steps + 1;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    EXECUTE 'SET SESSION work_mem = ''9MB''';
+    steps := steps + 1;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    PERFORM set_config('work_mem', '9MB', false);
+    steps := steps + 1;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    PERFORM pg_advisory_lock(424242);
+    steps := steps + 1;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  RETURN steps;
+END
+$fn$;
+REVOKE EXECUTE ON FUNCTION sess_test.leave_state() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION sess_test.leave_state() TO mcp_ro;
+
 -- Role with CONNECT, USAGE on app and SELECT on app.items only.
 CREATE ROLE mcp_min LOGIN PASSWORD 'test-only-min' CONNECTION LIMIT 20;
 GRANT CONNECT ON DATABASE appdb TO mcp_min;
