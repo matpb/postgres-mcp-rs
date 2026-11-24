@@ -64,6 +64,34 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
                     Some(quoted_end(text, k))
                 }
             }
+            // Escape string E'...': backslash escapes and doubled quotes.
+            Some(b'E' | b'e') if *key == b"password" && text.get(k + 1) == Some(&b'\'') => {
+                out.extend_from_slice(&text[start..=k]);
+                out.extend_from_slice(b"'***'");
+                Some(escape_end(text, k + 1))
+            }
+            // Unicode escape string U&'...': doubled quotes only.
+            Some(b'U' | b'u')
+                if *key == b"password" && text.get(k + 1..k + 3) == Some(b"&'".as_slice()) =>
+            {
+                out.extend_from_slice(&text[start..k + 2]);
+                out.extend_from_slice(b"'***'");
+                Some(quoted_end(text, k + 2))
+            }
+            // Dollar-quoted $tag$...$tag$, where the empty tag is $$.
+            Some(b'$') if *key == b"password" => {
+                let open = dollar_open(text, k)?;
+                let tag = &text[k..open];
+                let end = match find_bytes(text, open, tag) {
+                    Some(close) => close + tag.len(),
+                    None => text.len(),
+                };
+                out.extend_from_slice(&text[start..k]);
+                out.extend_from_slice(tag);
+                out.extend_from_slice(MASK.as_bytes());
+                out.extend_from_slice(tag);
+                Some(end)
+            }
             _ => None,
         };
     }
@@ -97,6 +125,51 @@ fn quoted_end(text: &[u8], open: usize) -> usize {
         i += 1;
     }
     text.len()
+}
+
+/// Index just past the closing quote of the escape string opened at `open`; a backslash escapes the next byte.
+fn escape_end(text: &[u8], open: usize) -> usize {
+    let mut i = open + 1;
+    while let Some(&b) = text.get(i) {
+        match b {
+            b'\\' => i += 2,
+            b'\'' if text.get(i + 1) == Some(&b'\'') => i += 2,
+            b'\'' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    text.len()
+}
+
+/// Index just past the opening `$tag$` delimiter that starts at `start`, or None when no delimiter starts there.
+fn dollar_open(text: &[u8], start: usize) -> Option<usize> {
+    if text.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut i = start + 1;
+    match text.get(i) {
+        Some(b'$') => return Some(i + 1),
+        Some(&b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        _ => return None,
+    }
+    while let Some(&b) = text.get(i) {
+        if b == b'$' {
+            return Some(i + 1);
+        }
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the first occurrence of `needle` at or after `from`.
+fn find_bytes(text: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    text.get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|p| from + p)
 }
 
 /// Index of the first byte that ends an unquoted value starting at `from`.
@@ -221,6 +294,9 @@ mod tests {
             "SELECT 1 AS passwordless",
             "ALTER ROLE x PASSWORD NULL",
             "ALTER ROLE x PASSWORD",
+            "ALTER ROLE x PASSWORD $1",
+            "ALTER ROLE x PASSWORD E",
+            "ALTER ROLE x PASSWORD U&",
             "plain message with = and : and ://",
             "",
         ] {
@@ -241,6 +317,62 @@ mod tests {
         assert_eq!(
             mask("SELECT 'x' AS a WHERE 'PASSWORD ''hunter2-m'''"),
             "SELECT 'x' AS a WHERE 'PASSWORD '***''"
+        );
+    }
+
+    #[test]
+    fn escape_string_password_is_masked() {
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD E'it\\'s'"),
+            "ALTER ROLE x PASSWORD E'***'"
+        );
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD e'a''b\\\\c' AND 1"),
+            "ALTER ROLE x PASSWORD e'***' AND 1"
+        );
+    }
+
+    #[test]
+    fn unterminated_escape_string_is_masked_to_end() {
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD E'abc\\'d"),
+            "ALTER ROLE x PASSWORD E'***'"
+        );
+    }
+
+    #[test]
+    fn dollar_quoted_password_is_masked() {
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD $$hunter2$$"),
+            "ALTER ROLE x PASSWORD $$***$$"
+        );
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD $tag$p'w$tag$ x"),
+            "ALTER ROLE x PASSWORD $tag$***$tag$ x"
+        );
+    }
+
+    #[test]
+    fn unterminated_dollar_quote_is_masked_to_end() {
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD $tag$abc"),
+            "ALTER ROLE x PASSWORD $tag$***$tag$"
+        );
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD $$abc $tag$"),
+            "ALTER ROLE x PASSWORD $$***$$"
+        );
+    }
+
+    #[test]
+    fn unicode_string_password_is_masked() {
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD U&'d\\0061'"),
+            "ALTER ROLE x PASSWORD U&'***'"
+        );
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD U&'abc"),
+            "ALTER ROLE x PASSWORD U&'***'"
         );
     }
 

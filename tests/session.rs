@@ -58,6 +58,8 @@ fn tuned(statement_timeout_ms: u64, max_rows: usize, pool_wait: Duration) -> Ses
             max_value_bytes: 4096,
         },
         pool_wait,
+        search_path_catalog_only: false,
+        unbound: false,
     }
 }
 

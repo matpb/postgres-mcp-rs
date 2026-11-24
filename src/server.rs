@@ -8,10 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::extract::{Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderName, HeaderValue, Method};
-use axum::middleware::from_fn_with_state;
-use axum::response::IntoResponse;
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::{Next, from_fn_with_state};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -302,6 +304,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let mcp = Router::new()
         .route_service("/mcp", service)
         .layer(ConcurrencyLimitLayer::new(limits.max_concurrent_requests))
+        .layer(from_fn_with_state(
+            limits.max_request_bytes,
+            buffer_request_body,
+        ))
         .layer(from_fn_with_state(guard, crate::http_guard::guard));
 
     let mut router = Router::new()
@@ -312,6 +318,30 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         router = router.layer(cors_layer(&config.allowed_origins));
     }
     router.layer(TraceLayer::new_for_http())
+}
+
+/// Buffers the body up to `max` bytes, so a chunked body over the limit gets the same 413 as a sized one.
+/// Any failure to read the body is answered as too large, since the limit is the only read failure this path expects.
+async fn buffer_request_body(State(max): State<usize>, request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    match to_bytes(body, max).await {
+        Ok(bytes) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Err(_) => payload_too_large(max),
+    }
+}
+
+fn payload_too_large(max: usize) -> Response {
+    let body =
+        format!(r#"{{"error":"payload_too_large","message":"Request body exceeds {max} bytes."}}"#);
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        [(CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 async fn health() -> impl IntoResponse {

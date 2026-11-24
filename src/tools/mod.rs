@@ -5,7 +5,7 @@ pub mod envelope;
 pub mod logs;
 pub mod monitor;
 pub mod schema;
-// text.rs holds every client-facing string; rustfmt leaves its layout alone.
+// text.rs is committed unformatted and must not be edited; rustfmt leaves it alone.
 #[rustfmt::skip]
 pub mod text;
 pub mod timescale;
@@ -155,6 +155,10 @@ pub struct Statement<'a> {
     pub fetch: FetchLimits,
     /// Characters the runner prepended to the submitted SQL, subtracted from error positions.
     pub offset: u32,
+    /// True when the server's own catalog SQL runs; false for user SQL, which keeps the role's search_path.
+    pub search_path_catalog_only: bool,
+    /// Runs without bind values through the simple protocol; see `SessionSettings::unbound`.
+    pub unbound: bool,
 }
 
 /// Runs SQL for the tools: user SQL through the gate, internal SQL without it.
@@ -188,6 +192,8 @@ impl<'a> Runner<'a> {
             user_sql: true,
             fetch: user_fetch(limits.max_rows, self.state),
             offset: 0,
+            search_path_catalog_only: false,
+            unbound: false,
         };
         let output = run(db, &pool, statement, ct).await?;
         Ok(envelope::build(
@@ -212,6 +218,8 @@ impl<'a> Runner<'a> {
             user_sql: false,
             fetch: user_fetch(INTERNAL_MAX_ROWS, self.state),
             offset: 0,
+            search_path_catalog_only: true,
+            unbound: false,
         };
         let (name, output) = self.internal_raw(database, statement, ct).await?;
         Ok(envelope::build(
@@ -254,6 +262,8 @@ async fn run(
         lock_timeout_ms: db.lock_timeout_ms,
         fetch: statement.fetch,
         pool_wait: POOL_WAIT,
+        search_path_catalog_only: statement.search_path_catalog_only,
+        unbound: statement.unbound,
     };
     run_readonly(
         pool,

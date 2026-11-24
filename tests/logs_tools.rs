@@ -6,8 +6,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use common::{
-    DB_NAME, PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with, db_entry,
-    one_db, post_mcp, result_of,
+    DB_NAME, DECOY_SETUP, PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with,
+    db_entry, one_db, post_mcp, result_of, superuser_setup,
 };
 use postgres_mcp::config::Config;
 use serde_json::{Value, json};
@@ -370,7 +370,7 @@ async fn unavailable_when_functions_are_not_installed() {
     let entry = json!({
         "name": "plain",
         "host": "127.0.0.1",
-        "port": PORT_19,
+        "port": PORT_15,
         "database": "postgres",
         "user": "postgres",
         "password": "test-only-superuser",
@@ -382,6 +382,35 @@ async fn unavailable_when_functions_are_not_installed() {
     assert_eq!(
         structured(&result)["reason"],
         "The log reader functions are not installed in this database."
+    );
+    let how = structured(&result)["howToEnable"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        how.contains("GRANT USAGE ON SCHEMA pgmcp TO postgres;"),
+        "{how}"
+    );
+}
+
+/// Same-named functions that are not SECURITY DEFINER and not owned by pgmcp_log_reader are refused.
+#[tokio::test]
+async fn unavailable_when_functions_are_not_authentic() {
+    superuser_setup(PORT_19, "postgres", DECOY_SETUP).await;
+    let entry = json!({
+        "name": "decoy",
+        "host": "127.0.0.1",
+        "port": PORT_19,
+        "database": "postgres",
+        "user": "postgres",
+        "password": "test-only-superuser",
+        "sslmode": "disable",
+    });
+    let result = call(config_with(&[entry], &[]), "read_server_log", json!({})).await;
+    assert!(!is_error(&result), "{result}");
+    assert_eq!(structured(&result)["available"], false, "{result}");
+    assert_eq!(
+        structured(&result)["reason"],
+        "The pgmcp log reader functions in this database were not installed by sql/log_reader.sql (unexpected owner or not SECURITY DEFINER)."
     );
     let how = structured(&result)["howToEnable"]
         .as_str()
@@ -448,4 +477,85 @@ async fn no_secret_in_any_output() {
     for secret in NO_SECRETS {
         assert!(!serialized.contains(secret), "secret {secret} in output");
     }
+}
+
+/// The user and entry_database filters keep only matching entries; a name that matches none gives none.
+#[tokio::test]
+async fn user_and_database_filters_select_entries() {
+    let m = marker("filter");
+    let ok = execute(PORT_18, &format!("SELECT '{m}' AS m")).await;
+    assert!(!is_error(&ok), "{ok}");
+
+    let by_user = poll(PORT_18, json!({ "contains": m, "user": "mcp_ro" })).await;
+    let entries = entries_of(&by_user);
+    assert!(!entries.is_empty(), "{by_user}");
+    assert!(entries.iter().all(|e| e["user"] == "mcp_ro"), "{by_user}");
+
+    let by_database = poll(PORT_18, json!({ "contains": m, "entry_database": DB_NAME })).await;
+    let entries = entries_of(&by_database);
+    assert!(!entries.is_empty(), "{by_database}");
+    assert!(
+        entries.iter().all(|e| e["database"] == DB_NAME),
+        "{by_database}"
+    );
+
+    let no_user = call(
+        one_db(PORT_18, &[]),
+        "read_server_log",
+        json!({ "contains": m, "user": "no_such_role" }),
+    )
+    .await;
+    assert!(entries_of(&no_user).is_empty(), "{no_user}");
+    let no_database = call(
+        one_db(PORT_18, &[]),
+        "read_server_log",
+        json!({ "contains": m, "entry_database": "no_such_database" }),
+    )
+    .await;
+    assert!(entries_of(&no_database).is_empty(), "{no_database}");
+}
+
+/// A response limit smaller than the log returns some entries and a cursor for the rest.
+#[tokio::test]
+async fn small_max_response_bytes_returns_entries_and_a_cursor() {
+    let limited = call(
+        one_db(PORT_18, &[("MAX_RESPONSE_BYTES", "2048")]),
+        "read_server_log",
+        json!({ "limit": 100 }),
+    )
+    .await;
+    assert!(!is_error(&limited), "{limited}");
+    assert!(!entries_of(&limited).is_empty(), "{limited}");
+    assert!(structured(&limited)["nextCursor"].is_string(), "{limited}");
+}
+
+/// A message over MAX_VALUE_BYTES is cut and marked, and the reply counts the cut.
+#[tokio::test]
+async fn max_value_bytes_truncates_and_counts_long_messages() {
+    let m = marker("long");
+    let padding = "x".repeat(200);
+    let failed = execute(PORT_18, &format!("SELECT CAST('{m}{padding}' AS integer)")).await;
+    assert!(is_error(&failed), "{failed}");
+    let seen = poll(PORT_18, json!({ "contains": m, "min_severity": "ERROR" })).await;
+    assert!(entries_of(&seen).iter().any(|e| mentions(e, &m)), "{seen}");
+
+    let limited = call(
+        one_db(PORT_18, &[("MAX_VALUE_BYTES", "64")]),
+        "read_server_log",
+        json!({ "contains": m, "min_severity": "ERROR" }),
+    )
+    .await;
+    assert!(
+        entries_of(&limited).iter().any(|e| e["message"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("…[truncated]"))),
+        "{limited}"
+    );
+    assert!(
+        structured(&limited)["truncatedMessages"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1,
+        "{limited}"
+    );
 }

@@ -375,3 +375,114 @@ SELECT current_setting('ssl_key_file');
 --;;
 -- code: parse_error
 SELECT FROM WHERE;
+--;;
+-- code: setting_denied
+SELECT current_setting('primary_conninfo'::text);
+--;;
+-- code: setting_denied
+SELECT current_setting('primary_' || 'conninfo');
+--;;
+-- code: setting_denied
+SELECT current_setting(lower('X'));
+--;;
+-- code: setting_denied
+SELECT current_setting(n) FROM unnest(ARRAY['primary_conninfo']) AS n;
+--;;
+-- code: setting_denied
+SELECT pg_catalog.current_setting('archive_command'::text);
+--;;
+-- code: setting_denied
+SELECT current_setting((SELECT 'primary_conninfo'));
+--;;
+-- code: setting_denied
+SELECT current_setting(VARIADIC ARRAY['primary_conninfo']);
+--;;
+-- code: setting_denied
+SELECT "current_setting"('ssl_passphrase_command'::name);
+--;;
+-- code: setting_denied
+SELECT current_setting('primary_conninfo', true);
+--;;
+-- code: setting_denied
+SELECT current_setting('work_mem', current_setting('work_mem'));
+--;;
+-- code: setting_denied
+SELECT current_setting();
+--;;
+-- code: relation_denied
+SELECT * FROM pg_config;
+--;;
+-- code: relation_denied
+SELECT * FROM pg_db_role_setting;
+--;;
+-- code: function_denied
+SELECT * FROM pg_show_all_settings();
+--;;
+-- code: relation_denied
+SELECT * FROM pg_file_settings;
+--;;
+-- code: relation_denied
+SELECT * FROM pg_hba_file_rules;
+--;;
+-- code: relation_denied
+SELECT * FROM pg_ident_file_mappings;
+--;;
+-- code: function_denied
+SELECT heap_force_kill('t'::regclass, NULL);
+--;;
+-- code: function_denied
+SELECT heap_force_freeze('t'::regclass, NULL);
+--;;
+-- code: function_denied
+SELECT pg_truncate_visibility_map('t'::regclass);
+--;;
+-- code: function_denied
+SELECT autoprewarm_dump_now();
+--;;
+-- code: function_denied
+SELECT pg_prewarm('t'::regclass);
+--;;
+-- code: function_denied
+SELECT pg_logdir_ls();
+--;;
+-- code: function_denied
+SELECT add_policies('t', false, 'ts', INTERVAL '1 day');
+--;;
+-- code: function_denied
+SELECT enable_chunk_skipping('t', 'ts');
+--;;
+-- code: function_denied
+SELECT pg_background_launch('SELECT 1');
+--;;
+-- code: function_denied
+SELECT http_get('https://example.com/');
+--;;
+-- code: function_denied
+SELECT postgres_fdw_disconnect_all();
+--;;
+-- code: function_denied
+SELECT hypopg_create_index('CREATE INDEX ON t (a)');
+--;;
+-- code: function_denied
+SELECT get_raw_page('t', 0);
+--;;
+-- code: function_denied
+SELECT pg_stat_kcache_reset();
+--;;
+-- code: function_denied
+SELECT pgr_dijkstra('SELECT 1', 1, 2);
+--;;
+-- code: function_denied
+SELECT _timescaledb_functions.hypertable_size('t');
+--;;
+-- code: function_denied
+SELECT _timescaledb_internal.hypertable_size('t');
+--;;
+-- code: function_denied
+SELECT _timescaledb_catalog.hypertable_size('t');
+--;;
+-- code: function_denied
+SELECT attach_chunk('h', 'c', '{}'::jsonb);
+--;;
+-- code: function_denied
+SELECT "pg_catalog"."heap_force_kill"('t'::regclass, NULL);

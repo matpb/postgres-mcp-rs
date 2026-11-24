@@ -83,7 +83,13 @@ impl Pool {
     }
 
     async fn open<'a>(&'a self, permit: SemaphorePermit<'a>) -> Result<Lease<'a>, PoolError> {
-        let conn = Connection::connect(&self.connect).await?;
+        let conn = match Connection::connect(&self.connect).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(database = %self.connect.database, error = %error, "connection failed");
+                return Err(PoolError::Connect(connect_failure_text(&error)));
+            }
+        };
         Ok(Lease {
             pool: self,
             _permit: permit,
@@ -139,6 +145,26 @@ pub enum PoolError {
     Busy,
     #[error("the pool is closed")]
     Closed,
-    #[error(transparent)]
-    Connect(#[from] WireError),
+    /// Client-facing text for a failed connect; the server's own message is only logged.
+    #[error("{0}")]
+    Connect(String),
+}
+
+/// The client-facing text for a connect failure, by class. PostgreSQL's wording can name users and addresses.
+fn connect_failure_text(error: &WireError) -> String {
+    match error {
+        WireError::Auth(_) => "authentication failed".to_owned(),
+        WireError::Db(db) => match db.code.as_str() {
+            code if code.starts_with("28") => "authentication failed".to_owned(),
+            "3D000" => "the database does not exist".to_owned(),
+            "53300" => "too many connections".to_owned(),
+            code => format!("the server refused the connection (SQLSTATE {code})"),
+        },
+        WireError::Io(_) => "cannot connect to the server".to_owned(),
+        WireError::Tls(_) => "TLS negotiation failed".to_owned(),
+        WireError::Timeout => "connection timed out".to_owned(),
+        WireError::Protocol(_) | WireError::Refused(_) => {
+            "unexpected reply from the server".to_owned()
+        }
+    }
 }

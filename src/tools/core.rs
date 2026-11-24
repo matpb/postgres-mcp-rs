@@ -19,7 +19,6 @@ use crate::server::AppState;
 
 /// Time allowed per database for list_databases.
 const PROBE_CAP: Duration = Duration::from_secs(5);
-const GENERIC_PLAN_UNAVAILABLE: &str = "generic_plan is not available through this server.";
 
 /// Settings that describe how to read data. None can hold credentials; a test checks this list.
 pub const SERVER_INFO_SETTINGS: &[&str] = &[
@@ -461,16 +460,12 @@ async fn explain(
             max_value_bytes: limits.max_response_bytes,
         },
         offset,
+        search_path_catalog_only: false,
+        unbound: args.generic_plan,
     };
     let (database, output) = runner
         .internal_raw(args.database.as_deref(), statement, ct)
-        .await
-        .map_err(|error| match error {
-            ToolError::Rejected(_) if args.generic_plan => {
-                ToolError::Rejected(GENERIC_PLAN_UNAVAILABLE.to_owned())
-            }
-            other => other,
-        })?;
+        .await?;
     let RunOutput {
         result, elapsed, ..
     } = output;

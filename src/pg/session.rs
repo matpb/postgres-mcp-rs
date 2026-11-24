@@ -4,12 +4,14 @@
 
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use crate::encode::TypeInfo;
 use crate::pg::pool::{Lease, Pool, PoolError};
 use crate::pg::wire::{
-    CancelHandle, Connection, DbError, FetchLimits, QueryResult, TxStatus, WireError,
+    CancelHandle, Connection, DbError, FetchLimits, Field, QueryResult, SimpleResult, Truncation,
+    TxStatus, WireError,
 };
 use crate::typeinfo::TypeCache;
 
@@ -31,6 +33,11 @@ pub struct SessionSettings {
     pub lock_timeout_ms: u64,
     pub fetch: FetchLimits,
     pub pool_wait: Duration,
+    /// Sets search_path to pg_catalog for the transaction; true for the server's own catalog SQL.
+    pub search_path_catalog_only: bool,
+    /// Runs the statement without bind values, through the simple protocol. EXPLAIN GENERIC_PLAN needs it:
+    /// a bound value makes PostgreSQL plan that value, not the generic plan.
+    pub unbound: bool,
 }
 
 #[derive(Debug)]
@@ -144,6 +151,9 @@ fn begin_sql(settings: &SessionSettings, server_version_num: u32) -> String {
             st.saturating_add(5_000)
         ));
     }
+    if settings.search_path_catalog_only {
+        parts.push("SET LOCAL search_path = pg_catalog".to_string());
+    }
     format!("{};", parts.join("; "))
 }
 
@@ -199,7 +209,7 @@ async fn run_held(
         biased;
         _ = cancel.cancelled() => Race::Cancelled,
         _ = tokio::time::sleep(deadline) => Race::Deadline,
-        r = conn.query(sql, params, user_sql, &settings.fetch) => Race::Done(r),
+        r = fetch_rows(conn, sql, params, user_sql, settings) => Race::Done(r),
     };
     let elapsed = started.elapsed();
     let result = match race {
@@ -234,6 +244,68 @@ async fn run_held(
         server_version_num: conn.server_version_num(),
         elapsed,
     })
+}
+
+/// Runs with the bind values, or unbound through the simple protocol when the settings ask for it.
+async fn fetch_rows(
+    conn: &mut Connection,
+    sql: &str,
+    params: &[Option<&str>],
+    user_sql: bool,
+    settings: &SessionSettings,
+) -> Result<QueryResult, WireError> {
+    if settings.unbound {
+        let simple = conn.simple_query(sql).await?;
+        return Ok(unbound_result(simple, &settings.fetch));
+    }
+    conn.query(sql, params, user_sql, &settings.fetch).await
+}
+
+/// A simple-protocol result in the shape of a bound one, under the same row, byte and value caps.
+fn unbound_result(simple: SimpleResult, fetch: &FetchLimits) -> QueryResult {
+    let bytes: usize = simple
+        .rows
+        .iter()
+        .flatten()
+        .flatten()
+        .map(String::len)
+        .sum();
+    let truncated = if simple.rows.len() > fetch.max_rows {
+        Some(Truncation::Rows)
+    } else if bytes > fetch.max_bytes {
+        Some(Truncation::Bytes)
+    } else {
+        None
+    };
+    let rows = if truncated.is_some() {
+        Vec::new()
+    } else {
+        simple
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cell| {
+                        cell.map(|text| {
+                            let full_len = text.len();
+                            let kept = full_len.min(fetch.max_value_bytes);
+                            Field {
+                                data: Bytes::from(text).slice(..kept),
+                                full_len,
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    QueryResult {
+        columns: Vec::new(),
+        rows,
+        truncated,
+        command_tag: simple.tags.last().cloned(),
+        status: simple.status,
+    }
 }
 
 fn allowed_tag(tag: &str) -> bool {
@@ -316,6 +388,6 @@ fn pool_failure(e: PoolError) -> RunError {
     match e {
         PoolError::Busy => RunError::Unavailable("all connections are busy, retry shortly".into()),
         PoolError::Closed => RunError::Unavailable("the pool is closed".into()),
-        PoolError::Connect(e) => RunError::Unavailable(e.to_string()),
+        PoolError::Connect(message) => RunError::Unavailable(message),
     }
 }

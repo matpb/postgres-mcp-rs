@@ -19,6 +19,10 @@ const SETUP_SQL: &str = "SELECT \
      ELSE has_schema_privilege('pgmcp', 'USAGE') \
      AND has_function_privilege('pgmcp.read_log_file(text,bigint,integer)', 'EXECUTE') \
      AND has_function_privilege('pgmcp.list_log_files()', 'EXECUTE') END AS allowed, \
+    COALESCE((SELECT bool_and(p.prosecdef AND (o.rolname = 'pgmcp_log_reader' OR o.rolsuper)) \
+     FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_roles o ON o.oid = p.proowner \
+     WHERE p.oid IN (pg_catalog.to_regprocedure('pgmcp.read_log_file(text,bigint,integer)'), \
+                     pg_catalog.to_regprocedure('pgmcp.list_log_files()'))), false) AS authentic, \
     pg_catalog.current_user() AS role";
 const FILES_SQL: &str = "SELECT l.name AS name, l.size AS size, l.modification::text AS modified \
     FROM pgmcp.list_log_files() AS l ORDER BY l.modification DESC, l.name DESC";
@@ -46,6 +50,8 @@ pub const SETTINGS: &[(&str, &str)] = &[
 /// Whether the log reader functions exist and the connected role may run them.
 pub struct Setup {
     pub installed: bool,
+    /// Both functions are SECURITY DEFINER and owned by pgmcp_log_reader or a superuser.
+    pub authentic: bool,
     pub allowed: bool,
     pub role: String,
 }
@@ -73,6 +79,7 @@ pub async fn setup(
         .ok_or_else(|| ToolError::Internal("the server returned no setup row".to_owned()))?;
     Ok(Setup {
         installed: flag(row, "installed"),
+        authentic: flag(row, "authentic"),
         allowed: flag(row, "allowed"),
         role: text_of(row, "role").unwrap_or_default(),
     })
@@ -211,6 +218,8 @@ pub async fn read_chunk(
             max_value_bytes: 2 * READ_LEN + 2,
         },
         offset: 0,
+        search_path_catalog_only: true,
+        unbound: false,
     };
     let (_, output) = Runner::new(state)
         .internal_raw(database, statement, ct)

@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::{NON_SYSTEM, ToolError, check_kinds, finish, like_escape, page, run_rows, take_page};
+use super::{
+    COLUMN_TYPE_SQL, NON_SYSTEM, ToolError, check_kinds, finish, like_escape, page, run_rows,
+    take_page,
+};
 use crate::server::AppState;
 use crate::tools::Call;
 
@@ -90,7 +93,7 @@ fn search_sql(selection: &Selection) -> String {
             WHEN a.attname::text ILIKE $2::text THEN 1 WHEN a.attname::text ILIKE $3::text THEN 2 ELSE 3 END, \
         n.nspname::text, c.relname::text, a.attname::text, 'column'::text, ''::text, \
         jsonb_build_object('kind', 'column', 'schema', n.nspname::text, 'table', c.relname::text, \
-            'name', a.attname::text, 'type', pg_catalog.format_type(a.atttypid, a.atttypmod), \
+            'name', a.attname::text, 'type', {COLUMN_TYPE_SQL}, \
             'matched', CASE WHEN a.attname::text ILIKE $3::text THEN 'name' ELSE 'comment' END, \
             'comment', pg_catalog.col_description(c.oid, a.attnum)) AS obj \
         FROM pg_catalog.pg_attribute a \

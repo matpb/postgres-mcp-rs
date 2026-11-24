@@ -246,3 +246,260 @@ fn audit_line_per_tool_call_without_sql_text() {
     assert!(line.contains(&format!("sql_sha256=\"{digest}\"")), "{line}");
     assert!(!stderr.contains("audited"), "SQL text was logged: {stderr}");
 }
+
+#[test]
+fn log_format_json_writes_only_json_lines_to_stderr() {
+    let mut child = command(&["stdio"])
+        .env("DATABASE_URL", database_url(PORT_19))
+        .env("LOG_FORMAT", "json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary starts");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let messages = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": PROTOCOL_2025, "capabilities": {}, "clientInfo": {"name": "test-client", "version": "0.0.0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"sql": "SELECT 1 AS fine"}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"sql": "SELECT 1/0 AS broken"}}}),
+    ];
+    for message in &messages {
+        writeln!(stdin, "{message}").expect("request is written");
+    }
+    drop(stdin);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("stderr is readable");
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.is_some_and(|s| s.success()), "{stderr}");
+
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!lines.is_empty(), "no log lines were written");
+    for line in &lines {
+        let parsed: Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("stderr line is not JSON: {line}: {e}"));
+        assert!(parsed.is_object(), "{line}");
+    }
+    assert!(lines.iter().any(|l| l.contains("tool call")), "{stderr}");
+}
+
+/// Starts `http` on `port` and forwards each stderr line over a channel.
+fn spawn_http(port: u16, extra: &[(&str, &str)]) -> (Child, mpsc::Receiver<String>) {
+    let mut cmd = command(&["http"]);
+    cmd.env("DATABASE_URL", database_url(PORT_19))
+        .env("MCP_PORT", port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().expect("server starts");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    (child, receiver)
+}
+
+/// Collects stderr lines until one contains `needle` or `limit` passes; returns everything collected.
+fn lines_until(receiver: &mpsc::Receiver<String>, needle: &str, limit: Duration) -> Vec<String> {
+    let deadline = Instant::now() + limit;
+    let mut seen = Vec::new();
+    while let Ok(line) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        let hit = line.contains(needle);
+        seen.push(line);
+        if hit {
+            break;
+        }
+    }
+    seen
+}
+
+#[test]
+fn non_loopback_bind_without_api_key_warns() {
+    let port = pick_port(0);
+    let (mut child, receiver) = spawn_http(port, &[("MCP_HOST", "0.0.0.0")]);
+    let seen = lines_until(
+        &receiver,
+        "listening on a non-loopback address without an API key",
+        Duration::from_secs(5),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        seen.iter()
+            .any(|l| l.contains("listening on a non-loopback address without an API key")),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn non_loopback_bind_with_api_key_does_not_warn() {
+    let port = pick_port(1);
+    let key = ("API_KEY", "test-only-api-key-0123456789");
+    let (mut child, receiver) = spawn_http(port, &[("MCP_HOST", "0.0.0.0"), key]);
+    let mut seen = lines_until(&receiver, "serving MCP", Duration::from_secs(10));
+    // The warning, when it exists, follows the startup line at once; the pause lets it arrive.
+    thread::sleep(Duration::from_millis(500));
+    seen.extend(receiver.try_iter());
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(seen.iter().any(|l| l.contains("serving MCP")), "{seen:?}");
+    assert!(!seen.iter().any(|l| l.contains("non-loopback")), "{seen:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_http_with_exit_status_zero() {
+    let port = pick_port(2);
+    let (mut child, receiver) = spawn_http(port, &[]);
+    let seen = lines_until(&receiver, "serving MCP", Duration::from_secs(10));
+    assert!(seen.iter().any(|l| l.contains("serving MCP")), "{seen:?}");
+    // The listener is up once /health answers; only then is the shutdown handler surely armed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let probe = command(&["healthcheck"])
+            .env("MCP_PORT", port.to_string())
+            .status()
+            .expect("healthcheck runs");
+        if probe.success() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let sent = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("kill runs");
+    assert!(sent.success(), "kill -TERM failed: {sent:?}");
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let status = status.expect("server exits within 5 s of SIGTERM");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// The tool names `tools/list` returns from a stdio server whose TOOLSETS is `toolsets`.
+fn listed_tool_names(toolsets: &str) -> Vec<String> {
+    let mut child = command(&["stdio"])
+        .env("DATABASE_URL", database_url(PORT_19))
+        .env("TOOLSETS", toolsets)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary starts");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let messages = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": PROTOCOL_2025, "capabilities": {}, "clientInfo": {"name": "test-client", "version": "0.0.0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    ];
+    for message in &messages {
+        writeln!(stdin, "{message}").expect("request is written");
+    }
+    drop(stdin);
+    let mut text = String::new();
+    stdout
+        .read_to_string(&mut text)
+        .expect("stdout is readable");
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.is_some_and(|s| s.success()), "{text}");
+    let answer = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["id"] == 2)
+        .unwrap_or_else(|| panic!("no tools/list answer in {text}"));
+    answer["result"]["tools"]
+        .as_array()
+        .expect("tools is an array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn each_disabled_toolset_is_absent_and_the_others_are_listed() {
+    const CORE: [&str; 4] = [
+        "list_databases",
+        "execute_query",
+        "explain_query",
+        "server_info",
+    ];
+    let groups: [(&str, &[&str]); 4] = [
+        (
+            "schema",
+            &[
+                "list_schemas",
+                "list_objects",
+                "describe_table",
+                "describe_function",
+                "search_schema",
+                "get_privileges",
+            ],
+        ),
+        (
+            "monitor",
+            &[
+                "list_activity",
+                "query_stats",
+                "database_stats",
+                "table_stats",
+                "replication_status",
+            ],
+        ),
+        ("logs", &["read_server_log"]),
+        (
+            "timescale",
+            &[
+                "list_hypertables",
+                "describe_hypertable",
+                "list_continuous_aggregates",
+                "list_jobs",
+            ],
+        ),
+    ];
+    for (disabled, tools) in groups {
+        let enabled: Vec<&str> = groups
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| *name != disabled)
+            .collect();
+        let names = listed_tool_names(&enabled.join(","));
+        for tool in tools {
+            assert!(
+                !names.iter().any(|n| n == tool),
+                "{disabled} is disabled but {tool} is listed: {names:?}"
+            );
+        }
+        for tool in CORE {
+            assert!(
+                names.iter().any(|n| n == tool),
+                "core {tool} missing: {names:?}"
+            );
+        }
+        for (name, group) in groups.iter().filter(|(name, _)| *name != disabled) {
+            for tool in group.iter() {
+                assert!(
+                    names.iter().any(|n| n == tool),
+                    "{name} is enabled but {tool} is missing: {names:?}"
+                );
+            }
+        }
+    }
+}

@@ -3,12 +3,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt;
 use postgres_mcp::config::Config;
+use postgres_mcp::pg::tls::SslMode;
+use postgres_mcp::pg::wire::{ConnectConfig, Connection};
 use postgres_mcp::{AppState, build_router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -140,4 +143,53 @@ pub fn result_of(response: &Value) -> &Value {
     response
         .get("result")
         .unwrap_or_else(|| panic!("no result in {response}"))
+}
+
+pub const SUPERUSER: &str = "postgres";
+pub const SUPERUSER_PASSWORD: &str = "test-only-superuser";
+/// Same statements as docker/initdb/55_hostile.sql, run on the live test servers too.
+pub const HOSTILE_SETUP: &[&str] = &[
+    "CREATE OR REPLACE FUNCTION public.starts_with(name, text) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pgmcp hostile %', 'function called'; END $$",
+    "CREATE OR REPLACE FUNCTION public.lower(name) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pgmcp hostile %', 'function called'; END $$",
+    "CREATE OR REPLACE FUNCTION public.strpos(name, text) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pgmcp hostile %', 'function called'; END $$",
+    "CREATE OR REPLACE FUNCTION public.format_type(oid, int) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pgmcp hostile %', 'function called'; END $$",
+    "CREATE OR REPLACE FUNCTION public.pg_get_expr(pg_node_tree, oid) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pgmcp hostile %', 'function called'; END $$",
+    "ALTER ROLE mcp_strict IN DATABASE appdb SET search_path = public, pg_catalog",
+];
+/// Decoy log reader for database `postgres` on PostgreSQL 19; same statements as docker/initdb/55_hostile.sql.
+pub const DECOY_SETUP: &[&str] = &[
+    "CREATE SCHEMA IF NOT EXISTS pgmcp AUTHORIZATION mcp_strict",
+    "CREATE OR REPLACE FUNCTION pgmcp.read_log_file(p_name text, p_offset bigint, p_length integer) RETURNS bytea LANGUAGE sql AS $$ SELECT NULL::bytea $$",
+    "CREATE OR REPLACE FUNCTION pgmcp.list_log_files() RETURNS TABLE(name text, size bigint, modification timestamptz) LANGUAGE sql AS $$ SELECT NULL::text, NULL::bigint, NULL::timestamptz WHERE false $$",
+    "ALTER FUNCTION pgmcp.read_log_file(text, bigint, integer) OWNER TO mcp_strict",
+    "ALTER FUNCTION pgmcp.list_log_files() OWNER TO mcp_strict",
+    "GRANT USAGE ON SCHEMA pgmcp TO mcp_ro",
+    "GRANT EXECUTE ON FUNCTION pgmcp.read_log_file(text, bigint, integer), pgmcp.list_log_files() TO mcp_ro",
+];
+
+/// Runs idempotent setup DDL as the superuser in one transaction that holds the setup advisory lock.
+pub async fn superuser_setup(port: u16, database: &str, statements: &[&str]) {
+    let config = ConnectConfig {
+        host: "127.0.0.1".into(),
+        port,
+        database: database.into(),
+        user: SUPERUSER.into(),
+        password: Some(SUPERUSER_PASSWORD.into()),
+        ssl_mode: SslMode::Disable,
+        ssl_root_cert: None,
+        connect_timeout: Duration::from_secs(10),
+        startup_params: Vec::new(),
+    };
+    let mut conn = Connection::connect(&config)
+        .await
+        .expect("superuser connection to the test server");
+    let mut script = vec!["BEGIN", "SELECT pg_advisory_xact_lock(815001)"];
+    script.extend_from_slice(statements);
+    script.push("COMMIT");
+    for sql in script {
+        if let Err(error) = conn.simple_query(sql).await {
+            panic!("setup statement failed on port {port}: {error}: {sql}");
+        }
+    }
+    conn.close().await;
 }

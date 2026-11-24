@@ -20,6 +20,7 @@ use query::LogFile;
 use scan::{Backward, WINDOW};
 
 const NOT_INSTALLED: &str = "The log reader functions are not installed in this database.";
+const NOT_AUTHENTIC: &str = "The pgmcp log reader functions in this database were not installed by sql/log_reader.sql (unexpected owner or not SECURITY DEFINER).";
 const NO_PRIVILEGE: &str = "The connected role may not execute pgmcp.read_log_file.";
 const NO_FILES: &str =
     "No log files found: logging_collector is off or the log directory is empty.";
@@ -276,6 +277,13 @@ async fn read(
         return Ok(unavailable(
             database,
             NOT_INSTALLED,
+            grant_text(&setup.role),
+        ));
+    }
+    if !setup.authentic {
+        return Ok(unavailable(
+            database,
+            NOT_AUTHENTIC,
             grant_text(&setup.role),
         ));
     }

@@ -632,19 +632,85 @@ async fn explain_option_version_gate() {
 }
 
 #[tokio::test]
-async fn explain_generic_plan() {
-    // The wire layer refuses statements with parameters when no values are bound, so the
-    // tool reports generic_plan as unavailable instead of failing obscurely.
+async fn explain_generic_plan_returns_a_plan_with_the_placeholder() {
+    for port in [PORT_18, PORT_19] {
+        let result = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": "SELECT * FROM app.items WHERE id = $1", "generic_plan": true}),
+        )
+        .await;
+        assert!(!is_error(&result), "port {port}: {}", text_of(&result));
+        let plan = structured(&result)["plan"].as_str().unwrap_or_default();
+        assert!(plan.contains("$1"), "port {port}: {plan}");
+        assert!(plan.contains("Scan"), "port {port}: {plan}");
+    }
+}
+
+#[tokio::test]
+async fn explain_generic_plan_json_format_has_the_placeholder() {
     let result = tool(
         one_db(PORT_18, &[]),
+        "explain_query",
+        json!({
+            "sql": "SELECT * FROM app.items WHERE id = $1 AND qty > $2",
+            "generic_plan": true,
+            "format": "json",
+        }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let plan = &structured(&result)["plan"][0]["Plan"];
+    let node = plan["Node Type"].as_str().unwrap_or_default();
+    assert!(node.contains("Scan"), "{plan}");
+    let condition = plan.to_string();
+    assert!(
+        condition.contains("$1") && condition.contains("$2"),
+        "{plan}"
+    );
+}
+
+#[tokio::test]
+async fn explain_generic_plan_is_version_gated_on_pg15() {
+    let result = tool(
+        one_db(PORT_15, &[]),
         "explain_query",
         json!({"sql": "SELECT * FROM app.items WHERE id = $1", "generic_plan": true}),
     )
     .await;
-    assert!(is_error(&result), "{}", text_of(&result));
+    assert!(is_error(&result), "{result}");
+    assert!(
+        text_of(&result).starts_with(
+            "Option generic_plan needs PostgreSQL 16 or newer; this server is PostgreSQL 15."
+        ),
+        "{}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn explain_placeholder_still_needs_generic_plan() {
+    let result = tool(
+        one_db(PORT_18, &[]),
+        "explain_query",
+        json!({"sql": "SELECT * FROM app.items WHERE id = $1"}),
+    )
+    .await;
+    assert!(is_error(&result), "{result}");
     assert_eq!(
         text_of(&result),
-        "generic_plan is not available through this server."
+        "Query rejected: Parameter placeholders ($1) are not supported. Inline the value."
+    );
+    let analyzed = tool(
+        one_db(PORT_18, &[]),
+        "explain_query",
+        json!({"sql": "SELECT * FROM app.items WHERE id = $1", "generic_plan": true, "analyze": true}),
+    )
+    .await;
+    assert!(is_error(&analyzed), "{analyzed}");
+    assert_eq!(
+        text_of(&analyzed),
+        "generic_plan cannot be combined with analyze."
     );
 }
 
@@ -956,4 +1022,71 @@ async fn concurrent_calls() {
         seen.push(n);
     }
     assert_eq!(seen.len(), 20);
+}
+
+/// Serves the router on a loopback port and POSTs the body with Transfer-Encoding: chunked and no
+/// Content-Length. Returns the status code and the raw response text.
+async fn post_chunked(router: axum::Router, body: &str, piece: usize) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let port = listener.local_addr().expect("local address").port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to the test server");
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost:8432\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: {PROTOCOL_2025}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    );
+    let mut request = head.into_bytes();
+    for part in body.as_bytes().chunks(piece) {
+        request.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+        request.extend_from_slice(part);
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"0\r\n\r\n");
+    stream.write_all(&request).await.expect("send the request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read the response");
+    let text = String::from_utf8_lossy(&response).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_default();
+    (status, text)
+}
+
+#[tokio::test]
+async fn chunked_body_over_the_limit_gets_413() {
+    let router = app(one_db(PORT_18, &[("MAX_REQUEST_BYTES", "2048")]));
+    let padding = "x".repeat(10 * 1024);
+    let body =
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"pad": padding}});
+    let (status, text) = post_chunked(router, &body.to_string(), 512).await;
+    assert_eq!(status, 413, "{text}");
+    assert!(
+        text.contains(
+            r#"{"error":"payload_too_large","message":"Request body exceeds 2048 bytes."}"#
+        ),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn chunked_body_under_the_limit_still_works() {
+    let router = app(one_db(PORT_18, &[("MAX_REQUEST_BYTES", "2048")]));
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let (status, text) = post_chunked(router, &body.to_string(), 7).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("\"name\":\"execute_query\""), "{text}");
 }

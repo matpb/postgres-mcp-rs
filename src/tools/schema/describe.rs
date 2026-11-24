@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{NON_SYSTEM, ToolError, contains_pattern, finish, run_rows, section};
+use super::{COLUMN_TYPE_SQL, NON_SYSTEM, ToolError, contains_pattern, finish, run_rows, section};
 use crate::server::AppState;
 use crate::tools::Call;
 
@@ -38,9 +38,11 @@ const SIZES_SQL: &str = "WITH leaves AS ( \
         'toastBytes', COALESCE(sum(CASE WHEN c.reltoastrelid <> 0::oid THEN pg_catalog.pg_total_relation_size(c.reltoastrelid) ELSE 0 END), 0)::bigint) AS v \
     FROM leaves l JOIN pg_catalog.pg_class c ON c.oid = l.relid";
 
-const COLUMNS_SQL: &str = "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
+fn columns_sql() -> String {
+    format!(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
         'position', a.attnum, 'name', a.attname::text, \
-        'type', pg_catalog.format_type(a.atttypid, a.atttypmod), \
+        'type', {COLUMN_TYPE_SQL}, \
         'nullable', NOT a.attnotnull, \
         'default', CASE WHEN a.attgenerated::text <> 's' THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid) END, \
         'identity', CASE a.attidentity::text WHEN 'a' THEN 'always' WHEN 'd' THEN 'by default' END, \
@@ -51,7 +53,9 @@ const COLUMNS_SQL: &str = "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
     FROM pg_catalog.pg_attribute a \
     JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
     LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-    WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped";
+    WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped"
+    )
+}
 
 /// The primary key of the relation, or null.
 fn primary_key_sql() -> String {
@@ -170,13 +174,92 @@ const INHERITED_BY_SQL: &str = "SELECT COALESCE(jsonb_agg(cn.nspname::text || '.
 
 const VIEW_SQL: &str = "SELECT pg_catalog.pg_get_viewdef($1::oid, true) AS v";
 
-/// The server name and the table options, without any option whose key looks like a secret.
+/// The server name and every table option; values are masked by `redact_options` before they are shown.
 const FOREIGN_SQL: &str = "SELECT jsonb_build_object('server', s.srvname::text, 'options', COALESCE( \
         (SELECT jsonb_object_agg(split_part(o, '=', 1), substring(o FROM position('=' IN o) + 1)) \
-            FROM unnest(ft.ftoptions) AS o \
-            WHERE NOT (split_part(o, '=', 1) ILIKE ANY (ARRAY['%pass%', '%secret%', '%token%', '%key%']))), '{}'::jsonb)) AS v \
+            FROM unnest(ft.ftoptions) AS o), '{}'::jsonb)) AS v \
     FROM pg_catalog.pg_foreign_table ft JOIN pg_catalog.pg_foreign_server s ON s.oid = ft.ftserver \
     WHERE ft.ftrelid = $1::oid";
+
+/// Foreign table option keys whose values are shown; every other option keeps its name with the value `***`.
+const SHOWN_FOREIGN_OPTIONS: &[&str] = &[
+    "schema_name",
+    "table_name",
+    "column_name",
+    "fetch_size",
+    "batch_size",
+    "use_remote_estimate",
+    "updatable",
+    "truncatable",
+    "async_capable",
+    "analyze_sampling",
+];
+const HIDDEN_OPTION_VALUE: &str = "***";
+
+/// Masks the value of every foreign table option whose key is not on SHOWN_FOREIGN_OPTIONS.
+fn redact_options(foreign: &mut Value) {
+    let Some(options) = foreign.get_mut("options").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (key, value) in options.iter_mut() {
+        if !SHOWN_FOREIGN_OPTIONS.contains(&key.as_str()) {
+            *value = Value::String(HIDDEN_OPTION_VALUE.to_owned());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::redact_options;
+
+    #[test]
+    fn listed_options_keep_their_values_and_every_other_is_masked() {
+        let mut foreign = json!({"server": "loopback", "options": {
+            "schema_name": "app", "table_name": "items", "column_name": "id", "fetch_size": "100",
+            "batch_size": "10", "use_remote_estimate": "true", "updatable": "false",
+            "truncatable": "false", "async_capable": "true", "analyze_sampling": "auto",
+            "host": "10.0.0.5", "password": "hunter2", "sslpassword": "k", "passfile": "/x",
+            "keyfile": "/y", "token_path": "/z", "user": "u", "SCHEMA_NAME": "app"
+        }});
+        redact_options(&mut foreign);
+        let options = &foreign["options"];
+        assert_eq!(options["schema_name"], json!("app"));
+        assert_eq!(options["table_name"], json!("items"));
+        assert_eq!(options["column_name"], json!("id"));
+        assert_eq!(options["fetch_size"], json!("100"));
+        assert_eq!(options["batch_size"], json!("10"));
+        assert_eq!(options["use_remote_estimate"], json!("true"));
+        assert_eq!(options["updatable"], json!("false"));
+        assert_eq!(options["truncatable"], json!("false"));
+        assert_eq!(options["async_capable"], json!("true"));
+        assert_eq!(options["analyze_sampling"], json!("auto"));
+        for key in [
+            "host",
+            "password",
+            "sslpassword",
+            "passfile",
+            "keyfile",
+            "token_path",
+            "user",
+            "SCHEMA_NAME",
+        ] {
+            assert_eq!(options[key], json!("***"), "{key}");
+        }
+        assert_eq!(foreign["server"], json!("loopback"));
+    }
+
+    #[test]
+    fn missing_or_empty_options_are_left_alone() {
+        let mut no_options = json!({"server": "loopback"});
+        redact_options(&mut no_options);
+        assert_eq!(no_options, json!({"server": "loopback"}));
+        let mut empty = json!({"server": "loopback", "options": {}});
+        redact_options(&mut empty);
+        assert_eq!(empty, json!({"server": "loopback", "options": {}}));
+    }
+}
 
 const STATS_SQL: &str = "SELECT jsonb_build_object('lastVacuum', s.last_vacuum, 'lastAutovacuum', s.last_autovacuum, \
     'lastAnalyze', s.last_analyze, 'lastAutoanalyze', s.last_autoanalyze, \
@@ -484,7 +567,16 @@ async fn describe_table_of(
     } else {
         section(state, db, SIZES_SQL, &[oid], ct, &mut errors, "sizes").await
     };
-    let columns = section(state, db, COLUMNS_SQL, &[oid], ct, &mut errors, "columns").await;
+    let columns = section(
+        state,
+        db,
+        &columns_sql(),
+        &[oid],
+        ct,
+        &mut errors,
+        "columns",
+    )
+    .await;
     let primary_key = section(
         state,
         db,
@@ -574,7 +666,12 @@ async fn describe_table_of(
         None
     };
     let foreign = if relkind == "f" {
-        section(state, db, FOREIGN_SQL, &[oid], ct, &mut errors, "foreign").await
+        section(state, db, FOREIGN_SQL, &[oid], ct, &mut errors, "foreign")
+            .await
+            .map(|mut value| {
+                redact_options(&mut value);
+                value
+            })
     } else {
         None
     };

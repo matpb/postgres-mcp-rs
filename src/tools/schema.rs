@@ -31,6 +31,12 @@ const NON_SYSTEM: &str = "NOT (n.nspname IN ('pg_catalog', 'information_schema',
     'timescaledb_information', 'timescaledb_experimental', 'toolkit_experimental') \
     OR n.nspname::text ~ '^(pg_temp_|pg_toast_temp_|_timescaledb_)')";
 
+/// A column's type as format_type renders it, minus the `public.` prefix that the role's search_path
+/// used to hide. Needs the pg_attribute alias `a`.
+const COLUMN_TYPE_SQL: &str = "CASE WHEN pg_catalog.left(pg_catalog.format_type(a.atttypid, a.atttypmod), 7) = 'public.' \
+    THEN pg_catalog.substr(pg_catalog.format_type(a.atttypid, a.atttypmod), 8) \
+    ELSE pg_catalog.format_type(a.atttypid, a.atttypmod) END";
+
 const INCLUDE_SYSTEM_PARAM: &str =
     "Also list system schemas such as pg_catalog and information_schema. Default false.";
 const KINDS_PARAM: &str = "Kinds to include: table, partitioned_table, view, materialized_view, foreign_table, sequence, function, procedure, type. Default: all except function, procedure and type.";
@@ -228,6 +234,8 @@ async fn run_rows(
             max_value_bytes: MIB,
         },
         offset: 0,
+        search_path_catalog_only: true,
+        unbound: false,
     };
     let (name, output) = Runner::new(state)
         .internal_raw(database, statement, ct)

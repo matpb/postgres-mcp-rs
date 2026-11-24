@@ -64,6 +64,15 @@ const CREDENTIAL_RELATIONS: &[&str] = &[
     "pg_file_settings",
     "pg_hba_file_rules",
     "pg_ident_file_mappings",
+    "pg_config",
+    "pg_db_role_setting",
+];
+
+/// Schemas whose functions are TimescaleDB internals; a call qualified with one is denied.
+const INTERNAL_SCHEMAS: &[&str] = &[
+    "_timescaledb_functions",
+    "_timescaledb_internal",
+    "_timescaledb_catalog",
 ];
 
 const EXPLAIN_OPTIONS: &[&str] = &[
@@ -180,6 +189,10 @@ const R_MAINTENANCE: &str = "it performs maintenance work";
 const R_SETTINGS: &str = "it can expose credentials; use the server_info tool";
 const R_TIMESCALE: &str = "it changes TimescaleDB objects";
 const R_CRON: &str = "it changes scheduled jobs";
+const R_RAW_PAGES: &str = "it changes or reads table pages directly";
+const R_EXTENSION: &str = "it is an extension routine the gate does not allow";
+const R_NETWORK: &str = "it makes network requests";
+const R_TIMESCALE_INTERNAL: &str = "it calls TimescaleDB internals the gate cannot classify";
 
 /// Function names denied by name or prefix (a trailing `*`); matched on the last name part.
 const DENIED_FUNCTIONS: &[(&str, &str)] = &[
@@ -293,6 +306,54 @@ const DENIED_FUNCTIONS: &[(&str, &str)] = &[
     ("detach_tablespaces", R_TIMESCALE),
     ("timescaledb_pre_restore", R_TIMESCALE),
     ("timescaledb_post_restore", R_TIMESCALE),
+    ("attach_chunk", R_TIMESCALE),
+    ("detach_chunk", R_TIMESCALE),
+    ("create_chunk", R_TIMESCALE),
+    ("copy_chunk", R_TIMESCALE),
+    ("cagg_migrate", R_TIMESCALE),
+    ("set_number_partitions", R_TIMESCALE),
+    ("set_replication_factor", R_TIMESCALE),
+    ("set_adaptive_chunking", R_TIMESCALE),
+    ("create_distributed_hypertable", R_TIMESCALE),
+    ("add_policies", R_TIMESCALE),
+    ("alter_policies", R_TIMESCALE),
+    ("remove_policies", R_TIMESCALE),
+    ("remove_all_policies", R_TIMESCALE),
+    ("enable_chunk_skipping", R_TIMESCALE),
+    ("disable_chunk_skipping", R_TIMESCALE),
+    ("heap_force_kill", R_RAW_PAGES),
+    ("heap_force_freeze", R_RAW_PAGES),
+    ("pg_truncate_visibility_map", R_RAW_PAGES),
+    ("get_raw_page", R_RAW_PAGES),
+    ("autoprewarm_dump_now", R_MAINTENANCE),
+    ("autoprewarm_start_worker", R_MAINTENANCE),
+    ("pg_logdir_ls", R_FILES),
+    ("pg_background_launch", R_OTHER_SQL),
+    ("pg_background_result", R_OTHER_SQL),
+    ("pg_background_detach", R_OTHER_SQL),
+    ("http", R_NETWORK),
+    ("http_get", R_NETWORK),
+    ("http_post", R_NETWORK),
+    ("http_put", R_NETWORK),
+    ("http_patch", R_NETWORK),
+    ("http_delete", R_NETWORK),
+    ("http_head", R_NETWORK),
+    ("http_set_curlopt", R_NETWORK),
+    ("http_reset_curlopt", R_NETWORK),
+    ("postgres_fdw_disconnect", R_CONTROL),
+    ("postgres_fdw_disconnect_all", R_CONTROL),
+    ("hypopg_create_index", R_SESSION),
+    ("hypopg_drop_index", R_SESSION),
+    ("hypopg_reset", R_SESSION),
+    ("hypopg_reset_index", R_SESSION),
+    ("hypopg_hide_index", R_SESSION),
+    ("hypopg_unhide_index", R_SESSION),
+    ("hypopg_unhide_all_indexes", R_SESSION),
+    ("pg_stat_kcache_reset", R_STATS),
+    ("pg_qualstats_reset", R_STATS),
+    ("pg_wait_sampling_reset_profile", R_STATS),
+    ("pg_stat_monitor_reset", R_STATS),
+    ("pgr_*", R_EXTENSION),
 ];
 
 /// Functions that stay allowed even where a deny prefix would match them.
@@ -501,14 +562,32 @@ fn check_function(body: &Value) -> Result<(), Rejection> {
     if qualifier.as_deref() == Some("cron") && CRON_JOB_FUNCTIONS.contains(&lowered.as_str()) {
         return Err(function_denied(last, R_CRON));
     }
+    if let Some(qualifier) = qualifier.as_deref()
+        && INTERNAL_SCHEMAS.contains(&qualifier)
+    {
+        return Err(function_denied(last, R_TIMESCALE_INTERNAL));
+    }
     if let Some(reason) = deny_reason(&lowered) {
         return Err(function_denied(last, reason));
     }
-    let first_arg = items(body, "args").first().and_then(string_constant);
-    if let (true, Some(name)) = (lowered == "current_setting", first_arg) {
-        check_setting(name)?;
+    if lowered == "current_setting" {
+        check_current_setting(body)?;
     }
     Ok(())
+}
+
+/// current_setting() takes a bare string literal naming the setting; the optional missing_ok may be any constant.
+fn check_current_setting(body: &Value) -> Result<(), Rejection> {
+    let args = items(body, "args");
+    let literal = args.first().and_then(string_constant);
+    let missing_ok_is_constant = args.get(1).is_none_or(is_constant);
+    match literal {
+        Some(name) if args.len() <= 2 && missing_ok_is_constant => check_setting(name),
+        _ => {
+            let message = "current_setting() takes a literal setting name here; computed names are not allowed.";
+            Err(reject("setting_denied", message))
+        }
+    }
 }
 
 fn check_relation(body: &Value) -> Result<(), Rejection> {
@@ -660,6 +739,11 @@ fn items<'a>(value: &'a Value, key: &str) -> &'a [Value] {
 
 fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+/// True for a literal constant node such as 'x', 1, true or NULL.
+fn is_constant(arg: &Value) -> bool {
+    node_of(arg).is_some_and(|(variant, _)| variant == "AConst")
 }
 
 /// The string of a string-literal argument, such as `'work_mem'`.

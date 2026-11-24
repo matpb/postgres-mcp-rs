@@ -233,6 +233,8 @@ async fn query(
             max_value_bytes: MAX_VALUE_BYTES,
         },
         offset: 0,
+        search_path_catalog_only: true,
+        unbound: false,
     };
     let (name, output) = Runner::new(state)
         .internal_raw(database, statement, ct)

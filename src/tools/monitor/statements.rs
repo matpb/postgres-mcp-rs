@@ -26,16 +26,23 @@ const HOW_TO_ENABLE: &str = "Add pg_stat_statements to shared_preload_libraries,
 /// SQLSTATE that PostgreSQL raises when the view is read without shared_preload_libraries.
 const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
 
-/// The extension's schema, whether its view resolves on this connection, and whether the info view exists.
+/// The extension's schema and whether its info view exists; the views are then named through that schema.
 const EXTENSION_SQL: &str = "SELECT n.nspname::text AS \"schema\", \
-    (pg_catalog.to_regclass('pg_stat_statements')::oid = v.oid) AS \"resolvable\", \
-    pg_catalog.to_regclass('pg_stat_statements_info') IS NOT NULL AS \"info\" \
+    EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.relnamespace = e.extnamespace \
+        AND c.relname = 'pg_stat_statements_info') AS \"info\" \
     FROM pg_catalog.pg_extension e \
     JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
-    LEFT JOIN pg_catalog.pg_class v ON v.relnamespace = e.extnamespace AND v.relname = 'pg_stat_statements' \
     WHERE e.extname = 'pg_stat_statements'";
-const INFO_SQL: &str = "SELECT i.dealloc AS \"dealloc\", i.stats_reset AS \"statsReset\" FROM pg_stat_statements_info i";
 const OPTIONAL_COLUMNS: [&str; 2] = ["total_plan_time", "wal_bytes"];
+
+/// `"schema".name` with the schema quoted, so the name resolves whatever the search_path is.
+fn qualified_name(schema: &str, name: &str) -> String {
+    format!("\"{}\".{name}", schema.replace('"', "\"\""))
+}
+
+fn info_sql(info_view: &str) -> String {
+    format!("SELECT i.dealloc AS \"dealloc\", i.stats_reset AS \"statsReset\" FROM {info_view} i")
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -103,22 +110,16 @@ async fn statements_of(
         ));
     };
     let db_name = extension.database.clone();
-    if !flag_of(ext, "resolvable") {
-        let schema = ext
-            .get("schema")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let reason = format!(
-            "pg_stat_statements is installed in schema {schema}, which is not on the search_path of this connection."
-        );
-        return Ok(unavailable(db_name, reason, None));
-    }
+    let schema = ext
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let view = qualified_name(schema, "pg_stat_statements");
     let has_info = flag_of(ext, "info");
 
     let visibility = text_visibility(state, database, ct).await?;
-    let optional =
-        present_columns(state, database, "pg_stat_statements", &OPTIONAL_COLUMNS, ct).await?;
-    let sql = statements_sql(&optional, order, limit);
+    let optional = present_columns(state, database, &view, &OPTIONAL_COLUMNS, ct).await?;
+    let sql = statements_sql(&view, &optional, order, limit);
     let min_calls = args.min_calls.map(|calls| calls.to_string());
     let params: [Option<&str>; 3] = [
         Some(bool_text(flag(args.all_databases))),
@@ -145,7 +146,8 @@ async fn statements_of(
         shape_query(row, query_chars);
     }
     let (stats_reset, dealloc) = if has_info {
-        let info = wide_rows(state, database, INFO_SQL, &[], ct).await?;
+        let info_view = qualified_name(schema, "pg_stat_statements_info");
+        let info = wide_rows(state, database, &info_sql(&info_view), &[], ct).await?;
         let row = first_object(info.rows);
         (
             row.get("statsReset")
@@ -196,7 +198,7 @@ fn order_clause(order_by: Option<&str>) -> Result<&'static str, ToolError> {
 }
 
 /// The ranking query over the view; the optional columns are included only when the server has them.
-fn statements_sql(optional: &[String], order: &str, limit: i64) -> String {
+fn statements_sql(view: &str, optional: &[String], order: &str, limit: i64) -> String {
     let has = |name: &str| optional.iter().any(|column| column == name);
     let mut extra = String::new();
     if has("total_plan_time") {
@@ -217,7 +219,7 @@ fn statements_sql(optional: &[String], order: &str, limit: i64) -> String {
         s.shared_blks_dirtied AS \"sharedBlksDirtied\", s.temp_blks_written AS \"tempBlksWritten\", \
         CASE WHEN s.shared_blks_hit + s.shared_blks_read > 0 \
         THEN ROUND(s.shared_blks_hit::numeric / (s.shared_blks_hit + s.shared_blks_read), 4)::float8 END AS \"cacheHitRatio\" \
-        FROM pg_stat_statements s \
+        FROM {view} s \
         LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.userid \
         LEFT JOIN pg_catalog.pg_database d ON d.oid = s.dbid \
         WHERE ($1::boolean OR s.dbid = (SELECT db.oid FROM pg_catalog.pg_database db WHERE db.datname = pg_catalog.current_database())) \

@@ -59,8 +59,9 @@ const FEATURES_SQL: &str = "SELECT pg_catalog.quote_ident(current_user) AS who, 
     CASE WHEN pg_catalog.to_regrole('pg_read_all_stats') IS NULL THEN false \
         ELSE pg_catalog.pg_has_role(current_user, 'pg_read_all_stats', 'USAGE') END AS \"queryText\", \
     EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements') AS \"pgssInstalled\", \
-    CASE WHEN pg_catalog.to_regclass('pg_stat_statements') IS NULL THEN false \
-        ELSE pg_catalog.has_table_privilege(pg_catalog.to_regclass('pg_stat_statements'), 'SELECT') END AS \"pgssSelect\", \
+    COALESCE((SELECT pg_catalog.has_table_privilege(c.oid, 'SELECT') FROM pg_catalog.pg_extension e \
+        JOIN pg_catalog.pg_class c ON c.relnamespace = e.extnamespace AND c.relname = 'pg_stat_statements' \
+        WHERE e.extname = 'pg_stat_statements'), false) AS \"pgssSelect\", \
     CASE WHEN pg_catalog.to_regprocedure('pgmcp.read_log_file(text,bigint,integer)') IS NULL \
         OR pg_catalog.to_regnamespace('pgmcp') IS NULL THEN false \
         ELSE pg_catalog.has_function_privilege(pg_catalog.to_regprocedure('pgmcp.read_log_file(text,bigint,integer)'), 'EXECUTE') \

@@ -458,6 +458,237 @@ fn arguments_are_unchanged() {
     assert_eq!(sql, "SELECT $1, lo_get(1)");
 }
 
+const COMPUTED_SETTING: &str =
+    "current_setting() takes a literal setting name here; computed names are not allowed.";
+
+#[test]
+fn current_setting_takes_only_a_literal_name() {
+    for sql in [
+        "SELECT current_setting('primary_conninfo'::text)",
+        "SELECT current_setting('primary_' || 'conninfo')",
+        "SELECT current_setting(lower('X'))",
+        "SELECT current_setting(n) FROM unnest(ARRAY['primary_conninfo']) AS n",
+        "SELECT pg_catalog.current_setting('archive_command'::text)",
+        "SELECT current_setting((SELECT 'primary_conninfo'))",
+        "SELECT current_setting(VARIADIC ARRAY['primary_conninfo'])",
+        "SELECT \"current_setting\"('ssl_passphrase_command'::name)",
+        "SELECT current_setting('work_mem'::text)",
+        "SELECT current_setting(1)",
+        "SELECT current_setting(NULL)",
+        "SELECT current_setting('work_mem', current_setting('work_mem'))",
+        "SELECT current_setting()",
+    ] {
+        let rejection = gate(sql).expect_err(sql);
+        assert_eq!(rejection.code, "setting_denied", "{sql}");
+        assert_eq!(rejection.message, COMPUTED_SETTING, "{sql}");
+    }
+}
+
+#[test]
+fn current_setting_literal_secret_uses_the_secret_message() {
+    let rejection = gate("SELECT pg_catalog.current_setting('Primary_Conninfo', true)")
+        .expect_err("secret literal");
+    assert_eq!(rejection.code, "setting_denied");
+    assert_eq!(
+        rejection.message,
+        "The setting primary_conninfo can expose credentials or local paths and is not readable through this server. Use the server_info tool for settings."
+    );
+}
+
+#[test]
+fn current_setting_literal_names_are_accepted() {
+    for sql in [
+        "SELECT current_setting('work_mem')",
+        "SELECT pg_catalog.current_setting('TimeZone', true)",
+        "SELECT current_setting('work_mem', 1)",
+    ] {
+        assert_eq!(
+            gate(sql).map(|a| a.kind),
+            Ok(StatementKind::Select),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn catalog_config_relation_is_denied_with_exact_message() {
+    let rejection = gate("SELECT * FROM pg_config").expect_err("build configuration view");
+    assert_eq!(rejection.code, "relation_denied");
+    assert_eq!(
+        rejection.message,
+        "pg_config can expose credentials and is not readable through this server. Use the server_info tool for settings."
+    );
+}
+
+/// Every function name the gate denies by name, with the reason the message must give.
+const DENIED_BY_NAME: &[(&str, &str)] = &[
+    (
+        "heap_force_kill",
+        "it changes or reads table pages directly",
+    ),
+    (
+        "heap_force_freeze",
+        "it changes or reads table pages directly",
+    ),
+    (
+        "pg_truncate_visibility_map",
+        "it changes or reads table pages directly",
+    ),
+    ("get_raw_page", "it changes or reads table pages directly"),
+    ("autoprewarm_dump_now", "it performs maintenance work"),
+    ("autoprewarm_start_worker", "it performs maintenance work"),
+    ("pg_prewarm", "it performs maintenance work"),
+    ("pg_logdir_ls", "it reads or writes server files"),
+    ("add_policies", "it changes TimescaleDB objects"),
+    ("alter_policies", "it changes TimescaleDB objects"),
+    ("remove_policies", "it changes TimescaleDB objects"),
+    ("remove_all_policies", "it changes TimescaleDB objects"),
+    ("enable_chunk_skipping", "it changes TimescaleDB objects"),
+    ("disable_chunk_skipping", "it changes TimescaleDB objects"),
+    ("attach_chunk", "it changes TimescaleDB objects"),
+    ("detach_chunk", "it changes TimescaleDB objects"),
+    ("create_chunk", "it changes TimescaleDB objects"),
+    ("copy_chunk", "it changes TimescaleDB objects"),
+    ("cagg_migrate", "it changes TimescaleDB objects"),
+    ("set_number_partitions", "it changes TimescaleDB objects"),
+    ("set_replication_factor", "it changes TimescaleDB objects"),
+    ("set_adaptive_chunking", "it changes TimescaleDB objects"),
+    (
+        "create_distributed_hypertable",
+        "it changes TimescaleDB objects",
+    ),
+    (
+        "pg_background_launch",
+        "it executes SQL text the gate cannot inspect",
+    ),
+    (
+        "pg_background_result",
+        "it executes SQL text the gate cannot inspect",
+    ),
+    (
+        "pg_background_detach",
+        "it executes SQL text the gate cannot inspect",
+    ),
+    ("http", "it makes network requests"),
+    ("http_get", "it makes network requests"),
+    ("http_post", "it makes network requests"),
+    ("http_put", "it makes network requests"),
+    ("http_patch", "it makes network requests"),
+    ("http_delete", "it makes network requests"),
+    ("http_head", "it makes network requests"),
+    ("http_set_curlopt", "it makes network requests"),
+    ("http_reset_curlopt", "it makes network requests"),
+    (
+        "postgres_fdw_disconnect",
+        "it controls the server or other sessions",
+    ),
+    (
+        "postgres_fdw_disconnect_all",
+        "it controls the server or other sessions",
+    ),
+    (
+        "hypopg_create_index",
+        "it changes session state that pooled connections would leak",
+    ),
+    (
+        "hypopg_drop_index",
+        "it changes session state that pooled connections would leak",
+    ),
+    (
+        "hypopg_reset",
+        "it changes session state that pooled connections would leak",
+    ),
+    (
+        "hypopg_reset_index",
+        "it changes session state that pooled connections would leak",
+    ),
+    (
+        "hypopg_hide_index",
+        "it changes session state that pooled connections would leak",
+    ),
+    (
+        "hypopg_unhide_index",
+        "it changes session state that pooled connections would leak",
+    ),
+    (
+        "hypopg_unhide_all_indexes",
+        "it changes session state that pooled connections would leak",
+    ),
+    ("pg_stat_kcache_reset", "it changes statistics"),
+    ("pg_qualstats_reset", "it changes statistics"),
+    ("pg_wait_sampling_reset_profile", "it changes statistics"),
+    ("pg_stat_monitor_reset", "it changes statistics"),
+    (
+        "pgr_dijkstra",
+        "it is an extension routine the gate does not allow",
+    ),
+    (
+        "pgr_createtopology",
+        "it is an extension routine the gate does not allow",
+    ),
+];
+
+#[test]
+fn extension_functions_are_denied_by_name() {
+    for (name, reason) in DENIED_BY_NAME {
+        let upper = name.to_uppercase();
+        for (sql, shown) in [
+            (format!("SELECT {name}()"), name.to_string()),
+            (
+                format!("SELECT pg_catalog.{name}(1, 'x')"),
+                name.to_string(),
+            ),
+            (format!("SELECT \"{upper}\"()"), upper.clone()),
+        ] {
+            let rejection = gate(&sql).expect_err(&sql);
+            assert_eq!(rejection.code, "function_denied", "{sql}");
+            assert_eq!(
+                rejection.message,
+                format!("Function {shown}() is not allowed: {reason}."),
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn calls_qualified_with_timescaledb_internal_schemas_are_denied() {
+    for schema in [
+        "_timescaledb_functions",
+        "_timescaledb_internal",
+        "_timescaledb_catalog",
+    ] {
+        for name in ["hypertable_size", "time_bucket", "anything_at_all"] {
+            let sql = format!("SELECT {schema}.{name}('t')");
+            let rejection = gate(&sql).expect_err(&sql);
+            assert_eq!(rejection.code, "function_denied", "{sql}");
+            assert_eq!(
+                rejection.message,
+                format!(
+                    "Function {name}() is not allowed: it calls TimescaleDB internals the gate cannot classify."
+                ),
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn timescaledb_read_functions_stay_allowed() {
+    for sql in [
+        "SELECT time_bucket('1 hour', ts), first(v, ts), last(v, ts) FROM t",
+        "SELECT hypertable_size('t'), hypertable_detailed_size('t'), show_chunks('t')",
+        "SELECT approximate_row_count('t'), chunks_detailed_size('t')",
+        "SELECT histogram(v, 0, 10, 5), locf(v), interpolate(v)",
+    ] {
+        assert_eq!(
+            gate(sql).map(|a| a.kind),
+            Ok(StatementKind::Select),
+            "{sql}"
+        );
+    }
+}
+
 /// Marks which characters are code, so mutations never touch strings or comments.
 fn code_mask(chars: &[char]) -> Vec<bool> {
     let mut mask = vec![false; chars.len()];
