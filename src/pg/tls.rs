@@ -9,6 +9,7 @@ use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{WebPkiServerVerifier, verify_server_cert_signed_by_trust_anchor};
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 
@@ -72,8 +73,8 @@ fn load_roots(root_cert: Option<&Path>) -> Result<RootCertStore, WireError> {
         Some(path) => {
             let file = std::fs::File::open(path)
                 .map_err(|e| WireError::Tls(format!("cannot open {}: {e}", path.display())))?;
-            let mut reader = std::io::BufReader::new(file);
-            for cert in rustls_pemfile::certs(&mut reader) {
+            let reader = std::io::BufReader::new(file);
+            for cert in CertificateDer::pem_reader_iter(reader) {
                 let cert = cert
                     .map_err(|e| WireError::Tls(format!("cannot read {}: {e}", path.display())))?;
                 roots.add(cert).map_err(|e| WireError::Tls(e.to_string()))?;

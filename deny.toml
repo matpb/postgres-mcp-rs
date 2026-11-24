@@ -12,8 +12,6 @@ feature-depth = 1
 ignore = [
     # chrono is pulled in by rmcp and schemars; no fixed version exists, so it cannot be upgraded here.
     { id = "RUSTSEC-2026-0543", reason = "unmaintained chrono, transitive via rmcp/schemars; no safe upgrade" },
-    # rustls-pemfile is used directly by the crate; the fix needs a source migration to rustls-pki-types.
-    { id = "RUSTSEC-2025-0134", reason = "unmaintained rustls-pemfile, direct dep; no safe upgrade, migration pending" },
 ]
 
 [licenses]

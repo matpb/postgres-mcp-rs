@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use postgres_mcp::config::{Config, ConfigError, LogFormat};
 use postgres_mcp::pg::tls::SslMode;
+use postgres_mcp::pg::wire::AuthPolicy;
 
 const URL: &str = "postgres://app:pw-secret@db.example.com:5433/appdb";
 
@@ -783,4 +784,141 @@ fn audit_log_and_log_format() {
         load_err(&[("DATABASE_URL", URL), ("LOG_FORMAT", "xml")]),
         "LOG_FORMAT: \"xml\" is not text or json"
     );
+}
+
+fn auth(scram: bool, md5: bool, password: bool, trust: bool) -> AuthPolicy {
+    AuthPolicy {
+        scram,
+        md5,
+        password,
+        trust,
+    }
+}
+
+#[test]
+fn require_auth_default_is_scram_and_none() {
+    let config = cfg(&[("DATABASE_URL", URL)]);
+    assert_eq!(config.databases[0].auth, auth(true, false, false, true));
+    assert_eq!(config.databases[0].auth, AuthPolicy::default());
+}
+
+#[test]
+fn require_auth_from_libpq_environment() {
+    let base = [("PGDATABASE", "pdb"), ("PGUSER", "pu")];
+    let with = |value: &str| {
+        let mut pairs = base.to_vec();
+        pairs.push(("PGREQUIREAUTH", value));
+        cfg(&pairs).databases[0].auth.clone()
+    };
+    assert_eq!(with("md5,password"), auth(false, true, true, false));
+    assert_eq!(with("none"), auth(false, false, false, true));
+    assert_eq!(with("scram-sha-256"), auth(true, false, false, false));
+    assert_eq!(
+        with("scram-sha-256,md5,password,none"),
+        auth(true, true, true, true)
+    );
+    assert_eq!(with(""), AuthPolicy::default());
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGREQUIREAUTH", "kerberos")
+        ]),
+        "PGREQUIREAUTH: unknown authentication method \"kerberos\"; expected scram-sha-256, md5, password or none"
+    );
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGREQUIREAUTH", " , ")
+        ]),
+        "PGREQUIREAUTH: no authentication method is listed"
+    );
+}
+
+#[test]
+fn require_auth_from_url_query() {
+    let config = cfg(&[(
+        "DATABASE_URL",
+        "postgres://app:pw@db.example.com/appdb?require_auth=md5,password",
+    )]);
+    assert_eq!(config.databases[0].auth, auth(false, true, true, false));
+    assert_eq!(
+        load_err(&[(
+            "DATABASE_URL",
+            "postgres://app:pw@db.example.com/appdb?require_auth=md5,bogus"
+        )]),
+        "DATABASE_URL: require_auth: unknown authentication method \"bogus\"; expected scram-sha-256, md5, password or none"
+    );
+    assert_eq!(
+        load_err(&[(
+            "DATABASE_URL",
+            "postgres://app:pw@db.example.com/appdb?require_auth="
+        )]),
+        "DATABASE_URL: require_auth: no authentication method is listed"
+    );
+}
+
+#[test]
+fn require_auth_from_json_entry() {
+    let config = cfg(&[(
+        "PG_DATABASES",
+        r#"[{"name":"a","database":"db","user":"u","require_auth":"password"}]"#,
+    )]);
+    assert_eq!(config.databases[0].auth, auth(false, false, true, false));
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","database":"db","user":"u","require_auth":"none,kerberos"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): require_auth: unknown authentication method \"kerberos\"; expected scram-sha-256, md5, password or none"
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","url":"postgres://u@h/db","require_auth":"md5"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): \"require_auth\" cannot be combined with \"url\""
+    );
+}
+
+#[test]
+fn verify_ca_needs_sslrootcert_in_each_source() {
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLMODE", "verify-ca")
+        ]),
+        "PGSSLMODE: sslmode=verify-ca needs sslrootcert"
+    );
+    assert_eq!(
+        load_err(&[(
+            "DATABASE_URL",
+            "postgres://app:pw@db.example.com/appdb?sslmode=verify-ca"
+        )]),
+        "DATABASE_URL: sslmode=verify-ca needs sslrootcert"
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","database":"db","user":"u","sslmode":"verify-ca"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): sslmode=verify-ca needs sslrootcert"
+    );
+    let ca = TempFile::new("not a certificate, only the path matters here");
+    let root = ca.path();
+    let config = cfg(&[
+        ("PGDATABASE", "pdb"),
+        ("PGUSER", "pu"),
+        ("PGSSLMODE", "verify-ca"),
+        ("PGSSLROOTCERT", root.as_str()),
+    ]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::VerifyCa);
+    let full = cfg(&[
+        ("PGDATABASE", "pdb"),
+        ("PGUSER", "pu"),
+        ("PGSSLMODE", "verify-full"),
+    ]);
+    assert_eq!(full.databases[0].connect.ssl_mode, SslMode::VerifyFull);
 }

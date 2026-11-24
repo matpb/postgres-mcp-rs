@@ -468,3 +468,29 @@ fn tls_root_cert_errors_are_exact() {
         other => panic!("expected Tls error, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn oversized_row_is_skipped_not_buffered_on_real_server() {
+    let mut conn = connect(15432).await;
+    // Row cap for max_bytes 48000: 4 * 48000 + 1 MiB = 1240576 bytes.
+    let limits = FetchLimits {
+        max_rows: 1_000,
+        max_bytes: 48_000,
+        max_value_bytes: 4_096,
+    };
+    let r = conn
+        .query("SELECT repeat('x', 300000000)", &[], false, &limits)
+        .await
+        .expect("truncated query");
+    assert_eq!(r.truncated, Some(Truncation::Bytes));
+    assert!(r.rows.len() <= 1, "rows: {}", r.rows.len());
+    assert_eq!(r.command_tag, None);
+    assert!(
+        conn.peak_message_bytes() <= 1_240_576,
+        "largest buffered message: {}",
+        conn.peak_message_bytes()
+    );
+    assert!(!conn.is_poisoned());
+    let r = conn.simple_query("SELECT 1").await.expect("usable again");
+    assert_eq!(r.rows, vec![vec![s("1")]]);
+}

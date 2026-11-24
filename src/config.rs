@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::http_guard::parse_origin;
 use crate::pg::tls::SslMode;
-use crate::pg::wire::ConnectConfig;
+use crate::pg::wire::{AuthPolicy, ConnectConfig};
 
 const DEFAULT_PORT: u16 = 8432;
 const MIN_API_KEY_CHARS: usize = 16;
@@ -37,6 +37,7 @@ const DATABASE_FIELDS: &[&str] = &[
     "password_file",
     "sslmode",
     "sslrootcert",
+    "require_auth",
     "max_connections",
     "statement_timeout_ms",
     "lock_timeout_ms",
@@ -50,6 +51,7 @@ const URL_EXCLUSIVE_FIELDS: &[&str] = &[
     "password",
     "sslmode",
     "sslrootcert",
+    "require_auth",
 ];
 
 /// Every variable this module reads; `from_env` copies them out of the process environment.
@@ -71,6 +73,7 @@ const ENV_VARS: &[&str] = &[
     "PGPASSWORD",
     "PGSSLMODE",
     "PGSSLROOTCERT",
+    "PGREQUIREAUTH",
     "PGAPPNAME",
     "MAX_ROWS",
     "MAX_VALUE_BYTES",
@@ -101,6 +104,8 @@ pub struct Limits {
 pub struct DatabaseConfig {
     pub name: String,
     pub connect: ConnectConfig,
+    /// Authentication methods the server may use, from `require_auth`.
+    pub auth: AuthPolicy,
     pub max_connections: usize,
     pub statement_timeout_ms: u64,
     pub lock_timeout_ms: u64,
@@ -188,6 +193,7 @@ struct Target {
     password: Option<String>,
     ssl_mode: SslMode,
     ssl_root_cert: Option<PathBuf>,
+    auth: AuthPolicy,
     /// `application_name` from a URL query, used when PGAPPNAME is unset.
     application_name: Option<String>,
     connect_timeout: Option<Duration>,
@@ -333,6 +339,51 @@ fn parse_port(name: &str, raw: &str) -> Result<u16, ConfigError> {
             "{name}: \"{raw}\" is not a port number"
         ))),
     }
+}
+
+/// verify-ca checks the chain only, so it needs a root certificate to check against.
+fn require_root_for_verify_ca(
+    name: &str,
+    mode: SslMode,
+    has_root: bool,
+) -> Result<(), ConfigError> {
+    if mode == SslMode::VerifyCa && !has_root {
+        return Err(ConfigError(format!(
+            "{name}: sslmode=verify-ca needs sslrootcert"
+        )));
+    }
+    Ok(())
+}
+
+/// Parses a `require_auth` comma list; each item names one method the server may use.
+fn parse_require_auth(name: &str, raw: &str) -> Result<AuthPolicy, ConfigError> {
+    let mut policy = AuthPolicy {
+        scram: false,
+        md5: false,
+        password: false,
+        trust: false,
+    };
+    let mut listed = false;
+    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        listed = true;
+        match item {
+            "scram-sha-256" => policy.scram = true,
+            "md5" => policy.md5 = true,
+            "password" => policy.password = true,
+            "none" => policy.trust = true,
+            other => {
+                return Err(ConfigError(format!(
+                    "{name}: unknown authentication method \"{other}\"; expected scram-sha-256, md5, password or none"
+                )));
+            }
+        }
+    }
+    if !listed {
+        return Err(ConfigError(format!(
+            "{name}: no authentication method is listed"
+        )));
+    }
+    Ok(policy)
 }
 
 fn parse_ssl_mode(name: &str, raw: &str) -> Result<SslMode, ConfigError> {
@@ -516,6 +567,16 @@ fn libpq_database(
     let name = resolve_name(get, &database, "PGDATABASE")?;
     let user = var(get, "PGUSER")
         .ok_or_else(|| ConfigError("PGUSER: required when PGDATABASE is set".into()))?;
+    let ssl_mode = match var(get, "PGSSLMODE") {
+        Some(raw) => parse_ssl_mode("PGSSLMODE", &raw)?,
+        None => SslMode::Prefer,
+    };
+    let ssl_root_cert = var(get, "PGSSLROOTCERT").map(PathBuf::from);
+    require_root_for_verify_ca("PGSSLMODE", ssl_mode, ssl_root_cert.is_some())?;
+    let auth = match var(get, "PGREQUIREAUTH") {
+        Some(raw) => parse_require_auth("PGREQUIREAUTH", &raw)?,
+        None => AuthPolicy::default(),
+    };
     let target = Target {
         host: var(get, "PGHOST").unwrap_or_else(|| DEFAULT_PG_HOST.to_owned()),
         port: match var(get, "PGPORT") {
@@ -525,11 +586,9 @@ fn libpq_database(
         database,
         user,
         password: var(get, "PGPASSWORD"),
-        ssl_mode: match var(get, "PGSSLMODE") {
-            Some(raw) => parse_ssl_mode("PGSSLMODE", &raw)?,
-            None => SslMode::Prefer,
-        },
-        ssl_root_cert: var(get, "PGSSLROOTCERT").map(PathBuf::from),
+        ssl_mode,
+        ssl_root_cert,
+        auth,
         application_name: None,
         connect_timeout: None,
     };
@@ -566,9 +625,11 @@ fn env_database(
     defaults: &Defaults,
     app_name: Option<&str>,
 ) -> DatabaseConfig {
+    let auth = target.auth.clone();
     DatabaseConfig {
         name,
         connect: connect_config(target, app_name),
+        auth,
         max_connections: DEFAULT_MAX_CONNECTIONS,
         statement_timeout_ms: defaults.statement_timeout_ms,
         lock_timeout_ms: defaults.lock_timeout_ms,
@@ -641,12 +702,14 @@ fn url_target(label: &str, raw: &str) -> Result<Target, ConfigError> {
 
     let mut sslmode = None;
     let mut sslrootcert = None;
+    let mut require_auth = None;
     let mut application_name = None;
     let mut connect_timeout = None;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "sslmode" => sslmode = Some(value.into_owned()),
             "sslrootcert" => sslrootcert = Some(PathBuf::from(value.as_ref())),
+            "require_auth" => require_auth = Some(value.into_owned()),
             "application_name" => application_name = Some(value.into_owned()),
             "connect_timeout" => connect_timeout = Some(value.into_owned()),
             other => {
@@ -659,6 +722,11 @@ fn url_target(label: &str, raw: &str) -> Result<Target, ConfigError> {
     let ssl_mode = match sslmode {
         Some(raw) => parse_ssl_mode(&format!("{label}: sslmode"), &raw)?,
         None => SslMode::Prefer,
+    };
+    require_root_for_verify_ca(label, ssl_mode, sslrootcert.is_some())?;
+    let auth = match require_auth {
+        Some(raw) => parse_require_auth(&format!("{label}: require_auth"), &raw)?,
+        None => AuthPolicy::default(),
     };
     let connect_timeout = connect_timeout
         .map(|raw| {
@@ -679,6 +747,7 @@ fn url_target(label: &str, raw: &str) -> Result<Target, ConfigError> {
         password,
         ssl_mode,
         ssl_root_cert: sslrootcert,
+        auth,
         application_name,
         connect_timeout,
     })
@@ -795,9 +864,11 @@ fn json_database(
         }
         None => json_discrete_target(map, &label)?,
     };
+    let auth = target.auth.clone();
     Ok(DatabaseConfig {
         name,
         connect: connect_config(target, app_name),
+        auth,
         max_connections,
         statement_timeout_ms,
         lock_timeout_ms,
@@ -831,6 +902,12 @@ fn json_discrete_target(map: &Map<String, Value>, label: &str) -> Result<Target,
         Some(raw) => parse_ssl_mode(&format!("{label}: sslmode"), &raw)?,
         None => SslMode::Prefer,
     };
+    let ssl_root_cert = json_string(map, "sslrootcert", label)?.map(PathBuf::from);
+    require_root_for_verify_ca(label, ssl_mode, ssl_root_cert.is_some())?;
+    let auth = match json_string(map, "require_auth", label)? {
+        Some(raw) => parse_require_auth(&format!("{label}: require_auth"), &raw)?,
+        None => AuthPolicy::default(),
+    };
     Ok(Target {
         host: json_string(map, "host", label)?.unwrap_or_else(|| DEFAULT_PG_HOST.to_owned()),
         port,
@@ -838,7 +915,8 @@ fn json_discrete_target(map: &Map<String, Value>, label: &str) -> Result<Target,
         user,
         password,
         ssl_mode,
-        ssl_root_cert: json_string(map, "sslrootcert", label)?.map(PathBuf::from),
+        ssl_root_cert,
+        auth,
         application_name: None,
         connect_timeout: None,
     })

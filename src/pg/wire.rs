@@ -31,6 +31,36 @@ const MAX_OTHER_LEN: u64 = 64 << 20;
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCARD_MAX_BYTES: usize = 64 << 20;
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read size used when a DataRow is discarded without being buffered.
+const SKIP_CHUNK: usize = 64 << 10;
+const ROW_CAP_FLOOR: usize = 64 << 10;
+const ROW_CAP_HEADROOM: usize = 1 << 20;
+const ROW_CAP_CEILING: usize = 256 << 20;
+
+/// Largest DataRow buffered for one query: 4 x max_bytes plus 1 MiB, within 64 KiB to 256 MiB.
+fn row_cap(limits: &FetchLimits) -> usize {
+    limits
+        .max_bytes
+        .saturating_mul(4)
+        .saturating_add(ROW_CAP_HEADROOM)
+        .clamp(ROW_CAP_FLOOR, ROW_CAP_CEILING)
+}
+
+/// What `recv_frame` may skip instead of failing.
+#[derive(Clone, Copy)]
+enum Skip {
+    Nothing,
+    /// Query rows: DataRows over `row_cap` are discarded unbuffered, NotificationResponse is ignored.
+    Rows {
+        row_cap: usize,
+    },
+}
+
+/// One received frame: a whole message, or a DataRow discarded unbuffered.
+enum Frame {
+    Message(Incoming),
+    SkippedRow { len: usize },
+}
 
 #[derive(Clone)]
 pub struct ConnectConfig {
@@ -64,6 +94,26 @@ impl fmt::Debug for ConnectConfig {
             .field("connect_timeout", &self.connect_timeout)
             .field("startup_params", &self.startup_params)
             .finish()
+    }
+}
+
+/// Which authentication methods the server may use. Refused methods are never answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthPolicy {
+    pub scram: bool,
+    pub md5: bool,
+    pub password: bool,
+    pub trust: bool,
+}
+
+impl Default for AuthPolicy {
+    fn default() -> Self {
+        AuthPolicy {
+            scram: true,
+            md5: false,
+            password: false,
+            trust: true,
+        }
     }
 }
 
@@ -198,6 +248,7 @@ pub struct Connection {
     parameters: HashMap<String, String>,
     cancel: CancelHandle,
     poisoned: bool,
+    peak_message_bytes: usize,
 }
 
 /// One backend message with its tag and total length (header included).
@@ -209,9 +260,22 @@ struct Incoming {
 
 impl Connection {
     pub async fn connect(cfg: &ConnectConfig) -> Result<Connection, WireError> {
-        tokio::time::timeout(cfg.connect_timeout, connect_inner(cfg))
+        Connection::connect_with(cfg, &AuthPolicy::default()).await
+    }
+
+    /// Connects and authenticates; only the methods in `policy` are answered.
+    pub async fn connect_with(
+        cfg: &ConnectConfig,
+        policy: &AuthPolicy,
+    ) -> Result<Connection, WireError> {
+        tokio::time::timeout(cfg.connect_timeout, connect_inner(cfg, policy))
             .await
             .map_err(|_| WireError::Timeout)?
+    }
+
+    /// Largest message this connection has buffered so far, header included.
+    pub fn peak_message_bytes(&self) -> usize {
+        self.peak_message_bytes
     }
 
     pub fn parameter(&self, name: &str) -> Option<&str> {
@@ -291,10 +355,19 @@ impl Connection {
 
     /// Reads one backend message. ParameterStatus and NoticeResponse are consumed here.
     async fn recv(&mut self) -> Result<Incoming, WireError> {
+        match self.recv_frame(Skip::Nothing).await? {
+            Frame::Message(incoming) => Ok(incoming),
+            Frame::SkippedRow { .. } => Err(protocol("DataRow is too large")),
+        }
+    }
+
+    /// Reads one backend frame, discarding what `skip` allows without buffering it.
+    async fn recv_frame(&mut self, skip: Skip) -> Result<Frame, WireError> {
         loop {
             if let Some(header) = Header::parse(&self.buf).map_err(protocol)? {
                 let (tag, len) = (header.tag(), header.len());
-                if matches!(tag, b'A' | b'G' | b'H' | b'W' | b'd' | b'c') {
+                let rows = matches!(skip, Skip::Rows { .. });
+                if matches!(tag, b'G' | b'H' | b'W' | b'd' | b'c') || (tag == b'A' && !rows) {
                     return Err(unexpected(tag));
                 }
                 let limit = if tag == b'D' {
@@ -310,7 +383,15 @@ impl Connection {
                     )));
                 }
                 let total = usize::try_from(len).map_err(protocol)? + 1;
+                if let Skip::Rows { row_cap } = skip
+                    && tag == b'D'
+                    && total > row_cap
+                {
+                    self.discard_message(total).await?;
+                    return Ok(Frame::SkippedRow { len: total });
+                }
                 if self.buf.len() >= total {
+                    self.peak_message_bytes = self.peak_message_bytes.max(total);
                     let message = Message::parse(&mut self.buf)
                         .map_err(protocol)?
                         .ok_or_else(|| protocol("incomplete message"))?;
@@ -319,30 +400,47 @@ impl Connection {
                             trace!("ignoring NoticeResponse");
                             continue;
                         }
+                        Message::NotificationResponse(_) if rows => continue,
                         Message::ParameterStatus(body) => {
                             let name = body.name().map_err(protocol)?.to_owned();
                             let value = body.value().map_err(protocol)?.to_owned();
+                            check_session_parameter(&name, &value)?;
                             self.parameters.insert(name, value);
                             continue;
                         }
                         message => {
-                            return Ok(Incoming {
+                            return Ok(Frame::Message(Incoming {
                                 tag,
                                 len: total,
                                 message,
-                            });
+                            }));
                         }
                     }
                 }
             }
             let read = self.stream.read_buf(&mut self.buf).await?;
             if read == 0 {
-                return Err(WireError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed the connection",
-                )));
+                return Err(eof());
             }
         }
+    }
+
+    /// Drops the next `total` bytes of the stream in SKIP_CHUNK steps, using buffered bytes first.
+    async fn discard_message(&mut self, total: usize) -> Result<(), WireError> {
+        let mut remaining = total;
+        let buffered = remaining.min(self.buf.len());
+        self.buf.advance(buffered);
+        remaining -= buffered;
+        let mut chunk = vec![0u8; SKIP_CHUNK];
+        while remaining > 0 {
+            let want = remaining.min(SKIP_CHUNK);
+            let read = self.stream.read(&mut chunk[..want]).await?;
+            if read == 0 {
+                return Err(eof());
+            }
+            remaining -= read;
+        }
+        Ok(())
     }
 
     async fn simple_inner(&mut self, sql: &str) -> Result<SimpleResult, WireError> {
@@ -490,8 +588,18 @@ impl Connection {
         let mut command_tag = None;
         let mut error = None;
         let mut status = None;
+        let skip = Skip::Rows {
+            row_cap: row_cap(limits),
+        };
         loop {
-            let incoming = self.recv().await?;
+            let incoming = match self.recv_frame(skip).await? {
+                Frame::Message(incoming) => incoming,
+                Frame::SkippedRow { .. } if bound => {
+                    truncated = Some(Truncation::Bytes);
+                    break;
+                }
+                Frame::SkippedRow { .. } => return Err(unexpected(b'D')),
+            };
             match incoming.message {
                 Message::BindComplete if !bound => bound = true,
                 Message::DataRow(body) if bound => {
@@ -518,7 +626,7 @@ impl Connection {
 
         if let Some(t) = truncated {
             self.cancel.cancel().await?;
-            let (tx_status, other) = self.discard_until_ready().await?;
+            let (tx_status, other) = self.discard_until_ready(skip).await?;
             if let Some(e) = other {
                 return Err(WireError::Db(e));
             }
@@ -546,21 +654,31 @@ impl Connection {
     }
 
     /// Reads and drops messages until ReadyForQuery, bounded by DISCARD_TIMEOUT and DISCARD_MAX_BYTES.
-    async fn discard_until_ready(&mut self) -> Result<(TxStatus, Option<DbError>), WireError> {
-        tokio::time::timeout(DISCARD_TIMEOUT, self.discard_loop())
+    async fn discard_until_ready(
+        &mut self,
+        skip: Skip,
+    ) -> Result<(TxStatus, Option<DbError>), WireError> {
+        tokio::time::timeout(DISCARD_TIMEOUT, self.discard_loop(skip))
             .await
             .map_err(|_| WireError::Timeout)?
     }
 
-    async fn discard_loop(&mut self) -> Result<(TxStatus, Option<DbError>), WireError> {
+    async fn discard_loop(&mut self, skip: Skip) -> Result<(TxStatus, Option<DbError>), WireError> {
         let mut discarded = 0usize;
         let mut other_error = None;
         loop {
-            let incoming = self.recv().await?;
-            discarded = discarded.saturating_add(incoming.len);
+            let frame = self.recv_frame(skip).await?;
+            let len = match &frame {
+                Frame::Message(incoming) => incoming.len,
+                Frame::SkippedRow { len } => *len,
+            };
+            discarded = discarded.saturating_add(len);
             if discarded > DISCARD_MAX_BYTES {
                 return Err(protocol("too much data while cancelling the query"));
             }
+            let Frame::Message(incoming) = frame else {
+                continue;
+            };
             match incoming.message {
                 Message::ErrorResponse(body) => {
                     let e = db_error(&body)?;
@@ -577,13 +695,35 @@ impl Connection {
     }
 
     /// Reads the startup, auth and parameter messages until the first ReadyForQuery.
-    async fn authenticate(&mut self, cfg: &ConnectConfig) -> Result<(), WireError> {
+    async fn authenticate(
+        &mut self,
+        cfg: &ConnectConfig,
+        policy: &AuthPolicy,
+    ) -> Result<(), WireError> {
         let mut out = BytesMut::new();
         let mut scram: Option<ScramSha256> = None;
+        let mut scram_proved = false;
+        // A password exchange (cleartext, MD5 or SASL) has started.
+        let mut challenged = false;
+        let mut authenticated = false;
         loop {
             let incoming = self.recv().await?;
+            if authenticated && incoming.tag == b'R' {
+                return Err(protocol("authentication request after AuthenticationOk"));
+            }
             match incoming.message {
-                Message::AuthenticationOk => {}
+                Message::AuthenticationOk => {
+                    if scram.is_some() && !scram_proved {
+                        return Err(WireError::Auth(
+                            "the server ended SCRAM authentication without proving its identity"
+                                .into(),
+                        ));
+                    }
+                    if !challenged && !policy.trust {
+                        return Err(refused("trust"));
+                    }
+                    authenticated = true;
+                }
                 Message::AuthenticationCleartextPassword => {
                     if self.cancel.tls.is_none() {
                         return Err(WireError::Auth(
@@ -591,15 +731,29 @@ impl Connection {
                                 .into(),
                         ));
                     }
+                    if !policy.password {
+                        return Err(refused("cleartext password"));
+                    }
                     let password = configured_password(cfg)?;
                     frontend::password_message(password.as_bytes(), &mut out).map_err(protocol)?;
+                    challenged = true;
                 }
                 Message::AuthenticationMd5Password(body) => {
+                    if !policy.md5 {
+                        return Err(refused("MD5"));
+                    }
                     let password = configured_password(cfg)?;
                     let hashed = md5_hash(cfg.user.as_bytes(), password.as_bytes(), body.salt());
                     frontend::password_message(hashed.as_bytes(), &mut out).map_err(protocol)?;
+                    challenged = true;
                 }
                 Message::AuthenticationSasl(body) => {
+                    if !policy.scram {
+                        return Err(refused("SCRAM-SHA-256"));
+                    }
+                    if scram.is_some() {
+                        return Err(protocol("SASL start received twice"));
+                    }
                     let mut mechanisms = body.mechanisms();
                     let mut offered = false;
                     while let Some(name) = mechanisms.next().map_err(protocol)? {
@@ -621,6 +775,7 @@ impl Connection {
                     )
                     .map_err(protocol)?;
                     scram = Some(client);
+                    challenged = true;
                 }
                 Message::AuthenticationSaslContinue(body) => {
                     let client = scram
@@ -638,6 +793,7 @@ impl Connection {
                     client
                         .finish(body.data())
                         .map_err(|e| WireError::Auth(e.to_string()))?;
+                    scram_proved = true;
                 }
                 Message::AuthenticationGss | Message::AuthenticationGssContinue(_) => {
                     return Err(WireError::Auth(
@@ -665,7 +821,12 @@ impl Connection {
                     self.cancel.process_id = body.process_id();
                     self.cancel.secret_key = body.secret_key();
                 }
-                Message::ReadyForQuery(_) => return Ok(()),
+                Message::ReadyForQuery(_) => {
+                    if !authenticated {
+                        return Err(protocol("ReadyForQuery before AuthenticationOk"));
+                    }
+                    return Ok(());
+                }
                 Message::ErrorResponse(body) => return Err(WireError::Db(db_error(&body)?)),
                 _ => return Err(unexpected(incoming.tag)),
             }
@@ -676,7 +837,10 @@ impl Connection {
     }
 }
 
-async fn connect_inner(cfg: &ConnectConfig) -> Result<Connection, WireError> {
+async fn connect_inner(cfg: &ConnectConfig, policy: &AuthPolicy) -> Result<Connection, WireError> {
+    if cfg.ssl_mode == SslMode::VerifyCa && cfg.ssl_root_cert.is_none() {
+        return Err(WireError::Tls("sslmode=verify-ca needs sslrootcert".into()));
+    }
     let mut tcp = TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
     tcp.set_nodelay(true)?;
     let mut buf = BytesMut::new();
@@ -722,6 +886,7 @@ async fn connect_inner(cfg: &ConnectConfig) -> Result<Connection, WireError> {
             secret_key: 0,
         },
         poisoned: false,
+        peak_message_bytes: 0,
     };
     let mut params = vec![
         ("user", cfg.user.as_str()),
@@ -736,7 +901,7 @@ async fn connect_inner(cfg: &ConnectConfig) -> Result<Connection, WireError> {
     let mut out = BytesMut::new();
     frontend::startup_message(params, &mut out).map_err(protocol)?;
     conn.send(&mut out).await?;
-    conn.authenticate(cfg).await?;
+    conn.authenticate(cfg, policy).await?;
     Ok(conn)
 }
 
@@ -915,6 +1080,34 @@ fn keep_row(
     *kept += row_bytes;
     rows.push(fields);
     Ok(None)
+}
+
+fn eof() -> WireError {
+    WireError::Io(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "server closed the connection",
+    ))
+}
+
+/// The error for an authentication method that `require_auth` does not allow.
+fn refused(method: &str) -> WireError {
+    WireError::Auth(format!(
+        "the server asked for {method} authentication, which is not allowed here (require_auth)"
+    ))
+}
+
+/// Rejects a session parameter whose value the read-only recipe depends on.
+fn check_session_parameter(name: &str, value: &str) -> Result<(), WireError> {
+    match (name, value) {
+        ("standard_conforming_strings", "on") | ("client_encoding", "UTF8") => Ok(()),
+        ("standard_conforming_strings", other) => Err(protocol(format!(
+            "server changed standard_conforming_strings to \"{other}\""
+        ))),
+        ("client_encoding", other) => Err(protocol(format!(
+            "server changed client_encoding to \"{other}\""
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Parses a server_version string such as "19.0" or "15.20 (...)" into PG_VERSION_NUM form.
