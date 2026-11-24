@@ -974,6 +974,56 @@ async fn replication_status_strict_role_degrades_without_error() {
     assert!(!result.to_string().contains("conninfo"), "{result}");
 }
 
+/// Each publication's `tables` equals its rows in pg_publication_tables, read through execute_query on the same server.
+#[tokio::test]
+async fn replication_status_publication_tables_match_catalog_view() {
+    for port in [PORT_18, PORT_19, PORT_15] {
+        let result = call(ro_config(port), "replication_status", json!({})).await;
+        let publications = structured(&result)["publications"]
+            .as_array()
+            .expect("publications")
+            .clone();
+        assert!(!publications.is_empty(), "port {port}: {result}");
+        for publication in &publications {
+            let name = publication["name"].as_str().expect("publication name");
+            let sql = format!(
+                "SELECT count(*) AS n FROM pg_catalog.pg_publication_tables WHERE pubname = '{name}'"
+            );
+            let query = call(ro_config(port), "execute_query", json!({"sql": sql})).await;
+            let expected = structured(&query)["rows"][0]["n"].clone();
+            assert_eq!(
+                publication["tables"], expected,
+                "port {port} publication {name}"
+            );
+        }
+    }
+}
+
+/// Exact table counts per membership kind on PostgreSQL 19: a schema, one table, a partition root and its leaves.
+#[tokio::test]
+async fn replication_status_publication_table_counts_by_kind() {
+    let result = call(ro_config(PORT_19), "replication_status", json!({})).await;
+    let publications = structured(&result)["publications"]
+        .as_array()
+        .expect("publications")
+        .clone();
+    let tables = |name: &str| {
+        publications
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("no publication {name}: {result}"))["tables"]
+            .clone()
+    };
+    assert_eq!(tables("pub_one"), json!(1));
+    assert_eq!(tables("pub_root"), json!(1), "partition root only");
+    assert_eq!(
+        tables("pub_leaves"),
+        json!(3),
+        "the three leaves of shop.events"
+    );
+    assert_eq!(tables("pub_schema"), json!(2), "the tables of schema app");
+}
+
 #[tokio::test]
 async fn toolset_gating_hides_monitor_tools() {
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});

@@ -202,7 +202,9 @@ fn statements_sql(view: &str, optional: &[String], order: &str, limit: i64) -> S
     let has = |name: &str| optional.iter().any(|column| column == name);
     let mut extra = String::new();
     if has("total_plan_time") {
-        extra.push_str("ROUND(s.total_plan_time::numeric, 3)::float8 AS \"totalPlanTimeMs\", ");
+        extra.push_str(
+            "pg_catalog.ROUND(s.total_plan_time::numeric, 3)::float8 AS \"totalPlanTimeMs\", ",
+        );
     }
     if has("wal_bytes") {
         extra.push_str("s.wal_bytes::bigint AS \"walBytes\", ");
@@ -210,21 +212,21 @@ fn statements_sql(view: &str, optional: &[String], order: &str, limit: i64) -> S
     format!(
         "SELECT s.queryid::text AS \"queryId\", r.rolname::text AS \"user\", d.datname::text AS \"database\", \
         s.query, NULL::boolean AS \"queryTruncated\", s.calls, \
-        ROUND(s.total_exec_time::numeric, 3)::float8 AS \"totalExecTimeMs\", \
-        ROUND(s.mean_exec_time::numeric, 3)::float8 AS \"meanExecTimeMs\", \
-        ROUND(s.min_exec_time::numeric, 3)::float8 AS \"minExecTimeMs\", \
-        ROUND(s.max_exec_time::numeric, 3)::float8 AS \"maxExecTimeMs\", \
-        ROUND(s.stddev_exec_time::numeric, 3)::float8 AS \"stddevExecTimeMs\", \
+        pg_catalog.ROUND(s.total_exec_time::numeric, 3)::float8 AS \"totalExecTimeMs\", \
+        pg_catalog.ROUND(s.mean_exec_time::numeric, 3)::float8 AS \"meanExecTimeMs\", \
+        pg_catalog.ROUND(s.min_exec_time::numeric, 3)::float8 AS \"minExecTimeMs\", \
+        pg_catalog.ROUND(s.max_exec_time::numeric, 3)::float8 AS \"maxExecTimeMs\", \
+        pg_catalog.ROUND(s.stddev_exec_time::numeric, 3)::float8 AS \"stddevExecTimeMs\", \
         {extra}s.rows, s.shared_blks_hit AS \"sharedBlksHit\", s.shared_blks_read AS \"sharedBlksRead\", \
         s.shared_blks_dirtied AS \"sharedBlksDirtied\", s.temp_blks_written AS \"tempBlksWritten\", \
         CASE WHEN s.shared_blks_hit + s.shared_blks_read > 0 \
-        THEN ROUND(s.shared_blks_hit::numeric / (s.shared_blks_hit + s.shared_blks_read), 4)::float8 END AS \"cacheHitRatio\" \
+        THEN pg_catalog.ROUND(s.shared_blks_hit::numeric / (s.shared_blks_hit + s.shared_blks_read), 4)::float8 END AS \"cacheHitRatio\" \
         FROM {view} s \
         LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.userid \
         LEFT JOIN pg_catalog.pg_database d ON d.oid = s.dbid \
         WHERE ($1::boolean OR s.dbid = (SELECT db.oid FROM pg_catalog.pg_database db WHERE db.datname = pg_catalog.current_database())) \
         AND ($2::bigint IS NULL OR s.calls >= $2::bigint) \
-        AND ($3::text IS NULL OR strpos(lower(s.query), lower($3::text)) > 0) \
+        AND ($3::text IS NULL OR pg_catalog.strpos(pg_catalog.lower(s.query), pg_catalog.lower($3::text)) > 0) \
         ORDER BY {order}, s.queryid, s.userid, s.dbid LIMIT {limit}"
     )
 }

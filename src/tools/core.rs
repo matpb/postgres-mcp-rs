@@ -14,7 +14,7 @@ use super::text;
 use super::{Call, INTERNAL_MAX_ROWS, Runner, Statement, ToolError, Toolset, value_of};
 use crate::gate::{self, GateOptions, StatementKind};
 use crate::pg::session::RunOutput;
-use crate::pg::wire::{FetchLimits, Field};
+use crate::pg::wire::{FetchLimits, Field, Truncation};
 use crate::server::AppState;
 
 /// Time allowed per database for list_databases.
@@ -71,7 +71,9 @@ const EXTENSIONS_SQL: &str = "SELECT e.extname AS name, e.extversion AS version,
     LEFT JOIN pg_catalog.pg_available_extensions a ON a.name = e.extname ORDER BY e.extname";
 const TIMESCALE_SQL: &str =
     "SELECT extversion AS timescaledb FROM pg_catalog.pg_extension WHERE extname = 'timescaledb'";
-const SETTINGS_SQL: &str = "SELECT name, setting, unit FROM pg_catalog.pg_settings WHERE name = ANY($1::text[]) ORDER BY name";
+const SETTINGS_SQL: &str = "SELECT s.name, pg_catalog.current_setting(s.name) AS setting FROM pg_catalog.pg_settings s WHERE s.name = ANY($1::text[]) ORDER BY s.name";
+/// The role's own search_path; the catalog-only session of SETTINGS_SQL would report pg_catalog.
+const SEARCH_PATH_SQL: &str = "SELECT pg_catalog.current_setting('search_path') AS setting";
 const VERSION_SQL: &str = "SELECT pg_catalog.current_setting('server_version') AS server_version, \
     pg_catalog.current_setting('server_version_num')::int AS server_version_num";
 
@@ -114,33 +116,23 @@ impl ExplainFormat {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExplainArgs {
     pub database: Option<String>,
-    /// The statement to explain, without the EXPLAIN keyword.
     pub sql: String,
-    /// Plan format: text (default), json, yaml or xml.
     #[serde(default)]
     pub format: ExplainFormat,
-    /// Execute the statement and report actual times and row counts.
     #[serde(default)]
     pub analyze: bool,
-    /// Include shared, local and temporary buffer usage.
     #[serde(default)]
     pub buffers: bool,
-    /// Include output columns and schema-qualified names.
     #[serde(default)]
     pub verbose: bool,
-    /// Include configuration settings that differ from the defaults (PostgreSQL 12 or newer).
     #[serde(default)]
     pub settings: bool,
-    /// Include WAL usage; needs analyze (PostgreSQL 13 or newer).
     #[serde(default)]
     pub wal: bool,
-    /// Include planner memory usage (PostgreSQL 17 or newer).
     #[serde(default)]
     pub memory: bool,
-    /// Measure the time to convert the output for transfer; needs analyze (PostgreSQL 17 or newer).
     #[serde(default)]
     pub serialize: bool,
-    /// Plan with generic parameters so the statement may contain $1 placeholders (PostgreSQL 16 or newer); not with analyze.
     #[serde(default)]
     pub generic_plan: bool,
 }
@@ -258,11 +250,35 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
         ),
         (
             Toolset::Core,
-            tool::<ExplainArgs, ExplainResult>(
+            tool_with_leading::<ExplainArgs, ExplainResult>(
                 "explain_query",
                 text::EXPLAIN_QUERY_TITLE,
                 text::EXPLAIN_QUERY,
-                &[("database", text::DATABASE_PARAM)],
+                &[
+                    ("database", text::DATABASE_PARAM),
+                    ("sql", text::EXPLAIN_QUERY_SQL_PARAM),
+                    ("format", text::EXPLAIN_QUERY_FORMAT_PARAM),
+                    ("analyze", text::EXPLAIN_QUERY_ANALYZE_PARAM),
+                    ("buffers", text::EXPLAIN_QUERY_BUFFERS_PARAM),
+                    ("verbose", text::EXPLAIN_QUERY_VERBOSE_PARAM),
+                    ("settings", text::EXPLAIN_QUERY_SETTINGS_PARAM),
+                    ("wal", text::EXPLAIN_QUERY_WAL_PARAM),
+                    ("memory", text::EXPLAIN_QUERY_MEMORY_PARAM),
+                    ("serialize", text::EXPLAIN_QUERY_SERIALIZE_PARAM),
+                    ("generic_plan", text::EXPLAIN_QUERY_GENERIC_PLAN_PARAM),
+                ],
+                &[
+                    "sql",
+                    "format",
+                    "analyze",
+                    "buffers",
+                    "verbose",
+                    "settings",
+                    "wal",
+                    "memory",
+                    "serialize",
+                    "generic_plan",
+                ],
             ),
         ),
         (
@@ -284,6 +300,17 @@ pub fn tool<I: JsonSchema + 'static, O: JsonSchema + 'static>(
     description: &'static str,
     docs: &[(&str, &str)],
 ) -> Tool {
+    tool_with_leading::<I, O>(name, title, description, docs, &[])
+}
+
+/// Like `tool`, and the descriptions of `leading` come first in their property objects.
+pub fn tool_with_leading<I: JsonSchema + 'static, O: JsonSchema + 'static>(
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    docs: &[(&str, &str)],
+    leading: &[&str],
+) -> Tool {
     let mut tool = Tool::new(name, description, Arc::new(Map::new()))
         .with_title(title)
         .with_annotations(
@@ -295,19 +322,31 @@ pub fn tool<I: JsonSchema + 'static, O: JsonSchema + 'static>(
         )
         .with_input_schema::<I>()
         .with_output_schema::<O>();
-    set_descriptions(&mut tool.input_schema, docs);
+    set_descriptions(&mut tool.input_schema, docs, leading);
     tool
 }
 
-/// Replaces the description of each named property in a generated input schema.
-fn set_descriptions(schema: &mut Arc<Map<String, Value>>, docs: &[(&str, &str)]) {
+/// Replaces the description of each named property in a generated input schema. A `leading` property
+/// gets its description first in its object, where the published schema has it for these fields.
+fn set_descriptions(schema: &mut Arc<Map<String, Value>>, docs: &[(&str, &str)], leading: &[&str]) {
     let schema = Arc::make_mut(schema);
     let Some(Value::Object(properties)) = schema.get_mut("properties") else {
         return;
     };
     for (name, doc) in docs {
         if let Some(Value::Object(property)) = properties.get_mut(*name) {
-            property.insert("description".to_owned(), Value::String((*doc).to_owned()));
+            let text = Value::String((*doc).to_owned());
+            if leading.contains(name) {
+                let rest = std::mem::take(property);
+                property.insert("description".to_owned(), text);
+                for (key, value) in rest {
+                    if key != "description" {
+                        property.insert(key, value);
+                    }
+                }
+            } else {
+                property.insert("description".to_owned(), text);
+            }
         }
     }
 }
@@ -475,11 +514,12 @@ async fn explain(
     let RunOutput {
         result, elapsed, ..
     } = output;
-    if result.truncated.is_some() {
-        return Err(ToolError::Internal(format!(
-            "the plan is larger than MAX_RESPONSE_BYTES ({} bytes)",
-            limits.max_response_bytes
-        )));
+    if let Some(truncated) = result.truncated {
+        return Err(truncated_plan_error(
+            truncated,
+            INTERNAL_MAX_ROWS,
+            limits.max_response_bytes,
+        ));
     }
     let plan = match args.format {
         ExplainFormat::Json => json_plan(&result.rows)?,
@@ -581,6 +621,18 @@ fn text_plan(rows: &[Vec<Option<Field>>]) -> Result<Value, ToolError> {
         }
     }
     Ok(Value::String(lines.join("\n")))
+}
+
+/// The error for a plan cut short: the row cap or the byte budget, whichever tripped.
+fn truncated_plan_error(truncated: Truncation, max_rows: usize, max_bytes: usize) -> ToolError {
+    ToolError::Internal(match truncated {
+        Truncation::Rows => format!(
+            "The plan has more than {max_rows} lines; use format \"json\" or explain a smaller statement."
+        ),
+        Truncation::Bytes => {
+            format!("the plan is larger than MAX_RESPONSE_BYTES ({max_bytes} bytes)")
+        }
+    })
 }
 
 /// The plan as parsed JSON, from the single json value that FORMAT JSON returns.
@@ -720,6 +772,13 @@ async fn server_info_of(
     )
     .await
     .and_then(|rows| rows.first().and_then(|r| text_of(r, "timescaledb")));
+    let search_path = match runner.user_query(database, SEARCH_PATH_SQL, ct).await {
+        Ok(envelope) => envelope.rows.first().and_then(|r| text_of(r, "setting")),
+        Err(error) => {
+            warnings.push(format!("settings.search_path: {}", error.message()));
+            None
+        }
+    };
     let settings_list = format!("{{{}}}", SERVER_INFO_SETTINGS.join(","));
     let settings = section(
         &runner,
@@ -733,10 +792,19 @@ async fn server_info_of(
     .await
     .map(|rows| {
         rows.iter()
-            .map(|r| SettingInfo {
-                name: text_of(r, "name").unwrap_or_default(),
-                value: text_of(r, "setting").unwrap_or_default(),
-                unit: text_of(r, "unit"),
+            .filter_map(|r| {
+                let name = text_of(r, "name").unwrap_or_default();
+                // The catalog-only session reports pg_catalog for search_path: use the role's value or omit it.
+                let value = if name == "search_path" {
+                    search_path.clone()?
+                } else {
+                    text_of(r, "setting").unwrap_or_default()
+                };
+                Some(SettingInfo {
+                    name,
+                    value,
+                    unit: None,
+                })
             })
             .collect()
     });
@@ -782,4 +850,23 @@ fn text_of(row: &Map<String, Value>, key: &str) -> Option<String> {
 
 fn flag(row: &Map<String, Value>, key: &str) -> bool {
     row.get(key).and_then(Value::as_bool).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_plan_names_the_reason_that_tripped() {
+        let rows = truncated_plan_error(Truncation::Rows, 5000, 48_000);
+        assert_eq!(
+            rows.message(),
+            "Internal error: The plan has more than 5000 lines; use format \"json\" or explain a smaller statement."
+        );
+        let bytes = truncated_plan_error(Truncation::Bytes, 5000, 48_000);
+        assert_eq!(
+            bytes.message(),
+            "Internal error: the plan is larger than MAX_RESPONSE_BYTES (48000 bytes)"
+        );
+    }
 }

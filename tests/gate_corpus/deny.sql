@@ -486,3 +486,36 @@ SELECT attach_chunk('h', 'c', '{}'::jsonb);
 --;;
 -- code: function_denied
 SELECT "pg_catalog"."heap_force_kill"('t'::regclass, NULL);
+--;;
+-- code: function_denied
+SELECT remove_compaction_policy('t');
+--;;
+-- code: function_denied
+SELECT set_partitioning_interval('t');
+--;;
+-- code: function_denied
+SELECT merge_chunks_concurrently('t');
+--;;
+-- code: function_denied
+SELECT add_job('t');
+--;;
+-- code: function_denied
+SELECT drop_chunks('t');
+--;;
+-- code: function_denied
+SELECT compress_chunk('t');
+--;;
+-- code: function_denied
+SELECT create_hypertable('t');
+--;;
+-- code: function_denied
+SELECT refresh_continuous_aggregate('t');
+--;;
+-- code: function_denied
+SELECT run_job('t');
+--;;
+-- code: function_denied
+SELECT move_chunk('t');
+--;;
+-- code: function_denied
+SELECT enable_chunk_skipping('t');

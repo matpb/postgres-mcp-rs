@@ -17,9 +17,9 @@ fn list_schemas_sql() -> String {
         "SELECT n.nspname::text AS name, \
         pg_catalog.pg_get_userbyid(n.nspowner) AS owner, \
         pg_catalog.obj_description(n.oid, 'pg_namespace') AS comment, \
-        (SELECT count(*) FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relkind::text IN ('r', 'p')) AS tables, \
-        (SELECT count(*) FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relkind::text IN ('v', 'm')) AS views, \
-        (SELECT count(*) FROM pg_catalog.pg_proc p WHERE p.pronamespace = n.oid) AS functions \
+        (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relkind::text IN ('r', 'p')) AS tables, \
+        (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relkind::text IN ('v', 'm')) AS views, \
+        (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc p WHERE p.pronamespace = n.oid) AS functions \
         FROM pg_catalog.pg_namespace n \
         WHERE ($1::boolean OR {NON_SYSTEM}) \
         AND (pg_catalog.pg_has_role(current_user, 'pg_read_all_data', 'MEMBER') \
@@ -170,14 +170,14 @@ fn code_filter(column: &str, codes: &[&str]) -> String {
 fn object_sql(selection: &Selection) -> String {
     let relations = format!(
         "SELECT n.nspname::text, c.relname::text, {REL_KIND}, ''::text, c.oid::bigint, \
-         jsonb_build_object('schema', n.nspname::text, 'name', c.relname::text, 'kind', {REL_KIND}, \
+         pg_catalog.jsonb_build_object('schema', n.nspname::text, 'name', c.relname::text, 'kind', {REL_KIND}, \
              'owner', pg_catalog.pg_get_userbyid(c.relowner), 'comment', pg_catalog.obj_description(c.oid, 'pg_class')) \
-         || pg_catalog.jsonb_strip_nulls(jsonb_build_object( \
+         || pg_catalog.jsonb_strip_nulls(pg_catalog.jsonb_build_object( \
              'rowEstimate', CASE WHEN c.relkind::text IN ('r', 'm') THEN c.reltuples::bigint \
-                 WHEN c.relkind::text = 'p' THEN (SELECT CASE WHEN bool_and(l.reltuples >= 0) THEN sum(l.reltuples)::bigint ELSE -1::bigint END \
+                 WHEN c.relkind::text = 'p' THEN (SELECT CASE WHEN pg_catalog.bool_and(l.reltuples >= 0) THEN pg_catalog.sum(l.reltuples)::bigint ELSE -1::bigint END \
                      FROM pg_catalog.pg_partition_tree(c.oid) t JOIN pg_catalog.pg_class l ON l.oid = t.relid WHERE t.isleaf) END, \
              'totalBytes', CASE WHEN c.relkind::text IN ('r', 'm') THEN pg_catalog.pg_total_relation_size(c.oid) \
-                 WHEN c.relkind::text = 'p' THEN (SELECT COALESCE(sum(pg_catalog.pg_total_relation_size(t.relid)), 0)::bigint \
+                 WHEN c.relkind::text = 'p' THEN (SELECT COALESCE(pg_catalog.sum(pg_catalog.pg_total_relation_size(t.relid)), 0)::bigint \
                      FROM pg_catalog.pg_partition_tree(c.oid) t WHERE t.isleaf) END, \
              'partitionOf', CASE WHEN c.relispartition THEN (SELECT pn.nspname::text || '.' || pc.relname::text \
                  FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
@@ -191,9 +191,9 @@ fn object_sql(selection: &Selection) -> String {
     let functions = format!(
         "SELECT n.nspname::text, p.proname::text, {FUNCTION_KIND}, \
          pg_catalog.pg_get_function_identity_arguments(p.oid), p.oid::bigint, \
-         jsonb_build_object('schema', n.nspname::text, 'name', p.proname::text, 'kind', {FUNCTION_KIND}, \
+         pg_catalog.jsonb_build_object('schema', n.nspname::text, 'name', p.proname::text, 'kind', {FUNCTION_KIND}, \
              'owner', pg_catalog.pg_get_userbyid(p.proowner), 'comment', pg_catalog.obj_description(p.oid, 'pg_proc')) \
-         || pg_catalog.jsonb_strip_nulls(jsonb_build_object( \
+         || pg_catalog.jsonb_strip_nulls(pg_catalog.jsonb_build_object( \
              'arguments', pg_catalog.pg_get_function_identity_arguments(p.oid), \
              'returns', pg_catalog.pg_get_function_result(p.oid))) AS obj \
          FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
@@ -205,11 +205,11 @@ fn object_sql(selection: &Selection) -> String {
     );
     let types = format!(
         "SELECT n.nspname::text, t.typname::text, 'type'::text, ''::text, t.oid::bigint, \
-         jsonb_build_object('schema', n.nspname::text, 'name', t.typname::text, 'kind', 'type', \
+         pg_catalog.jsonb_build_object('schema', n.nspname::text, 'name', t.typname::text, 'kind', 'type', \
              'owner', pg_catalog.pg_get_userbyid(t.typowner), 'comment', pg_catalog.obj_description(t.oid, 'pg_type'), \
              'typeKind', CASE t.typtype::text WHEN 'e' THEN 'enum' WHEN 'd' THEN 'domain' WHEN 'r' THEN 'range' ELSE 'composite' END) \
-         || pg_catalog.jsonb_strip_nulls(jsonb_build_object('enumLabels', CASE WHEN t.typtype::text = 'e' THEN \
-             (SELECT COALESCE(jsonb_agg(e.enumlabel::text ORDER BY e.enumsortorder), '[]'::jsonb) \
+         || pg_catalog.jsonb_strip_nulls(pg_catalog.jsonb_build_object('enumLabels', CASE WHEN t.typtype::text = 'e' THEN \
+             (SELECT COALESCE(pg_catalog.jsonb_agg(e.enumlabel::text ORDER BY e.enumsortorder), '[]'::jsonb) \
               FROM pg_catalog.pg_enum e WHERE e.enumtypid = t.oid) END)) AS obj \
          FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
          WHERE {enabled} AND (t.typtype::text IN ('e', 'd', 'r') OR (t.typtype::text = 'c' AND EXISTS \

@@ -10,7 +10,11 @@ use serde_json::{Map, Value};
 use url::Url;
 
 use crate::http_guard::parse_origin;
-use crate::pg::tls::SslMode;
+use std::sync::Arc;
+
+use rustls::ClientConfig;
+
+use crate::pg::tls::{self, SslMode};
 use crate::pg::wire::{AuthPolicy, ConnectConfig};
 
 const DEFAULT_PORT: u16 = 8432;
@@ -109,6 +113,8 @@ pub struct DatabaseConfig {
     pub max_connections: usize,
     pub statement_timeout_ms: u64,
     pub lock_timeout_ms: u64,
+    /// TLS configuration built by `Config::prepare_tls`; None until then or when sslmode is disable.
+    pub tls: Option<Arc<ClientConfig>>,
 }
 
 impl fmt::Debug for DatabaseConfig {
@@ -214,7 +220,26 @@ impl Config {
                 }
             }
         }
-        Config::from_lookup(&|name| vars.get(name).cloned())
+        let mut config = Config::from_lookup(&|name| vars.get(name).cloned())?;
+        config.prepare_tls()?;
+        Ok(config)
+    }
+
+    /// Builds each database's TLS configuration once, so the root file is read at startup, not per connection.
+    /// A failure names the database and the cause, never the file contents.
+    pub fn prepare_tls(&mut self) -> Result<(), ConfigError> {
+        for db in &mut self.databases {
+            if db.connect.ssl_mode == SslMode::Disable {
+                continue;
+            }
+            let config = tls::startup_client_config(
+                db.connect.ssl_mode,
+                db.connect.ssl_root_cert.as_deref(),
+            )
+            .map_err(|reason| ConfigError(format!("{}: {reason}", db.name)))?;
+            db.tls = Some(config);
+        }
+        Ok(())
     }
 
     /// Same logic with an injectable variable lookup, for tests. An empty value counts as unset.
@@ -420,6 +445,11 @@ fn api_key(get: &dyn Fn(&str) -> Option<String>) -> Result<Option<String>, Confi
         ),
         (None, None) => return Ok(None),
     };
+    if key != key.trim() {
+        return Err(ConfigError(format!(
+            "{source}: must not start or end with whitespace"
+        )));
+    }
     if key.chars().count() < MIN_API_KEY_CHARS {
         return Err(ConfigError(format!(
             "{source}: must be at least {MIN_API_KEY_CHARS} characters"
@@ -551,7 +581,7 @@ fn databases(
                 Ok(vec![libpq_database(get, database, defaults, app_name)?])
             } else {
                 Err(ConfigError(
-                    "no database configured: set PG_DATABASES, DATABASE_URL or PGHOST/PGDATABASE/PGUSER".into(),
+                    "no database configured: set PG_DATABASES, DATABASE_URL, or PGDATABASE with PGHOST and PGUSER".into(),
                 ))
             }
         }
@@ -633,6 +663,7 @@ fn env_database(
         max_connections: DEFAULT_MAX_CONNECTIONS,
         statement_timeout_ms: defaults.statement_timeout_ms,
         lock_timeout_ms: defaults.lock_timeout_ms,
+        tls: None,
     }
 }
 
@@ -872,6 +903,7 @@ fn json_database(
         max_connections,
         statement_timeout_ms,
         lock_timeout_ms,
+        tls: None,
     })
 }
 

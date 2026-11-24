@@ -38,31 +38,16 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
                 text::LIST_ACTIVITY,
                 &[
                     ("database", text::DATABASE_PARAM),
-                    (
-                        "state",
-                        "Only sessions in this state: active, idle, idle in transaction, idle in transaction (aborted).",
-                    ),
-                    (
-                        "min_duration_ms",
-                        "Only sessions whose current query (or transaction, when idle in transaction) has run at least this long.",
-                    ),
-                    ("user", "Only sessions of this role."),
-                    (
-                        "all_databases",
-                        "Include sessions connected to other databases of the server. Default false: this database only.",
-                    ),
-                    (
-                        "only_blocked",
-                        "Only sessions waiting on a lock, plus the sessions blocking them.",
-                    ),
+                    ("state", text::LIST_ACTIVITY_STATE_PARAM),
+                    ("min_duration_ms", text::LIST_ACTIVITY_MIN_DURATION_MS_PARAM),
+                    ("user", text::LIST_ACTIVITY_USER_PARAM),
+                    ("all_databases", text::LIST_ACTIVITY_ALL_DATABASES_PARAM),
+                    ("only_blocked", text::LIST_ACTIVITY_ONLY_BLOCKED_PARAM),
                     (
                         "include_background",
-                        "Include background workers (autovacuum, WAL writer, extension workers). Default false: client backends only.",
+                        text::LIST_ACTIVITY_INCLUDE_BACKGROUND_PARAM,
                     ),
-                    (
-                        "query_chars",
-                        "Characters of query text to return per session, 0 to 4000. Default 500.",
-                    ),
+                    ("query_chars", text::LIST_ACTIVITY_QUERY_CHARS_PARAM),
                     ("limit", text::LIMIT_PARAM),
                 ],
             ),
@@ -75,30 +60,12 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
                 text::QUERY_STATS,
                 &[
                     ("database", text::DATABASE_PARAM),
-                    (
-                        "order_by",
-                        "Ranking: total_time (default), mean_time, calls, rows, io (blocks read), temp (temp blocks written).",
-                    ),
-                    (
-                        "min_calls",
-                        "Only statements called at least this many times.",
-                    ),
-                    (
-                        "contains",
-                        "Case-insensitive text the statement must contain.",
-                    ),
-                    (
-                        "all_databases",
-                        "Include statements from other databases. Default false.",
-                    ),
-                    (
-                        "query_chars",
-                        "Characters of statement text per entry, 0 to 4000. Default 500.",
-                    ),
-                    (
-                        "limit",
-                        "Maximum number of statements to return (default 20, at most 500).",
-                    ),
+                    ("order_by", text::QUERY_STATS_ORDER_BY_PARAM),
+                    ("min_calls", text::QUERY_STATS_MIN_CALLS_PARAM),
+                    ("contains", text::QUERY_STATS_CONTAINS_PARAM),
+                    ("all_databases", text::QUERY_STATS_ALL_DATABASES_PARAM),
+                    ("query_chars", text::QUERY_STATS_QUERY_CHARS_PARAM),
+                    ("limit", text::QUERY_STATS_LIMIT_PARAM),
                 ],
             ),
         ),
@@ -110,10 +77,7 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
                 text::DATABASE_STATS,
                 &[
                     ("database", text::DATABASE_PARAM),
-                    (
-                        "sections",
-                        "Sections to return: database, io, wal, checkpointer, progress, wait_events. Default: database, checkpointer and progress.",
-                    ),
+                    ("sections", text::DATABASE_STATS_SECTIONS_PARAM),
                 ],
             ),
         ),
@@ -126,19 +90,10 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
                 &[
                     ("database", text::DATABASE_PARAM),
                     ("schema", text::SCHEMA_PARAM),
-                    ("table", "Only this table (bare name, combine with schema)."),
-                    (
-                        "order_by",
-                        "Ranking: size (default), seq_scan, idx_scan, dead_rows, writes, last_autovacuum.",
-                    ),
-                    (
-                        "include_indexes",
-                        "Add each table's indexes with their scan counts and sizes. Default true when a single table is requested, else false.",
-                    ),
-                    (
-                        "unused_indexes",
-                        "Return only indexes never scanned since the last statistics reset (primary keys and unique indexes excluded).",
-                    ),
+                    ("table", text::TABLE_STATS_TABLE_PARAM),
+                    ("order_by", text::TABLE_STATS_ORDER_BY_PARAM),
+                    ("include_indexes", text::TABLE_STATS_INCLUDE_INDEXES_PARAM),
+                    ("unused_indexes", text::TABLE_STATS_UNUSED_INDEXES_PARAM),
                     ("limit", text::LIMIT_PARAM),
                     ("cursor", text::CURSOR_PARAM),
                 ],

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,11 +54,10 @@ impl AppState {
             .map(|db| {
                 (
                     db.name.clone(),
-                    Arc::new(Pool::with_auth(
-                        db.connect.clone(),
-                        db.max_connections,
-                        db.auth.clone(),
-                    )),
+                    Arc::new(
+                        Pool::with_auth(db.connect.clone(), db.max_connections, db.auth.clone())
+                            .with_tls(db.tls.clone()),
+                    ),
                 )
             })
             .collect();
@@ -388,7 +387,7 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
         ])
 }
 
-/// Probes `/health` on 127.0.0.1 and exits 0 only for a 200 status line.
+/// Probes `/health` on the address MCP_HOST names and exits 0 only for a 200 status line.
 fn healthcheck() -> ExitCode {
     let port = match env_value("MCP_PORT") {
         Ok(None) => DEFAULT_MCP_PORT,
@@ -398,15 +397,35 @@ fn healthcheck() -> ExitCode {
         },
         Err(message) => return config_error(&message),
     };
-    if probe_health(port) {
+    let host = match env_value("MCP_HOST") {
+        Ok(None) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Ok(Some(raw)) => match raw.parse::<IpAddr>() {
+            Ok(host) => host,
+            Err(_) => {
+                return config_error(&format!(
+                    "MCP_HOST: \"{raw}\" is not an IP address; use 127.0.0.1 or ::1"
+                ));
+            }
+        },
+        Err(message) => return config_error(&message),
+    };
+    if probe_health(SocketAddr::new(probe_address(host), port)) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
 }
 
-fn probe_health(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+/// The address a local probe connects to: loopback in place of an unspecified bind address.
+fn probe_address(host: IpAddr) -> IpAddr {
+    match host {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => other,
+    }
+}
+
+fn probe_health(addr: SocketAddr) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, HEALTH_TIMEOUT) else {
         return false;
     };
@@ -433,4 +452,21 @@ fn probe_health(port: u16) -> bool {
     text.lines()
         .next()
         .is_some_and(|status| status.contains(" 200 "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_address_maps_unspecified_hosts_to_loopback() {
+        let v4_any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let v6_any = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        let v6_loop = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let lan = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
+        assert_eq!(probe_address(v4_any), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(probe_address(v6_any), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(probe_address(v6_loop), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(probe_address(lan), lan);
+    }
 }

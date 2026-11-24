@@ -329,11 +329,11 @@ fn precedence() {
 fn no_database_error() {
     assert_eq!(
         load_err(&[("MCP_PORT", "9000")]),
-        "no database configured: set PG_DATABASES, DATABASE_URL or PGHOST/PGDATABASE/PGUSER"
+        "no database configured: set PG_DATABASES, DATABASE_URL, or PGDATABASE with PGHOST and PGUSER"
     );
     assert_eq!(
         load_err(&[("PGHOST", "h"), ("PGUSER", "u")]),
-        "no database configured: set PG_DATABASES, DATABASE_URL or PGHOST/PGDATABASE/PGUSER"
+        "no database configured: set PG_DATABASES, DATABASE_URL, or PGDATABASE with PGHOST and PGUSER"
     );
 }
 
@@ -496,6 +496,30 @@ fn short_api_key_error() {
     let message = load_err(&[("DATABASE_URL", URL), ("API_KEY", key)]);
     assert_eq!(message, "API_KEY: must be at least 16 characters");
     assert!(!message.contains(key), "{message}");
+}
+
+#[test]
+fn api_key_with_surrounding_whitespace_is_error() {
+    let key = "0123456789abcdef-key";
+    for padded in [format!(" {key}"), format!("{key} "), format!("{key}\t")] {
+        let message = load_err(&[("DATABASE_URL", URL), ("API_KEY", &padded)]);
+        assert_eq!(message, "API_KEY: must not start or end with whitespace");
+        assert!(!message.contains(key), "{message}");
+    }
+}
+
+#[test]
+fn api_key_inner_whitespace_is_kept() {
+    let key = "0123 4567 89abcdef";
+    let config = cfg(&[("DATABASE_URL", URL), ("API_KEY", key)]);
+    assert_eq!(config.api_key.as_deref(), Some(key));
+}
+
+#[test]
+fn api_key_file_content_is_trimmed() {
+    let file = TempFile::new(" 0123456789abcdef-key \n");
+    let config = cfg(&[("DATABASE_URL", URL), ("API_KEY_FILE", &file.path())]);
+    assert_eq!(config.api_key.as_deref(), Some("0123456789abcdef-key"));
 }
 
 #[test]

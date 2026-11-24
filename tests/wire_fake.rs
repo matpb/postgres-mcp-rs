@@ -5,14 +5,17 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use postgres_mcp::pg::pool::{Pool, PoolError};
+use postgres_mcp::pg::session::{RunError, SessionSettings, run_readonly};
 use postgres_mcp::pg::tls::SslMode;
 use postgres_mcp::pg::wire::{
     AuthPolicy, ConnectConfig, Connection, DbError, FetchLimits, QueryResult, Truncation, TxStatus,
     WireError,
 };
+use postgres_mcp::tools::ToolError;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 
 mod common;
 use common::{app, call_tool, config_with, db_entry, result_of};
@@ -881,6 +884,171 @@ async fn oversized_data_row_keeps_its_prefix_and_stops_at_the_budget() {
         conn.peak_message_bytes()
     );
     assert!(!conn.is_poisoned());
+}
+
+/// Runs the script on the first connection only. The listener closes once that connection is accepted,
+/// so a CancelRequest on a second connection is refused.
+async fn spawn_server_refusing_cancel(steps: Vec<Step>) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let task = tokio::spawn(async move {
+        let mut recorded = Vec::new();
+        let accepted = tokio::time::timeout(TIMEOUT, listener.accept()).await;
+        drop(listener);
+        if let Ok(Ok((mut sock, _))) = accepted {
+            tokio::time::timeout(TIMEOUT, run_steps(&mut sock, steps, &mut recorded))
+                .await
+                .ok();
+        }
+        recorded
+    });
+    (port, task)
+}
+
+#[tokio::test]
+async fn refused_cancel_after_the_row_cap_still_returns_the_capped_rows() {
+    let mut steps = startup_ok();
+    steps.extend(describe_one_int4());
+    steps.extend([
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::Write(bind_complete()),
+        Step::Write(data_row(&[b"1"])),
+        Step::Write(data_row(&[b"2"])),
+        Step::Write(data_row(&[b"3"])),
+        Step::Write(command_complete("SELECT 3")),
+        Step::Write(ready(b'I')),
+    ]);
+    let (port, _task) = spawn_server_refusing_cancel(steps).await;
+    let mut conn = Connection::connect(&cfg(port)).await.expect("connect");
+    let capped = FetchLimits {
+        max_rows: 2,
+        max_bytes: 1 << 20,
+        max_value_bytes: 1 << 20,
+    };
+    let r = conn
+        .query("SELECT 1", &[], false, &capped)
+        .await
+        .expect("capped query succeeds when the cancel is refused");
+    let values: Vec<Vec<u8>> = r
+        .rows
+        .iter()
+        .map(|row| row[0].as_ref().map(|f| f.data.to_vec()).unwrap_or_default())
+        .collect();
+    assert_eq!(values, vec![b"1".to_vec(), b"2".to_vec()]);
+    assert_eq!(r.truncated, Some(Truncation::Rows));
+    assert_eq!(r.command_tag, None);
+    assert_eq!(r.status, TxStatus::Idle);
+    assert!(!conn.is_poisoned());
+}
+
+#[tokio::test]
+async fn refused_cancel_and_a_dropped_drain_fail_and_poison() {
+    let mut steps = startup_ok();
+    steps.extend(describe_one_int4());
+    steps.extend([
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::Write(bind_complete()),
+        Step::Write(data_row(&[b"1"])),
+        Step::Write(data_row(&[b"2"])),
+        Step::Write(data_row(&[b"3"])),
+    ]);
+    let (port, _task) = spawn_server_refusing_cancel(steps).await;
+    let mut conn = Connection::connect(&cfg(port)).await.expect("connect");
+    let capped = FetchLimits {
+        max_rows: 2,
+        max_bytes: 1 << 20,
+        max_value_bytes: 1 << 20,
+    };
+    let err = conn
+        .query("SELECT 1", &[], false, &capped)
+        .await
+        .expect_err_with("the drain hits EOF before ReadyForQuery");
+    assert!(matches!(err, WireError::Io(_)), "{err:?}");
+    assert!(conn.is_poisoned());
+}
+
+/// A statement cancelled by the server after the limit, with a message in French: a timeout, not a cancel.
+#[tokio::test]
+async fn localized_57014_after_the_statement_limit_is_a_timeout() {
+    let mut steps = startup_ok();
+    // The session check: BEGIN READ ONLY, three SET LOCAL lines, then the check row.
+    let check_values: [&[u8]; 8] = [
+        b"on",
+        b"ISO, MDY",
+        b"iso_8601",
+        b"UTC",
+        b"hex",
+        b"on",
+        b"UTF8",
+        b"true",
+    ];
+    steps.extend([
+        Step::ReadTagged,
+        Step::Write(command_complete("BEGIN")),
+        Step::Write(command_complete("SET")),
+        Step::Write(command_complete("SET")),
+        Step::Write(command_complete("SET")),
+        Step::Write(row_description(&[
+            ("a", 25),
+            ("b", 25),
+            ("c", 25),
+            ("d", 25),
+            ("e", 25),
+            ("f", 25),
+            ("g", 25),
+            ("h", 25),
+        ])),
+        Step::Write(data_row(&check_values)),
+        Step::Write(command_complete("SELECT 1")),
+        Step::Write(ready(b'T')),
+    ]);
+    steps.extend(describe_one_int4());
+    steps.extend([
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::Sleep(Duration::from_millis(300)),
+        Step::Write(bind_complete()),
+        Step::Write(error_response(
+            "57014",
+            "annulation de la requête à cause du délai écoulé pour l'exécution de l'instruction",
+        )),
+        Step::Write(ready(b'E')),
+        Step::ReadTagged,
+        Step::Write(command_complete("ROLLBACK")),
+        Step::Write(ready(b'I')),
+        Step::ReadTagged,
+        Step::Write(command_complete("DISCARD ALL")),
+        Step::Write(ready(b'I')),
+    ]);
+    let (port, _task) = spawn_server(steps).await;
+    let pool = Pool::new(cfg(port), 1);
+    let settings = SessionSettings {
+        statement_timeout_ms: 200,
+        lock_timeout_ms: 1_000,
+        fetch: limits(1 << 20),
+        pool_wait: TIMEOUT,
+        search_path_catalog_only: false,
+    };
+    let err = run_readonly(
+        &pool,
+        "SELECT 1",
+        &[],
+        false,
+        &settings,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("the server cancelled the statement");
+    assert!(matches!(err, RunError::Timeout(200)), "{err:?}");
+    assert!(matches!(
+        ToolError::from_run(err, "appdb", 0),
+        ToolError::Timeout(200)
+    ));
 }
 
 #[tokio::test]

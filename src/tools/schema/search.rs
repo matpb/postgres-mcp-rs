@@ -74,12 +74,12 @@ fn search_sql(selection: &Selection) -> String {
         format!("c.relkind::text IN ({})", quote_all(&relkinds))
     };
     let relations = format!(
-        "SELECT CASE WHEN lower(c.relname::text) = lower($1::text) THEN 0 \
+        "SELECT CASE WHEN pg_catalog.lower(c.relname::text) = pg_catalog.lower($1::text) THEN 0 \
             WHEN c.relname::text ILIKE $2::text THEN 1 WHEN c.relname::text ILIKE $3::text THEN 2 ELSE 3 END, \
         n.nspname::text, ''::text, c.relname::text, \
         CASE c.relkind::text WHEN 'f' THEN 'foreign_table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized_view' ELSE 'table' END, \
         ''::text, \
-        jsonb_build_object('kind', CASE c.relkind::text WHEN 'f' THEN 'foreign_table' WHEN 'v' THEN 'view' \
+        pg_catalog.jsonb_build_object('kind', CASE c.relkind::text WHEN 'f' THEN 'foreign_table' WHEN 'v' THEN 'view' \
                 WHEN 'm' THEN 'materialized_view' ELSE 'table' END, \
             'schema', n.nspname::text, 'name', c.relname::text, \
             'matched', CASE WHEN c.relname::text ILIKE $3::text THEN 'name' ELSE 'comment' END, \
@@ -89,10 +89,10 @@ fn search_sql(selection: &Selection) -> String {
         AND (c.relname::text ILIKE $3::text OR pg_catalog.obj_description(c.oid, 'pg_class') ILIKE $3::text)"
     );
     let columns = format!(
-        "SELECT CASE WHEN lower(a.attname::text) = lower($1::text) THEN 0 \
+        "SELECT CASE WHEN pg_catalog.lower(a.attname::text) = pg_catalog.lower($1::text) THEN 0 \
             WHEN a.attname::text ILIKE $2::text THEN 1 WHEN a.attname::text ILIKE $3::text THEN 2 ELSE 3 END, \
         n.nspname::text, c.relname::text, a.attname::text, 'column'::text, ''::text, \
-        jsonb_build_object('kind', 'column', 'schema', n.nspname::text, 'table', c.relname::text, \
+        pg_catalog.jsonb_build_object('kind', 'column', 'schema', n.nspname::text, 'table', c.relname::text, \
             'name', a.attname::text, 'type', {COLUMN_TYPE_SQL}, \
             'matched', CASE WHEN a.attname::text ILIKE $3::text THEN 'name' ELSE 'comment' END, \
             'comment', pg_catalog.col_description(c.oid, a.attnum)) AS obj \
@@ -105,11 +105,11 @@ fn search_sql(selection: &Selection) -> String {
         columns_enabled = if selection.columns { "TRUE" } else { "FALSE" },
     );
     let functions = format!(
-        "SELECT CASE WHEN lower(p.proname::text) = lower($1::text) THEN 0 \
+        "SELECT CASE WHEN pg_catalog.lower(p.proname::text) = pg_catalog.lower($1::text) THEN 0 \
             WHEN p.proname::text ILIKE $2::text THEN 1 WHEN p.proname::text ILIKE $3::text THEN 2 ELSE 3 END, \
         n.nspname::text, ''::text, p.proname::text, 'function'::text, \
         pg_catalog.pg_get_function_identity_arguments(p.oid), \
-        jsonb_build_object('kind', 'function', 'schema', n.nspname::text, 'name', p.proname::text, \
+        pg_catalog.jsonb_build_object('kind', 'function', 'schema', n.nspname::text, 'name', p.proname::text, \
             'matched', CASE WHEN p.proname::text ILIKE $3::text THEN 'name' ELSE 'comment' END, \
             'comment', pg_catalog.obj_description(p.oid, 'pg_proc')) AS obj \
         FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \

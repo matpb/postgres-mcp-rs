@@ -15,15 +15,15 @@ const CORE_SQL: &str = "SELECT pg_catalog.current_database()::text AS \"database
     CASE WHEN pg_catalog.pg_is_in_recovery() THEN pg_catalog.pg_last_wal_receive_lsn()::text END AS \"receiveLsn\", \
     CASE WHEN pg_catalog.pg_is_in_recovery() THEN pg_catalog.pg_last_wal_replay_lsn()::text END AS \"replayLsn\", \
     CASE WHEN pg_catalog.pg_is_in_recovery() THEN \
-    ROUND(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp() - pg_catalog.pg_last_xact_replay_timestamp())::numeric, 3)::float8 \
+    pg_catalog.ROUND(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp() - pg_catalog.pg_last_xact_replay_timestamp())::numeric, 3)::float8 \
     END AS \"replayLagSeconds\"";
 const STANDBYS_SQL: &str = "SELECT r.pid, r.usename AS \"user\", r.application_name AS \"application\", \
     r.client_addr::text AS \"clientAddr\", r.state, r.sync_state AS \"syncState\", \
     r.sent_lsn::text AS \"sentLsn\", r.write_lsn::text AS \"writeLsn\", r.flush_lsn::text AS \"flushLsn\", \
     r.replay_lsn::text AS \"replayLsn\", \
-    ROUND((EXTRACT(EPOCH FROM r.write_lag) * 1000)::numeric, 3)::float8 AS \"writeLagMs\", \
-    ROUND((EXTRACT(EPOCH FROM r.flush_lag) * 1000)::numeric, 3)::float8 AS \"flushLagMs\", \
-    ROUND((EXTRACT(EPOCH FROM r.replay_lag) * 1000)::numeric, 3)::float8 AS \"replayLagMs\", \
+    pg_catalog.ROUND((EXTRACT(EPOCH FROM r.write_lag) * 1000)::numeric, 3)::float8 AS \"writeLagMs\", \
+    pg_catalog.ROUND((EXTRACT(EPOCH FROM r.flush_lag) * 1000)::numeric, 3)::float8 AS \"flushLagMs\", \
+    pg_catalog.ROUND((EXTRACT(EPOCH FROM r.replay_lag) * 1000)::numeric, 3)::float8 AS \"replayLagMs\", \
     CASE WHEN NOT pg_catalog.pg_is_in_recovery() \
     THEN pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(), r.replay_lsn)::bigint END AS \"lagBytes\" \
     FROM pg_catalog.pg_stat_replication r ORDER BY r.pid";
@@ -34,11 +34,7 @@ const WAL_RECEIVER_SQL: &str = "SELECT w.status, w.sender_host AS \"senderHost\"
 const PUBLICATIONS_SQL: &str = "SELECT p.pubname AS \"name\", pg_catalog.pg_get_userbyid(p.pubowner)::text AS \"owner\", \
     p.puballtables AS \"allTables\", p.pubinsert AS \"insert\", p.pubupdate AS \"update\", \
     p.pubdelete AS \"delete\", p.pubtruncate AS \"truncate\", \
-    CASE WHEN p.puballtables THEN (SELECT count(*) FROM pg_catalog.pg_class c \
-    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-    WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
-    AND NOT starts_with(n.nspname, 'pg_toast')) \
-    ELSE (SELECT count(*) FROM pg_catalog.pg_publication_rel pr WHERE pr.prpubid = p.oid) END AS \"tables\" \
+    (SELECT pg_catalog.count(*) FROM pg_catalog.pg_publication_tables pt WHERE pt.pubname = p.pubname) AS \"tables\" \
     FROM pg_catalog.pg_publication p ORDER BY p.pubname";
 const SUBSCRIPTIONS_SQL: &str = "SELECT s.subname AS \"name\", pg_catalog.pg_get_userbyid(s.subowner)::text AS \"owner\", \
     s.subenabled AS \"enabled\", s.subpublications AS \"publications\", s.subslotname::text AS \"slotName\" \
@@ -117,9 +113,13 @@ async fn replication_of(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let text = |key: &str| row.get(key).and_then(Value::as_str).map(str::to_owned);
-    let replay_lag_seconds = row.get("replayLagSeconds").and_then(Value::as_f64);
     let (current_lsn, receive_lsn, replay_lsn) =
         (text("currentLsn"), text("receiveLsn"), text("replayLsn"));
+    let replay_lag_seconds = replay_lag_seconds(
+        receive_lsn.as_deref(),
+        replay_lsn.as_deref(),
+        row.get("replayLagSeconds").and_then(Value::as_f64),
+    );
     let database_name = core.database.clone();
 
     let (standbys, standbys_error) = optional_rows(state, database, STANDBYS_SQL, ct).await?;
@@ -155,6 +155,16 @@ async fn replication_of(
         subscriptions_error,
         warnings,
     })
+}
+
+/// The time since the last replayed transaction, null once the standby has replayed all it received:
+/// that time keeps growing on an idle primary.
+fn replay_lag_seconds(
+    receive_lsn: Option<&str>,
+    replay_lsn: Option<&str>,
+    lag: Option<f64>,
+) -> Option<f64> {
+    if receive_lsn == replay_lsn { None } else { lag }
 }
 
 /// The rows of a section that some roles may not read: None with the error text when PostgreSQL refuses.
@@ -242,4 +252,37 @@ fn slot_warnings(slots: &[Map<String, Value>]) -> Vec<String> {
         }
     }
     warnings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replay_lag_seconds;
+
+    #[test]
+    fn replay_lag_is_null_when_the_standby_has_replayed_everything_received() {
+        assert_eq!(
+            replay_lag_seconds(Some("0/3000060"), Some("0/3000060"), Some(12.5)),
+            None
+        );
+    }
+
+    #[test]
+    fn replay_lag_is_reported_while_replay_is_behind_receive() {
+        assert_eq!(
+            replay_lag_seconds(Some("0/3000070"), Some("0/3000060"), Some(12.5)),
+            Some(12.5)
+        );
+        assert_eq!(
+            replay_lag_seconds(None, Some("0/3000060"), Some(3.0)),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn replay_lag_without_a_lag_value_is_null() {
+        assert_eq!(
+            replay_lag_seconds(Some("0/3000060"), Some("0/3000050"), None),
+            None
+        );
+    }
 }

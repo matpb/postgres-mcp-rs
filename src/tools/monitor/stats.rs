@@ -18,12 +18,12 @@ const SECTIONS: [&str; 6] = [
     "wait_events",
 ];
 const DEFAULT_SECTIONS: [&str; 3] = ["database", "checkpointer", "progress"];
-const VERSION_SQL: &str = "SELECT current_setting('server_version') AS \"serverVersion\", \
-    current_setting('server_version_num')::int AS \"versionNum\"";
+const VERSION_SQL: &str = "SELECT pg_catalog.current_setting('server_version') AS \"serverVersion\", \
+    pg_catalog.current_setting('server_version_num')::int AS \"versionNum\"";
 const DATABASE_SQL: &str = "SELECT d.numbackends, d.xact_commit AS \"xactCommit\", \
     d.xact_rollback AS \"xactRollback\", d.blks_read AS \"blksRead\", d.blks_hit AS \"blksHit\", \
     CASE WHEN d.blks_hit + d.blks_read > 0 \
-    THEN ROUND(d.blks_hit::numeric / (d.blks_hit + d.blks_read), 4)::float8 END AS \"cacheHitRatio\", \
+    THEN pg_catalog.ROUND(d.blks_hit::numeric / (d.blks_hit + d.blks_read), 4)::float8 END AS \"cacheHitRatio\", \
     d.tup_returned AS \"tupReturned\", d.tup_fetched AS \"tupFetched\", d.tup_inserted AS \"tupInserted\", \
     d.tup_updated AS \"tupUpdated\", d.tup_deleted AS \"tupDeleted\", d.conflicts, \
     d.temp_files AS \"tempFiles\", d.temp_bytes AS \"tempBytes\", d.deadlocks, \
@@ -31,7 +31,7 @@ const DATABASE_SQL: &str = "SELECT d.numbackends, d.xact_commit AS \"xactCommit\
     d.sessions_fatal AS \"sessionsFatal\", d.sessions_killed AS \"sessionsKilled\", d.stats_reset AS \"statsReset\", \
     pg_catalog.pg_database_size(d.datid) AS \"sizeBytes\", pg_catalog.age(db.datfrozenxid) AS \"xidAge\", \
     pg_catalog.current_setting('max_connections')::int AS \"maxConnections\", \
-    (SELECT count(*) FROM pg_catalog.pg_stat_activity a WHERE a.backend_type = 'client backend') AS \"connectionsUsed\" \
+    (SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity a WHERE a.backend_type = 'client backend') AS \"connectionsUsed\" \
     FROM pg_catalog.pg_stat_database d \
     JOIN pg_catalog.pg_database db ON db.oid = d.datid \
     WHERE d.datname = pg_catalog.current_database()";
@@ -89,10 +89,10 @@ const CHECKPOINTER_BGWRITER_SQL: &str = "SELECT s.checkpoints_timed AS \"checkpo
     s.checkpoint_sync_time AS \"syncTimeMs\", s.buffers_checkpoint AS \"buffersWritten\", \
     s.stats_reset AS \"statsReset\", 'pg_stat_bgwriter' AS source FROM pg_catalog.pg_stat_bgwriter s";
 const WAIT_EVENTS_SQL: &str = "SELECT a.wait_event_type AS \"type\", a.wait_event AS \"event\", \
-    count(*) AS \"sessions\" FROM pg_catalog.pg_stat_activity a \
+    pg_catalog.count(*) AS \"sessions\" FROM pg_catalog.pg_stat_activity a \
     WHERE a.wait_event_type IS NOT NULL \
     GROUP BY a.wait_event_type, a.wait_event \
-    ORDER BY count(*) DESC, a.wait_event_type, a.wait_event";
+    ORDER BY pg_catalog.count(*) DESC, a.wait_event_type, a.wait_event";
 
 /// One pg_stat_progress_* view with the counter columns it may have.
 struct ProgressView {

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use postgres_mcp::config::Config;
+use postgres_mcp::pg::pool::Pool;
 use postgres_mcp::pg::tls::SslMode;
 use postgres_mcp::pg::wire::{AuthPolicy, ConnectConfig, Connection, WireError};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
@@ -223,6 +225,74 @@ fn cfg(port: u16, host: &str, mode: SslMode, root: Option<&Path>) -> ConnectConf
         connect_timeout: Duration::from_secs(5),
         startup_params: Vec::new(),
     }
+}
+
+/// Accepts every connection in turn and serves each with the TLS handshake and the session script.
+async fn spawn_server_for_all(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let tls = acceptor(chain, key);
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            let tls = tls.clone();
+            tokio::spawn(async move {
+                let mut ssl_request = [0u8; 8];
+                if tcp.read_exact(&mut ssl_request).await.is_err() {
+                    return;
+                }
+                if tcp.write_all(b"S").await.is_err() {
+                    return;
+                }
+                if let Ok(mut stream) = tls.accept(tcp).await {
+                    let mut served = Served::default();
+                    session(&mut stream, false, &mut served).await;
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Two connections of one pool after the root file is gone: both use the configuration read at startup.
+#[tokio::test]
+async fn pool_connections_do_not_reread_the_root_certificate() {
+    let certs = make_certs();
+    let ca = TempPem::write("pool-shared", &certs.ca_pem);
+    let port = spawn_server_for_all(certs.leaf_chain.clone(), certs.leaf_key.clone_key()).await;
+    let entry = serde_json::json!({
+        "name": "appdb",
+        "host": "127.0.0.1",
+        "port": port,
+        "database": "appdb",
+        "user": "app",
+        "password": PASSWORD,
+        "sslmode": "verify-ca",
+        "sslrootcert": ca.path().to_string_lossy(),
+        "max_connections": 2,
+    });
+    let databases = serde_json::json!([entry]).to_string();
+    let mut config =
+        Config::from_lookup(&|name| (name == "PG_DATABASES").then(|| databases.clone()))
+            .expect("configuration is valid");
+    config
+        .prepare_tls()
+        .expect("the root file is read at startup");
+    let db = config.database(None).expect("one database").clone();
+    let pool = Pool::with_auth(db.connect.clone(), db.max_connections, db.auth.clone())
+        .with_tls(db.tls.clone());
+    let first = pool
+        .checkout(Duration::from_secs(5))
+        .await
+        .expect("first connection");
+    drop(ca);
+    let second = pool
+        .checkout(Duration::from_secs(5))
+        .await
+        .expect("second connection needs no root file");
+    drop((first, second));
 }
 
 #[tokio::test]

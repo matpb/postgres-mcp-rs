@@ -261,7 +261,16 @@ impl Connection {
         cfg: &ConnectConfig,
         policy: &AuthPolicy,
     ) -> Result<Connection, WireError> {
-        tokio::time::timeout(cfg.connect_timeout, connect_inner(cfg, policy))
+        Connection::connect_with_tls(cfg, policy, None).await
+    }
+
+    /// Like `connect_with`, using `tls` for the handshake when given instead of reading the root file.
+    pub async fn connect_with_tls(
+        cfg: &ConnectConfig,
+        policy: &AuthPolicy,
+        tls: Option<Arc<ClientConfig>>,
+    ) -> Result<Connection, WireError> {
+        tokio::time::timeout(cfg.connect_timeout, connect_inner(cfg, policy, tls))
             .await
             .map_err(|_| WireError::Timeout)?
     }
@@ -809,7 +818,10 @@ impl Connection {
         }
 
         if let Some(t) = truncated {
-            self.cancel.cancel().await?;
+            // A failed cancel leaves the statement running; the bounded drain below still reads it to ReadyForQuery.
+            if let Err(e) = self.cancel.cancel().await {
+                tracing::warn!(error = %e, "cancel request after a capped fetch failed; draining the statement");
+            }
             let (tx_status, other) = self.discard_until_ready(skip).await?;
             if let Some(e) = other {
                 return Err(WireError::Db(e));
@@ -1021,7 +1033,11 @@ impl Connection {
     }
 }
 
-async fn connect_inner(cfg: &ConnectConfig, policy: &AuthPolicy) -> Result<Connection, WireError> {
+async fn connect_inner(
+    cfg: &ConnectConfig,
+    policy: &AuthPolicy,
+    prepared: Option<Arc<ClientConfig>>,
+) -> Result<Connection, WireError> {
     if cfg.ssl_mode == SslMode::VerifyCa && cfg.ssl_root_cert.is_none() {
         return Err(WireError::Tls("sslmode=verify-ca needs sslrootcert".into()));
     }
@@ -1040,7 +1056,10 @@ async fn connect_inner(cfg: &ConnectConfig, policy: &AuthPolicy) -> Result<Conne
                         "unexpected data after the SSL response".into(),
                     ));
                 }
-                let config = tls::client_config(cfg.ssl_mode, cfg.ssl_root_cert.as_deref())?;
+                let config = match prepared {
+                    Some(config) => config,
+                    None => tls::client_config(cfg.ssl_mode, cfg.ssl_root_cert.as_deref())?,
+                };
                 tls = Some(config.clone());
                 start_tls(tcp, &cfg.host, config).await?
             }

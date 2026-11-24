@@ -1444,6 +1444,62 @@ async fn describe_table_partitioned_row_estimate_is_leaf_sum_or_unknown() {
     );
 }
 
+/// The value of column `v` in the single row of an execute_query result on the same router.
+async fn scalar_through_query(router: &Router, sql: &str) -> Value {
+    let result = call_on(router, "execute_query", json!({"sql": sql})).await;
+    let rows = array(&ok(&result)["rows"], "rows").clone();
+    assert_eq!(rows.len(), 1, "{sql}");
+    rows[0]["v"].clone()
+}
+
+#[tokio::test]
+async fn describe_table_sizes_match_postgres_for_leaf_parent_and_plain_table() {
+    let router = app(one_db(PORT_18, &[]));
+    let leaf = call_on(
+        &router,
+        "describe_table",
+        json!({"table": "shop.events_2024_q1"}),
+    )
+    .await;
+    let leaf_sizes = ok(&leaf)["sizes"].clone();
+    let leaf_total = scalar_through_query(
+        &router,
+        "SELECT pg_total_relation_size('shop.events_2024_q1'::regclass) AS v",
+    )
+    .await;
+    assert_eq!(leaf_sizes["totalBytes"], leaf_total, "{leaf_sizes}");
+    let leaf_table = scalar_through_query(
+        &router,
+        "SELECT pg_relation_size('shop.events_2024_q1'::regclass) AS v",
+    )
+    .await;
+    assert_eq!(leaf_sizes["tableBytes"], leaf_table, "{leaf_sizes}");
+
+    let parent = call_on(&router, "describe_table", json!({"table": "shop.events"})).await;
+    let parent_total = ok(&parent)["sizes"]["totalBytes"].clone();
+    let leaves_total = scalar_through_query(
+        &router,
+        "SELECT sum(pg_total_relation_size(t.relid))::bigint AS v \
+         FROM pg_catalog.pg_partition_tree('shop.events'::regclass) t WHERE t.isleaf",
+    )
+    .await;
+    assert_eq!(parent_total, leaves_total, "{parent}");
+    assert!(parent_total.as_i64().unwrap_or_default() > 0, "{parent}");
+
+    let plain = call_on(
+        &router,
+        "describe_table",
+        json!({"table": "shop.customers"}),
+    )
+    .await;
+    let plain_total = scalar_through_query(
+        &router,
+        "SELECT pg_total_relation_size('shop.customers'::regclass) AS v",
+    )
+    .await;
+    assert_eq!(ok(&plain)["sizes"]["totalBytes"], plain_total, "{plain}");
+}
+
 #[tokio::test]
 async fn describe_function_aggregate_and_window_kinds() {
     let router = app(one_db(PORT_18, &[]));

@@ -2,10 +2,11 @@
 // PoolError holds WireError, which is large (fixed by the wire interface).
 #![allow(clippy::result_large_err)]
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rustls::ClientConfig;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::pg::wire::{AuthPolicy, ConnectConfig, Connection, WireError};
@@ -15,6 +16,8 @@ use crate::typeinfo::TypeCache;
 pub struct Pool {
     connect: ConnectConfig,
     auth: AuthPolicy,
+    /// Built once at startup and shared by every connection and cancel request of the pool, when set.
+    tls: Option<Arc<ClientConfig>>,
     permits: Semaphore,
     idle: Mutex<Vec<Connection>>,
     types: TypeCache,
@@ -32,11 +35,18 @@ impl Pool {
         Pool {
             connect,
             auth,
+            tls: None,
             permits: Semaphore::new(max_connections),
             idle: Mutex::new(Vec::new()),
             types: TypeCache::new(),
             closed: AtomicBool::new(false),
         }
+    }
+
+    /// Uses `tls` for every new connection instead of reading the root file again.
+    pub fn with_tls(mut self, tls: Option<Arc<ClientConfig>>) -> Pool {
+        self.tls = tls;
+        self
     }
 
     /// Waits for a permit (at most `wait`), then reuses an idle connection or opens a new one.
@@ -90,7 +100,9 @@ impl Pool {
     }
 
     async fn open<'a>(&'a self, permit: SemaphorePermit<'a>) -> Result<Lease<'a>, PoolError> {
-        let conn = match Connection::connect_with(&self.connect, &self.auth).await {
+        let conn = match Connection::connect_with_tls(&self.connect, &self.auth, self.tls.clone())
+            .await
+        {
             Ok(conn) => conn,
             Err(error) => {
                 tracing::warn!(database = %self.connect.database, error = %error, "connection failed");

@@ -21,7 +21,7 @@ const PREDEFINED_ROLES: [(&str, &str); 7] = [
     ("pgSignalBackend", "pg_signal_backend"),
 ];
 
-const ROLE_SQL: &str = "SELECT jsonb_build_object( \
+const ROLE_SQL: &str = "SELECT pg_catalog.jsonb_build_object( \
         'name', current_user::text, 'sessionUser', session_user::text, \
         'superuser', r.rolsuper, 'createDb', r.rolcreatedb, 'createRole', r.rolcreaterole, \
         'replication', r.rolreplication, 'bypassRls', r.rolbypassrls, 'inherit', r.rolinherit, \
@@ -29,25 +29,25 @@ const ROLE_SQL: &str = "SELECT jsonb_build_object( \
         'memberOf', (WITH RECURSIVE member_of(roleid) AS ( \
             SELECT a.roleid FROM pg_catalog.pg_auth_members a WHERE a.member = r.oid \
             UNION SELECT a.roleid FROM pg_catalog.pg_auth_members a JOIN member_of m ON a.member = m.roleid) \
-            SELECT COALESCE(jsonb_agg(g.rolname::text ORDER BY g.rolname::text), '[]'::jsonb) \
+            SELECT COALESCE(pg_catalog.jsonb_agg(g.rolname::text ORDER BY g.rolname::text), '[]'::jsonb) \
             FROM member_of m JOIN pg_catalog.pg_roles g ON g.oid = m.roleid)) AS v \
     FROM pg_catalog.pg_roles r WHERE r.rolname = current_user";
 
-const DATABASE_SQL: &str = "SELECT jsonb_build_object( \
-        'connect', has_database_privilege(current_database(), 'CONNECT'), \
-        'create', has_database_privilege(current_database(), 'CREATE'), \
-        'temp', has_database_privilege(current_database(), 'TEMP')) AS v";
+const DATABASE_SQL: &str = "SELECT pg_catalog.jsonb_build_object( \
+        'connect', pg_catalog.has_database_privilege(pg_catalog.current_database(), 'CONNECT'), \
+        'create', pg_catalog.has_database_privilege(pg_catalog.current_database(), 'CREATE'), \
+        'temp', pg_catalog.has_database_privilege(pg_catalog.current_database(), 'TEMP')) AS v";
 
 /// Per non-system schema: USAGE and CREATE, and how many of its tables the role can and cannot SELECT.
 fn schemas_sql() -> String {
     format!(
-        "SELECT COALESCE(jsonb_agg(jsonb_build_object('name', x.name, 'usage', x.usage, \
+        "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('name', x.name, 'usage', x.usage, \
         'create', x.can_create, 'selectableTables', x.selectable, 'unselectableTables', x.unselectable) \
         ORDER BY x.name), '[]'::jsonb) AS v \
-        FROM (SELECT n.nspname::text AS name, has_schema_privilege(n.oid, 'USAGE') AS usage, \
-        has_schema_privilege(n.oid, 'CREATE') AS can_create, \
-        count(c.oid) FILTER (WHERE has_table_privilege(c.oid, 'SELECT')) AS selectable, \
-        count(c.oid) FILTER (WHERE NOT has_table_privilege(c.oid, 'SELECT')) AS unselectable \
+        FROM (SELECT n.nspname::text AS name, pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage, \
+        pg_catalog.has_schema_privilege(n.oid, 'CREATE') AS can_create, \
+        pg_catalog.count(c.oid) FILTER (WHERE pg_catalog.has_table_privilege(c.oid, 'SELECT')) AS selectable, \
+        pg_catalog.count(c.oid) FILTER (WHERE NOT pg_catalog.has_table_privilege(c.oid, 'SELECT')) AS unselectable \
         FROM pg_catalog.pg_namespace n \
         LEFT JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relkind::text IN ('r', 'p') \
         WHERE {NON_SYSTEM} \
@@ -84,21 +84,24 @@ fn predefined_sql() -> String {
         .iter()
         .map(|(key, role)| format!("'{key}', {}", member_of(role)))
         .collect();
-    format!("SELECT jsonb_build_object({}) AS v", pairs.join(", "))
+    format!(
+        "SELECT pg_catalog.jsonb_build_object({}) AS v",
+        pairs.join(", ")
+    )
 }
 
 /// Findings beyond read access, in a fixed order; an empty list when the role is read-only.
 fn beyond_sql() -> String {
     let schemas = format!(
         "ARRAY(SELECT 'CREATE on schema ' || n.nspname::text FROM pg_catalog.pg_namespace n \
-        WHERE {NON_SYSTEM} AND has_schema_privilege(n.oid, 'CREATE') ORDER BY n.nspname::text)"
+        WHERE {NON_SYSTEM} AND pg_catalog.has_schema_privilege(n.oid, 'CREATE') ORDER BY n.nspname::text)"
     );
     let tables = format!(
-        "ARRAY[(SELECT CASE WHEN count(*) > 0 THEN 'INSERT/UPDATE/DELETE/TRUNCATE on ' || count(*) || ' tables' END \
+        "ARRAY[(SELECT CASE WHEN pg_catalog.count(*) > 0 THEN 'INSERT/UPDATE/DELETE/TRUNCATE on ' || pg_catalog.count(*) || ' tables' END \
         FROM (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
             WHERE c.relkind::text IN ('r', 'p') AND {NON_SYSTEM} LIMIT 5000) t \
-        WHERE has_table_privilege(t.oid, 'INSERT') OR has_table_privilege(t.oid, 'UPDATE') \
-            OR has_table_privilege(t.oid, 'DELETE') OR has_table_privilege(t.oid, 'TRUNCATE'))]"
+        WHERE pg_catalog.has_table_privilege(t.oid, 'INSERT') OR pg_catalog.has_table_privilege(t.oid, 'UPDATE') \
+            OR pg_catalog.has_table_privilege(t.oid, 'DELETE') OR pg_catalog.has_table_privilege(t.oid, 'TRUNCATE'))]"
     );
     let write_all = member_of("pg_write_all_data");
     let signal = member_of("pg_signal_backend");
@@ -106,14 +109,14 @@ fn beyond_sql() -> String {
     let exec = member_of("pg_execute_server_program");
     let write_files = member_of("pg_write_server_files");
     format!(
-        "SELECT COALESCE(to_jsonb(ARRAY(SELECT m FROM unnest(\
+        "SELECT COALESCE(pg_catalog.to_jsonb(ARRAY(SELECT m FROM pg_catalog.unnest(\
         ARRAY[CASE WHEN r.rolsuper THEN 'superuser' END, \
         CASE WHEN {write_all} THEN 'member of pg_write_all_data' END, \
         CASE WHEN r.rolcreatedb THEN 'CREATEDB' END, \
         CASE WHEN r.rolcreaterole THEN 'CREATEROLE' END, \
         CASE WHEN r.rolreplication THEN 'REPLICATION' END, \
         CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END, \
-        CASE WHEN has_database_privilege(current_database(), 'CREATE') THEN 'CREATE on database' END] \
+        CASE WHEN pg_catalog.has_database_privilege(pg_catalog.current_database(), 'CREATE') THEN 'CREATE on database' END] \
         || {schemas} || {tables} \
         || ARRAY[CASE WHEN {signal} THEN 'member of pg_signal_backend' END, \
         CASE WHEN {read_files} THEN 'member of pg_read_server_files' END, \

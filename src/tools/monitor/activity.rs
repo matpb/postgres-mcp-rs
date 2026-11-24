@@ -30,19 +30,19 @@ const ACTIVITY_SQL: &str = "WITH base AS (\
     AND ($2::boolean OR a.backend_type = 'client backend') \
     AND ($3::text IS NULL OR a.state = $3::text) \
     AND ($4::bigint IS NULL OR EXTRACT(EPOCH FROM pg_catalog.clock_timestamp() - \
-    CASE WHEN starts_with(a.state, 'idle in transaction') THEN a.xact_start ELSE a.query_start END) * 1000 >= $4::bigint) \
+    CASE WHEN pg_catalog.starts_with(a.state, 'idle in transaction') THEN a.xact_start ELSE a.query_start END) * 1000 >= $4::bigint) \
     AND ($5::text IS NULL OR a.usename = $5::text)), \
-    kept AS (SELECT b.* FROM base b WHERE NOT $6::boolean OR cardinality(b.blocked_by) > 0 \
-    OR b.pid IN (SELECT unnest(x.blocked_by) FROM base x)) \
+    kept AS (SELECT b.* FROM base b WHERE NOT $6::boolean OR pg_catalog.cardinality(b.blocked_by) > 0 \
+    OR b.pid IN (SELECT pg_catalog.unnest(x.blocked_by) FROM base x)) \
     SELECT k.pid, k.usename AS \"user\", k.datname AS \"database\", k.application_name AS \"application\", \
     k.client_addr::text AS \"clientAddr\", k.backend_type AS \"backendType\", k.state, \
     k.wait_event_type AS \"waitEventType\", k.wait_event AS \"waitEvent\", k.backend_start AS \"backendStart\", \
     k.xact_start AS \"xactStart\", k.query_start AS \"queryStart\", k.state_change AS \"stateChange\", \
-    FLOOR(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp() - k.xact_start) * 1000)::bigint AS \"xactAgeMs\", \
-    FLOOR(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp() - k.query_start) * 1000)::bigint AS \"queryAgeMs\", \
+    pg_catalog.FLOOR(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp() - k.xact_start) * 1000)::bigint AS \"xactAgeMs\", \
+    pg_catalog.FLOOR(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp() - k.query_start) * 1000)::bigint AS \"queryAgeMs\", \
     k.query, NULL::boolean AS \"queryTruncated\", k.query_id::text AS \"queryId\", \
     k.blocked_by AS \"blockedBy\", NULL::int[] AS blocking, \
-    (k.pid = pg_catalog.pg_backend_pid()) AS \"isSelf\", count(*) OVER () AS total \
+    (k.pid = pg_catalog.pg_backend_pid()) AS \"isSelf\", pg_catalog.count(*) OVER () AS total \
     FROM kept k ORDER BY (k.state = 'active') DESC NULLS LAST, \"queryAgeMs\" DESC NULLS LAST, k.pid";
 
 #[derive(Debug, Deserialize, JsonSchema)]

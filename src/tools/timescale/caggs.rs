@@ -104,20 +104,56 @@ fn list_sql(sources: &Sources, window: &str) -> String {
     )
 }
 
-/// The watermark of one aggregate as text: a timestamp for timestamptz time, the integer otherwise.
-/// Takes the materialization schema and name as $1 and $2.
-fn watermark_sql(cagg_watermark: &str, hypertable_info: &str) -> String {
+/// Time column types whose watermark the server converts; the others are reported as warnings.
+const WATERMARK_TYPES: [&str; 6] = [
+    "timestamp with time zone",
+    "timestamp without time zone",
+    "date",
+    "smallint",
+    "integer",
+    "bigint",
+];
+
+/// The watermark of one aggregate as text, with its time column type. Takes the materialization schema and name as $1 and $2.
+fn watermark_sql(functions: &WatermarkFunctions) -> String {
+    let WatermarkFunctions {
+        cagg_watermark,
+        hypertable_info,
+        to_timestamp,
+        to_date,
+    } = functions;
     format!(
         "WITH mat AS (SELECT c.oid FROM pg_catalog.pg_class c \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = $1::text AND c.relname = $2::text), \
          wm AS (SELECT {cagg_watermark}(({hypertable_info}(mat.oid)).hypertable_id) AS w FROM mat) \
-         SELECT CASE WHEN d.column_type::text = 'timestamp with time zone' \
-           THEN pg_catalog.to_timestamp(wm.w::float8 / 1000000.0)::text \
-           WHEN d.column_type::text IN ('smallint', 'integer', 'bigint') THEN wm.w::text END AS \"watermark\" \
+         SELECT d.column_type::text AS \"columnType\", CASE d.column_type::text \
+           WHEN 'timestamp with time zone' THEN pg_catalog.to_timestamp(wm.w::float8 / 1000000.0)::text \
+           WHEN 'timestamp without time zone' THEN {to_timestamp}(wm.w)::text \
+           WHEN 'date' THEN {to_date}(wm.w)::text \
+           WHEN 'smallint' THEN wm.w::text WHEN 'integer' THEN wm.w::text WHEN 'bigint' THEN wm.w::text END AS \"watermark\" \
          FROM wm LEFT JOIN timescaledb_information.dimensions d \
          ON d.hypertable_schema::text = $1::text AND d.hypertable_name::text = $2::text AND d.dimension_number = 1"
     )
+}
+
+/// The TimescaleDB functions the watermark SQL calls, qualified as the installed version has them.
+struct WatermarkFunctions {
+    cagg_watermark: String,
+    hypertable_info: String,
+    to_timestamp: String,
+    to_date: String,
+}
+
+impl WatermarkFunctions {
+    fn find(features: &probe::Features) -> Option<WatermarkFunctions> {
+        Some(WatermarkFunctions {
+            cagg_watermark: features.function(FUNCTIONS_SCHEMA, "cagg_watermark")?,
+            hypertable_info: features.function(FUNCTIONS_SCHEMA, "get_hypertable_info")?,
+            to_timestamp: features.function(FUNCTIONS_SCHEMA, "to_timestamp_without_timezone")?,
+            to_date: features.function(FUNCTIONS_SCHEMA, "to_date")?,
+        })
+    }
 }
 
 pub async fn list(state: &AppState, args: ListArgs, ct: &CancellationToken) -> Call {
@@ -162,14 +198,9 @@ async fn list_of(
     let next_cursor = page.trim(&mut rows);
 
     let mut warnings = Vec::new();
-    let watermark = match (
-        features.function(FUNCTIONS_SCHEMA, "cagg_watermark"),
-        features.function(FUNCTIONS_SCHEMA, "get_hypertable_info"),
-    ) {
-        (Some(cagg_watermark), Some(hypertable_info)) => {
-            Some(watermark_sql(&cagg_watermark, &hypertable_info))
-        }
-        _ => {
+    let watermark = match WatermarkFunctions::find(&features) {
+        Some(functions) => Some(watermark_sql(&functions)),
+        None => {
             unavailable(&mut warnings, "cagg_watermark");
             None
         }
@@ -188,9 +219,22 @@ async fn list_of(
             (Some(sql), (Some(schema), Some(name))) => {
                 let params = [Some(schema.as_str()), Some(name.as_str())];
                 let found = section(state, target, sql, &params, &label, ct, &mut warnings).await?;
-                first_row(found)
-                    .and_then(|found| found.get("watermark").cloned())
-                    .unwrap_or(Value::Null)
+                match first_row(found) {
+                    Some(found) => {
+                        let column_type = text_of(&found, "columnType");
+                        if !column_type
+                            .as_deref()
+                            .is_some_and(|t| WATERMARK_TYPES.contains(&t))
+                        {
+                            warnings.push(format!(
+                                "{label}: unsupported time column type {}",
+                                column_type.as_deref().unwrap_or("unknown")
+                            ));
+                        }
+                        found.get("watermark").cloned().unwrap_or(Value::Null)
+                    }
+                    None => Value::Null,
+                }
             }
             _ => Value::Null,
         };

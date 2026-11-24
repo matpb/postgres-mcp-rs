@@ -130,3 +130,11 @@ SELECT time_bucket('1 hour', ts), time_bucket_gapfill('1 hour', ts), locf(v), in
 SELECT hypertable_size('t'), hypertable_detailed_size('t'), hypertable_index_size('i'), hypertable_approximate_size('t'), hypertable_compression_stats('t'), chunks_detailed_size('t'), approximate_row_count('t'), show_chunks('t') FROM t;
 --;;
 SELECT first(v, ts), last(v, ts) FROM t;
+--;;
+SELECT show_tablespaces('t'), chunk_compression_stats('t'), hypertable_columnstore_stats('t'), chunk_columnstore_stats('t');
+--;;
+SELECT hypertable_name, num_chunks FROM timescaledb_information.hypertables;
+--;;
+SELECT chunk_name, range_start FROM timescaledb_information.chunks;
+--;;
+SELECT view_name FROM timescaledb_information.continuous_aggregates;

@@ -236,9 +236,9 @@ async fn run_held(
     let result = match race {
         Race::Done(Ok(result)) => result,
         Race::Done(Err(e)) if conn.is_poisoned() => {
-            return Err(close_on(query_failure(e, statement_ms)));
+            return Err(close_on(query_failure(e, statement_ms, elapsed)));
         }
-        Race::Done(Err(e)) => return Err(query_failure(e, statement_ms)),
+        Race::Done(Err(e)) => return Err(query_failure(e, statement_ms, elapsed)),
         Race::Cancelled => {
             stop_query(&cancel_handle).await;
             return Err(Failure::Drop(RunError::Cancelled));
@@ -356,13 +356,24 @@ async fn reset_and_release(mut lease: Lease<'_>) {
     }
 }
 
-fn query_failure(e: WireError, statement_ms: u64) -> Failure {
+/// A 57014 is the statement limit when the run reached most of it, or when the server text says so. The text
+/// alone is not used: it is in the server's language. The client's own cancels never reach this function.
+fn query_failure(e: WireError, statement_ms: u64, elapsed: Duration) -> Failure {
     match e {
-        WireError::Db(db) if db.code == "57014" && db.message.contains("statement timeout") => {
+        WireError::Db(db)
+            if db.code == "57014"
+                && (db.message.contains("statement timeout")
+                    || reached_limit(elapsed, statement_ms)) =>
+        {
             Failure::Keep(RunError::Timeout(statement_ms))
         }
         other => wire_failure(other),
     }
+}
+
+/// True when `elapsed` is at least 90% of the statement limit.
+fn reached_limit(elapsed: Duration, statement_ms: u64) -> bool {
+    elapsed.as_millis() * 100 >= u128::from(statement_ms) * 90
 }
 
 /// Server-reported errors and refusals leave the connection resettable; anything else closes it.

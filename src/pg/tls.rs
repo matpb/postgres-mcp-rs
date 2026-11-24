@@ -50,7 +50,83 @@ pub fn client_config(
     if mode == SslMode::VerifyCa && root_cert.is_none() {
         return Err(WireError::Tls("sslmode=verify-ca needs sslrootcert".into()));
     }
-    let roots = Arc::new(load_roots(root_cert)?);
+    let roots = match root_cert {
+        Some(path) => read_roots(path).map_err(|e| e.wire(path))?,
+        None => bundled_roots(),
+    };
+    build_config(mode, roots)
+}
+
+/// The configuration for a database at startup, read once and then shared. The error text names the
+/// cause only, never the path or the file contents: it follows `cannot read sslrootcert: ` or is `sslrootcert holds no certificate`.
+pub fn startup_client_config(
+    mode: SslMode,
+    root_cert: Option<&Path>,
+) -> Result<Arc<ClientConfig>, String> {
+    let roots = match root_cert {
+        Some(path) => read_roots(path).map_err(RootsError::startup)?,
+        None => bundled_roots(),
+    };
+    build_config(mode, roots).map_err(|e| match e {
+        WireError::Tls(message) => message,
+        other => other.to_string(),
+    })
+}
+
+fn bundled_roots() -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+/// Why a root certificate file cannot be used. The variants hold the cause, never the file contents.
+enum RootsError {
+    Open(std::io::Error),
+    Read(String),
+    Empty,
+    Add(String),
+}
+
+impl RootsError {
+    /// The text the wire client reports for a connection that cannot load its roots.
+    fn wire(self, path: &Path) -> WireError {
+        let shown = path.display();
+        WireError::Tls(match self {
+            RootsError::Open(e) => format!("cannot open {shown}: {e}"),
+            RootsError::Read(m) => format!("cannot read {shown}: {m}"),
+            RootsError::Empty => format!("no certificates found in {shown}"),
+            RootsError::Add(m) => m,
+        })
+    }
+
+    /// The text the startup check reports; the caller prefixes the database name or variable.
+    fn startup(self) -> String {
+        match self {
+            RootsError::Open(e) => format!("cannot read sslrootcert: {e}"),
+            RootsError::Read(m) | RootsError::Add(m) => format!("cannot read sslrootcert: {m}"),
+            RootsError::Empty => "sslrootcert holds no certificate".to_owned(),
+        }
+    }
+}
+
+fn read_roots(path: &Path) -> Result<RootCertStore, RootsError> {
+    let file = std::fs::File::open(path).map_err(RootsError::Open)?;
+    let reader = std::io::BufReader::new(file);
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_reader_iter(reader) {
+        let cert = cert.map_err(|e| RootsError::Read(e.to_string()))?;
+        roots
+            .add(cert)
+            .map_err(|e| RootsError::Add(e.to_string()))?;
+    }
+    if roots.is_empty() {
+        return Err(RootsError::Empty);
+    }
+    Ok(roots)
+}
+
+fn build_config(mode: SslMode, roots: RootCertStore) -> Result<Arc<ClientConfig>, WireError> {
+    let roots = Arc::new(roots);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let webpki = WebPkiServerVerifier::builder_with_provider(roots.clone(), provider.clone())
         .build()
@@ -68,30 +144,6 @@ pub fn client_config(
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     Ok(Arc::new(config))
-}
-
-fn load_roots(root_cert: Option<&Path>) -> Result<RootCertStore, WireError> {
-    let mut roots = RootCertStore::empty();
-    match root_cert {
-        Some(path) => {
-            let file = std::fs::File::open(path)
-                .map_err(|e| WireError::Tls(format!("cannot open {}: {e}", path.display())))?;
-            let reader = std::io::BufReader::new(file);
-            for cert in CertificateDer::pem_reader_iter(reader) {
-                let cert = cert
-                    .map_err(|e| WireError::Tls(format!("cannot read {}: {e}", path.display())))?;
-                roots.add(cert).map_err(|e| WireError::Tls(e.to_string()))?;
-            }
-            if roots.is_empty() {
-                return Err(WireError::Tls(format!(
-                    "no certificates found in {}",
-                    path.display()
-                )));
-            }
-        }
-        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-    }
-    Ok(roots)
 }
 
 /// Certificate verifier: Require/Prefer accept any certificate, VerifyCa checks the chain only,

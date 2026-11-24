@@ -10,10 +10,10 @@ use crate::server::AppState;
 use crate::tools::Call;
 
 /// Column names of the constraint's own table, from conkey in key order.
-const LOCAL_COLUMNS: &str = "(SELECT jsonb_agg(att.attname::text ORDER BY k.ord) FROM unnest(con.conkey) WITH ORDINALITY AS k(num, ord) \
+const LOCAL_COLUMNS: &str = "(SELECT pg_catalog.jsonb_agg(att.attname::text ORDER BY k.ord) FROM pg_catalog.unnest(con.conkey) WITH ORDINALITY AS k(num, ord) \
     JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = k.num)";
 /// Column names a foreign key references, from confkey in key order.
-const REFERENCED_COLUMNS: &str = "(SELECT jsonb_agg(att.attname::text ORDER BY k.ord) FROM unnest(con.confkey) WITH ORDINALITY AS k(num, ord) \
+const REFERENCED_COLUMNS: &str = "(SELECT pg_catalog.jsonb_agg(att.attname::text ORDER BY k.ord) FROM pg_catalog.unnest(con.confkey) WITH ORDINALITY AS k(num, ord) \
     JOIN pg_catalog.pg_attribute att ON att.attrelid = con.confrelid AND att.attnum = k.num)";
 
 /// The relation row: names, kind, persistence, owner, comment, estimate and privileges.
@@ -21,26 +21,27 @@ const CORE_SQL: &str = "SELECT n.nspname::text AS schema, c.relname::text AS nam
     c.relpersistence::text AS persistence, pg_catalog.pg_get_userbyid(c.relowner) AS owner, \
     pg_catalog.obj_description(c.oid, 'pg_class') AS comment, \
     CASE WHEN c.relkind::text IN ('r', 'm') THEN c.reltuples::bigint \
-        WHEN c.relkind::text = 'p' THEN (SELECT CASE WHEN bool_and(l.reltuples >= 0) THEN sum(l.reltuples)::bigint ELSE -1::bigint END \
+        WHEN c.relkind::text = 'p' THEN (SELECT CASE WHEN pg_catalog.bool_and(l.reltuples >= 0) THEN pg_catalog.sum(l.reltuples)::bigint ELSE -1::bigint END \
             FROM pg_catalog.pg_partition_tree(c.oid) t JOIN pg_catalog.pg_class l ON l.oid = t.relid WHERE t.isleaf) END AS \"rowEstimate\", \
     pg_catalog.has_table_privilege(c.oid, 'SELECT') AS \"canSelect\", \
     c.relrowsecurity AS \"rlsEnabled\", c.relforcerowsecurity AS \"rlsForced\" \
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1::oid";
 
+/// Sizes of the leaves, or of the relation itself when it is not a partition tree (a leaf lists itself in its tree).
 const SIZES_SQL: &str = "WITH leaves AS ( \
     SELECT t.relid FROM pg_catalog.pg_partition_tree($1::oid) t WHERE t.isleaf \
     UNION ALL \
-    SELECT $1::oid WHERE (SELECT c.relkind::text FROM pg_catalog.pg_class c WHERE c.oid = $1::oid) <> 'p') \
-    SELECT jsonb_build_object( \
-        'totalBytes', COALESCE(sum(pg_catalog.pg_total_relation_size(l.relid)), 0)::bigint, \
-        'tableBytes', COALESCE(sum(pg_catalog.pg_relation_size(l.relid)), 0)::bigint, \
-        'indexBytes', COALESCE(sum(pg_catalog.pg_indexes_size(l.relid)), 0)::bigint, \
-        'toastBytes', COALESCE(sum(CASE WHEN c.reltoastrelid <> 0::oid THEN pg_catalog.pg_total_relation_size(c.reltoastrelid) ELSE 0 END), 0)::bigint) AS v \
+    SELECT $1::oid WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_partition_tree($1::oid))) \
+    SELECT pg_catalog.jsonb_build_object( \
+        'totalBytes', COALESCE(pg_catalog.sum(pg_catalog.pg_total_relation_size(l.relid)), 0)::bigint, \
+        'tableBytes', COALESCE(pg_catalog.sum(pg_catalog.pg_relation_size(l.relid)), 0)::bigint, \
+        'indexBytes', COALESCE(pg_catalog.sum(pg_catalog.pg_indexes_size(l.relid)), 0)::bigint, \
+        'toastBytes', COALESCE(pg_catalog.sum(CASE WHEN c.reltoastrelid <> 0::oid THEN pg_catalog.pg_total_relation_size(c.reltoastrelid) ELSE 0 END), 0)::bigint) AS v \
     FROM leaves l JOIN pg_catalog.pg_class c ON c.oid = l.relid";
 
 fn columns_sql() -> String {
     format!(
-        "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
+        "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object( \
         'position', a.attnum, 'name', a.attname::text, \
         'type', {COLUMN_TYPE_SQL}, \
         'nullable', NOT a.attnotnull, \
@@ -60,27 +61,27 @@ fn columns_sql() -> String {
 /// The primary key of the relation, or null.
 fn primary_key_sql() -> String {
     format!(
-        "SELECT (SELECT jsonb_build_object('name', con.conname::text, 'columns', {LOCAL_COLUMNS}) \
+        "SELECT (SELECT pg_catalog.jsonb_build_object('name', con.conname::text, 'columns', {LOCAL_COLUMNS}) \
         FROM pg_catalog.pg_constraint con WHERE con.conrelid = $1::oid AND con.contype = 'p') AS v"
     )
 }
 
 fn unique_sql() -> String {
     format!(
-        "SELECT COALESCE(jsonb_agg(jsonb_build_object('name', con.conname::text, \
+        "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('name', con.conname::text, \
         'columns', {LOCAL_COLUMNS}, 'deferrable', con.condeferrable) ORDER BY con.conname), '[]'::jsonb) AS v \
         FROM pg_catalog.pg_constraint con WHERE con.conrelid = $1::oid AND con.contype = 'u'"
     )
 }
 
-const CHECK_SQL: &str = "SELECT COALESCE(jsonb_agg(jsonb_build_object('name', con.conname::text, \
+const CHECK_SQL: &str = "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('name', con.conname::text, \
     'definition', pg_catalog.pg_get_constraintdef(con.oid)) ORDER BY con.conname), '[]'::jsonb) AS v \
     FROM pg_catalog.pg_constraint con WHERE con.conrelid = $1::oid AND con.contype = 'c'";
 
 /// Foreign keys this relation declares.
 fn foreign_keys_sql() -> String {
     format!(
-        "SELECT COALESCE(jsonb_agg(jsonb_build_object('name', con.conname::text, \
+        "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('name', con.conname::text, \
         'columns', {LOCAL_COLUMNS}, \
         'referencesTable', (SELECT rn.nspname::text || '.' || rc.relname::text FROM pg_catalog.pg_class rc \
             JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace WHERE rc.oid = con.confrelid), \
@@ -97,7 +98,7 @@ fn foreign_keys_sql() -> String {
 /// Foreign keys in other relations that reference this one.
 fn referenced_by_sql() -> String {
     format!(
-        "SELECT COALESCE(jsonb_agg(jsonb_build_object('name', con.conname::text, \
+        "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('name', con.conname::text, \
         'table', (SELECT cn.nspname::text || '.' || cc.relname::text FROM pg_catalog.pg_class cc \
             JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.relnamespace WHERE cc.oid = con.conrelid), \
         'columns', {LOCAL_COLUMNS}, 'referencesColumns', {REFERENCED_COLUMNS}) ORDER BY con.conname), '[]'::jsonb) AS v \
@@ -105,7 +106,7 @@ fn referenced_by_sql() -> String {
     )
 }
 
-const INDEXES_SQL: &str = "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
+const INDEXES_SQL: &str = "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object( \
         'name', ic.relname::text, 'definition', pg_catalog.pg_get_indexdef(i.indexrelid), \
         'unique', i.indisunique, 'primary', i.indisprimary, 'valid', i.indisvalid, \
         'method', am.amname::text, 'sizeBytes', pg_catalog.pg_relation_size(i.indexrelid), \
@@ -116,10 +117,10 @@ const INDEXES_SQL: &str = "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
     LEFT JOIN pg_catalog.pg_stat_all_indexes s ON s.indexrelid = i.indexrelid \
     WHERE i.indrelid = $1::oid";
 
-const TRIGGERS_SQL: &str = "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
+const TRIGGERS_SQL: &str = "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object( \
         'name', tg.tgname::text, \
         'timing', CASE WHEN tg.tgtype::integer & 64 <> 0 THEN 'INSTEAD OF' WHEN tg.tgtype::integer & 2 <> 0 THEN 'BEFORE' ELSE 'AFTER' END, \
-        'events', (SELECT COALESCE(jsonb_agg(ev.name ORDER BY ev.ord), '[]'::jsonb) \
+        'events', (SELECT COALESCE(pg_catalog.jsonb_agg(ev.name ORDER BY ev.ord), '[]'::jsonb) \
             FROM (VALUES (4, 'INSERT', 1), (16, 'UPDATE', 2), (8, 'DELETE', 3), (32, 'TRUNCATE', 4)) AS ev(bit, name, ord) \
             WHERE tg.tgtype::integer & ev.bit <> 0), \
         'level', CASE WHEN tg.tgtype::integer & 1 <> 0 THEN 'ROW' ELSE 'STATEMENT' END, \
@@ -129,44 +130,44 @@ const TRIGGERS_SQL: &str = "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
         'definition', pg_catalog.pg_get_triggerdef(tg.oid)) ORDER BY tg.tgname::text), '[]'::jsonb) AS v \
     FROM pg_catalog.pg_trigger tg WHERE tg.tgrelid = $1::oid AND NOT tg.tgisinternal";
 
-const POLICIES_SQL: &str = "SELECT COALESCE(jsonb_agg(jsonb_build_object( \
+const POLICIES_SQL: &str = "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object( \
         'name', pol.polname::text, \
         'command', CASE pol.polcmd::text WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT' WHEN 'w' THEN 'UPDATE' \
             WHEN 'd' THEN 'DELETE' ELSE 'ALL' END, \
         'permissive', pol.polpermissive, \
-        'roles', (SELECT COALESCE(jsonb_agg(CASE WHEN x.r = 0::oid THEN 'public' \
+        'roles', (SELECT COALESCE(pg_catalog.jsonb_agg(CASE WHEN x.r = 0::oid THEN 'public' \
             ELSE (SELECT rolname::text FROM pg_catalog.pg_roles WHERE oid = x.r) END ORDER BY x.ord), '[]'::jsonb) \
-            FROM unnest(pol.polroles) WITH ORDINALITY AS x(r, ord)), \
+            FROM pg_catalog.unnest(pol.polroles) WITH ORDINALITY AS x(r, ord)), \
         'using', pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), \
         'withCheck', pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid)) ORDER BY pol.polname::text), '[]'::jsonb) AS v \
     FROM pg_catalog.pg_policy pol WHERE pol.polrelid = $1::oid";
 
 /// Partition key and children for a partitioned table, and the parent and bound for a partition.
-const PARTITIONING_SQL: &str = "SELECT CASE WHEN c.relkind::text = 'p' OR c.relispartition THEN jsonb_build_object( \
+const PARTITIONING_SQL: &str = "SELECT CASE WHEN c.relkind::text = 'p' OR c.relispartition THEN pg_catalog.jsonb_build_object( \
         'key', CASE WHEN c.relkind::text = 'p' THEN pg_catalog.pg_get_partkeydef(c.oid) END, \
         'strategy', (SELECT CASE pt.partstrat::text WHEN 'l' THEN 'list' WHEN 'r' THEN 'range' WHEN 'h' THEN 'hash' END \
             FROM pg_catalog.pg_partitioned_table pt WHERE pt.partrelid = c.oid), \
-        'partitions', (SELECT COALESCE(jsonb_agg(x.item ORDER BY x.nm), '[]'::jsonb) FROM ( \
+        'partitions', (SELECT COALESCE(pg_catalog.jsonb_agg(x.item ORDER BY x.nm), '[]'::jsonb) FROM ( \
             SELECT cn.nspname::text || '.' || cc.relname::text AS nm, \
-                jsonb_build_object('name', cn.nspname::text || '.' || cc.relname::text, \
+                pg_catalog.jsonb_build_object('name', cn.nspname::text || '.' || cc.relname::text, \
                     'bound', pg_catalog.pg_get_expr(cc.relpartbound, cc.oid)) AS item \
             FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class cc ON cc.oid = i.inhrelid \
             JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.relnamespace \
             WHERE i.inhparent = c.oid ORDER BY cn.nspname::text, cc.relname::text LIMIT 200) x), \
-        'partitionsTruncated', (SELECT count(*) > 200 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid), \
+        'partitionsTruncated', (SELECT pg_catalog.count(*) > 200 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid), \
         'parent', CASE WHEN c.relispartition THEN (SELECT pn.nspname::text || '.' || pc.relname::text \
             FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
             JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace WHERE i.inhrelid = c.oid) END, \
         'bound', CASE WHEN c.relispartition THEN pg_catalog.pg_get_expr(c.relpartbound, c.oid) END) END AS v \
     FROM pg_catalog.pg_class c WHERE c.oid = $1::oid";
 
-const INHERITS_SQL: &str = "SELECT COALESCE(jsonb_agg(pn.nspname::text || '.' || pc.relname::text \
+const INHERITS_SQL: &str = "SELECT COALESCE(pg_catalog.jsonb_agg(pn.nspname::text || '.' || pc.relname::text \
     ORDER BY pn.nspname::text, pc.relname::text), '[]'::jsonb) AS v \
     FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
     JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
     WHERE i.inhrelid = $1::oid AND NOT (SELECT c.relispartition FROM pg_catalog.pg_class c WHERE c.oid = $1::oid)";
 
-const INHERITED_BY_SQL: &str = "SELECT COALESCE(jsonb_agg(cn.nspname::text || '.' || cc.relname::text \
+const INHERITED_BY_SQL: &str = "SELECT COALESCE(pg_catalog.jsonb_agg(cn.nspname::text || '.' || cc.relname::text \
     ORDER BY cn.nspname::text, cc.relname::text), '[]'::jsonb) AS v \
     FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class cc ON cc.oid = i.inhrelid \
     JOIN pg_catalog.pg_namespace cn ON cn.oid = cc.relnamespace \
@@ -175,9 +176,9 @@ const INHERITED_BY_SQL: &str = "SELECT COALESCE(jsonb_agg(cn.nspname::text || '.
 const VIEW_SQL: &str = "SELECT pg_catalog.pg_get_viewdef($1::oid, true) AS v";
 
 /// The server name and every table option; values are masked by `redact_options` before they are shown.
-const FOREIGN_SQL: &str = "SELECT jsonb_build_object('server', s.srvname::text, 'options', COALESCE( \
-        (SELECT jsonb_object_agg(split_part(o, '=', 1), substring(o FROM position('=' IN o) + 1)) \
-            FROM unnest(ft.ftoptions) AS o), '{}'::jsonb)) AS v \
+const FOREIGN_SQL: &str = "SELECT pg_catalog.jsonb_build_object('server', s.srvname::text, 'options', COALESCE( \
+        (SELECT pg_catalog.jsonb_object_agg(pg_catalog.split_part(o, '=', 1), substring(o FROM position('=' IN o) + 1)) \
+            FROM pg_catalog.unnest(ft.ftoptions) AS o), '{}'::jsonb)) AS v \
     FROM pg_catalog.pg_foreign_table ft JOIN pg_catalog.pg_foreign_server s ON s.oid = ft.ftserver \
     WHERE ft.ftrelid = $1::oid";
 
@@ -261,7 +262,7 @@ mod tests {
     }
 }
 
-const STATS_SQL: &str = "SELECT jsonb_build_object('lastVacuum', s.last_vacuum, 'lastAutovacuum', s.last_autovacuum, \
+const STATS_SQL: &str = "SELECT pg_catalog.jsonb_build_object('lastVacuum', s.last_vacuum, 'lastAutovacuum', s.last_autovacuum, \
     'lastAnalyze', s.last_analyze, 'lastAutoanalyze', s.last_autoanalyze, \
     'liveRows', s.n_live_tup, 'deadRows', s.n_dead_tup) AS v \
     FROM pg_catalog.pg_stat_all_tables s WHERE s.relid = $1::oid";

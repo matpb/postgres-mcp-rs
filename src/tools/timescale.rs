@@ -11,7 +11,7 @@ use rmcp::model::Tool;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use super::core::tool;
+use super::core::{tool, tool_with_leading};
 use super::envelope::{self, QueryEnvelope};
 use super::text;
 use super::{Call, INTERNAL_MAX_ROWS, Runner, Statement, ToolError, Toolset, parse_args};
@@ -131,26 +131,18 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
         ),
         (
             Toolset::Timescale,
-            tool::<hypertables::DescribeArgs, hypertables::DescribeResult>(
+            tool_with_leading::<hypertables::DescribeArgs, hypertables::DescribeResult>(
                 "describe_hypertable",
                 text::DESCRIBE_HYPERTABLE_TITLE,
                 text::DESCRIBE_HYPERTABLE,
                 &[
                     ("database", text::DATABASE_PARAM),
-                    ("hypertable", "Hypertable name, bare or as schema.name."),
-                    (
-                        "schema",
-                        "Schema of the hypertable. Optional when the name is unique.",
-                    ),
-                    (
-                        "chunk_limit",
-                        "Chunks to list, newest first (default 20, at most 500).",
-                    ),
-                    (
-                        "chunk_cursor",
-                        "Cursor from a previous call's nextChunkCursor.",
-                    ),
+                    ("hypertable", text::DESCRIBE_HYPERTABLE_HYPERTABLE_PARAM),
+                    ("schema", text::DESCRIBE_HYPERTABLE_SCHEMA_PARAM),
+                    ("chunk_limit", text::DESCRIBE_HYPERTABLE_CHUNK_LIMIT_PARAM),
+                    ("chunk_cursor", text::DESCRIBE_HYPERTABLE_CHUNK_CURSOR_PARAM),
                 ],
+                &["hypertable", "schema", "chunk_limit", "chunk_cursor"],
             ),
         ),
         (
@@ -169,18 +161,19 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
         ),
         (
             Toolset::Timescale,
-            tool::<jobs::ListArgs, jobs::ListResult>(
+            tool_with_leading::<jobs::ListArgs, jobs::ListResult>(
                 "list_jobs",
                 text::LIST_JOBS_TITLE,
                 text::LIST_JOBS,
                 &[
                     ("database", text::DATABASE_PARAM),
-                    ("job_id", "Only this job."),
-                    ("history", "Return recent runs instead of the job list."),
-                    ("only_failures", "With history: only failed runs."),
+                    ("job_id", text::LIST_JOBS_JOB_ID_PARAM),
+                    ("history", text::LIST_JOBS_HISTORY_PARAM),
+                    ("only_failures", text::LIST_JOBS_ONLY_FAILURES_PARAM),
                     ("limit", text::LIMIT_PARAM),
                     ("cursor", text::CURSOR_PARAM),
                 ],
+                &["job_id", "history", "only_failures"],
             ),
         ),
     ]

@@ -50,3 +50,10 @@ GRANT SELECT ON ALL TABLES IN SCHEMA shop TO mcp_strict;
 GRANT SELECT ON ALL TABLES IN SCHEMA app TO mcp_strict;
 GRANT USAGE ON SCHEMA shop_parts TO mcp_strict;
 GRANT SELECT ON ALL TABLES IN SCHEMA shop_parts TO mcp_strict;
+
+-- Publications for the replication tests: one per kind of membership, the partition root and the leaves.
+CREATE PUBLICATION pub_schema FOR TABLES IN SCHEMA app;
+CREATE PUBLICATION pub_one FOR TABLE shop.customers;
+CREATE PUBLICATION pub_root FOR TABLE shop.events WITH (publish_via_partition_root = true);
+CREATE PUBLICATION pub_leaves FOR TABLE shop.events;
+CREATE PUBLICATION pub_all FOR ALL TABLES;

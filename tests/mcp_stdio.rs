@@ -143,6 +143,105 @@ fn http_without_database_is_configuration_error() {
     assert!(stderr.contains("configuration error"), "{stderr}");
 }
 
+/// Exit status of `healthcheck` on `port` with MCP_HOST set to `host`.
+fn healthcheck_on(host: &str, port: u16) -> ExitStatus {
+    command(&["healthcheck"])
+        .env("MCP_HOST", host)
+        .env("MCP_PORT", port.to_string())
+        .status()
+        .expect("healthcheck runs")
+}
+
+#[test]
+fn healthcheck_probes_the_mcp_host_address() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        eprintln!("skipping: this machine has no IPv6 loopback address");
+        return;
+    }
+    for _ in 0..5 {
+        let port = free_port();
+        let mut server = command(&["http"])
+            .env("DATABASE_URL", database_url(PORT_19))
+            .env("MCP_HOST", "::1")
+            .env("MCP_PORT", port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("server starts");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut healthy = false;
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if server.try_wait().expect("child can be polled").is_some() {
+                exited = true;
+                break;
+            }
+            if healthcheck_on("::1", port).success() {
+                healthy = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = server.kill();
+        let _ = server.wait();
+        if healthy {
+            return;
+        }
+        assert!(exited, "server on [::1]:{port} never answered /health");
+    }
+    panic!("no free port answered within 5 attempts");
+}
+
+/// Runs `http` with DATABASE_URL carrying the given sslrootcert and returns its exit code and stderr.
+/// A server that starts instead of failing is killed and reported.
+fn startup_with_root_cert(root_cert: &str) -> (Option<i32>, String) {
+    let url = format!(
+        "postgres://{DB_USER}:{DB_PASSWORD}@127.0.0.1:{PORT_19}/{DB_NAME}?sslmode=verify-full&sslrootcert={root_cert}"
+    );
+    let mut child = command(&["http"])
+        .env("DATABASE_URL", url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary starts");
+    let Some(status) = wait_with_timeout(&mut child, Duration::from_secs(10)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the server started instead of failing on sslrootcert {root_cert}");
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)
+            .expect("stderr is readable");
+    }
+    (status.code(), stderr.trim_end().to_owned())
+}
+
+#[test]
+fn nonexistent_sslrootcert_fails_startup_with_exit_2() {
+    let (code, stderr) = startup_with_root_cert("/nonexistent/pgmcp-ca.pem");
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr,
+        "configuration error: appdb: cannot read sslrootcert: No such file or directory (os error 2)"
+    );
+}
+
+#[test]
+fn sslrootcert_without_certificates_fails_startup_with_exit_2() {
+    let path = std::env::temp_dir().join(format!("pgmcp-no-certs-{}.pem", std::process::id()));
+    std::fs::write(&path, "not a certificate\n").expect("write the test file");
+    let (code, stderr) = startup_with_root_cert(&path.to_string_lossy());
+    std::fs::remove_file(&path).expect("remove the test file");
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr,
+        "configuration error: appdb: sslrootcert holds no certificate"
+    );
+}
+
 #[test]
 fn healthcheck_fails_on_closed_port() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");

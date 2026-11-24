@@ -96,3 +96,38 @@ BEGIN
   END IF;
 END
 $do$;
+
+-- Timestamp and date time columns with refreshed continuous aggregates. They live in their own database so the
+-- appdb listings keep their counts; the watermark tests read them there.
+\if :has_timescaledb
+SELECT 'CREATE DATABASE timeline' WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'timeline') \gexec
+\c timeline
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+CREATE SCHEMA naive;
+CREATE TABLE naive.readings (ts timestamp NOT NULL, device_id int NOT NULL, value double precision)
+  WITH (tsdb.hypertable, tsdb.partition_column = 'ts', tsdb.chunk_interval = '1 day');
+INSERT INTO naive.readings
+  SELECT ts, d, d::double precision FROM generate_series('2024-01-01 00:00:00'::timestamp, '2024-01-03 23:50:00', '10 min') AS ts,
+         generate_series(1, 3) AS d;
+CREATE MATERIALIZED VIEW naive.readings_hourly WITH (timescaledb.continuous) AS
+  SELECT time_bucket('1 hour', ts) AS bucket, device_id, avg(value) AS avg_value
+  FROM naive.readings GROUP BY 1, 2 WITH NO DATA;
+DO $do$
+BEGIN
+  CALL refresh_continuous_aggregate('naive.readings_hourly', '2024-01-01 00:00:00', '2024-01-04 00:00:00');
+END
+$do$;
+CREATE TABLE naive.daily_counts (day date NOT NULL, n int NOT NULL)
+  WITH (tsdb.hypertable, tsdb.partition_column = 'day', tsdb.chunk_interval = '7 days');
+INSERT INTO naive.daily_counts
+  SELECT d::date, extract(day FROM d)::int FROM generate_series('2024-01-01 00:00:00'::timestamp, '2024-01-20 00:00:00', '1 day') AS d;
+CREATE MATERIALIZED VIEW naive.daily_counts_weekly WITH (timescaledb.continuous) AS
+  SELECT time_bucket('7 days', day) AS bucket, sum(n) AS total
+  FROM naive.daily_counts GROUP BY 1 WITH NO DATA;
+DO $do$
+BEGIN
+  CALL refresh_continuous_aggregate('naive.daily_counts_weekly', '2024-01-01', '2024-01-22');
+END
+$do$;
+\c appdb
+\endif

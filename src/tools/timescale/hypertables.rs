@@ -29,13 +29,9 @@ pub struct ListArgs {
 #[serde(deny_unknown_fields)]
 pub struct DescribeArgs {
     pub database: Option<String>,
-    /// Hypertable name, bare or as schema.name.
     pub hypertable: String,
-    /// Schema of the hypertable. Optional when the name is unique.
     pub schema: Option<String>,
-    /// Chunks to list, newest first (default 20, at most 500).
     pub chunk_limit: Option<i64>,
-    /// Cursor from a previous call's nextChunkCursor.
     pub chunk_cursor: Option<String>,
 }
 
@@ -162,9 +158,9 @@ fn list_sql(sources: &Sources, window: &str) -> String {
          pg_catalog.pg_get_userbyid(c.relowner)::text AS \"owner\", pg_catalog.obj_description(c.oid, 'pg_class') AS \"comment\", \
          td.column_name::text AS \"timeColumn\", td.column_type::text AS \"timeColumnType\", \
          COALESCE(pg_catalog.to_jsonb(td.time_interval::text), pg_catalog.to_jsonb(td.integer_interval)) AS \"chunkInterval\", \
-         (SELECT count(*) FROM timescaledb_information.dimensions dd \
+         (SELECT pg_catalog.count(*) FROM timescaledb_information.dimensions dd \
            WHERE dd.hypertable_schema = ht.hypertable_schema AND dd.hypertable_name = ht.hypertable_name) AS \"dimensions\", \
-         (SELECT count(*) FROM timescaledb_information.chunks ch \
+         (SELECT pg_catalog.count(*) FROM timescaledb_information.chunks ch \
            WHERE ch.hypertable_schema = ht.hypertable_schema AND ch.hypertable_name = ht.hypertable_name) AS \"chunks\", \
          {enabled}EXISTS (SELECT 1 FROM timescaledb_information.continuous_aggregates ca \
            WHERE ca.materialization_hypertable_schema = ht.hypertable_schema \

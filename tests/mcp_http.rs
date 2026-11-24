@@ -176,6 +176,34 @@ async fn stateless_2026_request_works() {
     assert!(names.contains(&"execute_query"), "{names:?}");
 }
 
+/// Every input property of every published tool has a non-empty description.
+#[tokio::test]
+async fn every_tool_input_property_has_a_description() {
+    let router = app(one_db(PORT_18, &[]));
+    let body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+    let reply = post_mcp(&router, &body, &[("mcp-protocol-version", PROTOCOL_2025)]).await;
+    let tools = result_of(&reply.json())["tools"].clone();
+    let tools = tools.as_array().expect("tools array").clone();
+    assert!(!tools.is_empty());
+    let mut checked = 0;
+    for tool in &tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let properties = tool["inputSchema"]["properties"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        for (property, schema) in &properties {
+            checked += 1;
+            let description = schema["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.is_empty(),
+                "{name}.{property} has no description"
+            );
+        }
+    }
+    assert!(checked > 50, "only {checked} input properties checked");
+}
+
 #[tokio::test]
 async fn tools_list_has_core_tools_with_annotations() {
     let router = app(one_db(PORT_18, &[]));
@@ -532,6 +560,35 @@ async fn explain_text_and_json() {
     assert!(plan.contains("Scan"), "{plan}");
 }
 
+/// `n` branches of `SELECT 1` in a balanced UNION ALL tree, so the parser does not see a deep chain.
+fn balanced_union(n: usize) -> String {
+    if n <= 10 {
+        let branches = vec!["SELECT 1"; n].join(" UNION ALL ");
+        return format!("({branches})");
+    }
+    let half = n / 2;
+    format!(
+        "({} UNION ALL {})",
+        balanced_union(half),
+        balanced_union(n - half)
+    )
+}
+
+/// A text plan over the row cap names the line limit and the JSON format, not the byte limit.
+#[tokio::test]
+async fn explain_text_plan_over_the_row_cap_names_the_line_limit() {
+    let branches = balanced_union(5000);
+    assert!(branches.len() < 100 * 1024, "{} bytes", branches.len());
+    // A 1 MiB response budget lets the line count, not the bytes, be the limit that trips.
+    let roomy = one_db(PORT_18, &[("MAX_RESPONSE_BYTES", "1048576")]);
+    let result = tool(roomy, "explain_query", json!({"sql": branches})).await;
+    assert!(is_error(&result), "{result}");
+    assert_eq!(
+        text_of(&result),
+        "Internal error: The plan has more than 5000 lines; use format \"json\" or explain a smaller statement."
+    );
+}
+
 #[tokio::test]
 async fn explain_analyze_runs() {
     let result = tool(
@@ -799,6 +856,56 @@ async fn server_info_shape() {
     assert_eq!(find("TimeZone").as_deref(), Some("UTC"));
     assert_eq!(find("default_transaction_read_only").as_deref(), Some("on"));
     assert_eq!(info["warnings"], json!([]));
+}
+
+/// One PG_DATABASES entry named appdb for a given login.
+fn login_db(port: u16, user: &str, password: &str) -> Value {
+    json!({
+        "name": "appdb",
+        "host": "127.0.0.1",
+        "port": port,
+        "database": DB_NAME,
+        "user": user,
+        "password": password,
+        "sslmode": "disable",
+        "max_connections": 1,
+    })
+}
+
+/// Every setting server_info reports equals current_setting(name) read through execute_query on the same server.
+async fn assert_server_info_settings_match_queries(port: u16, user: &str, password: &str) -> Value {
+    let router = app(config_with(&[login_db(port, user, password)], &[]));
+    let response = call_tool(&router, "server_info", json!({})).await;
+    let info = structured(result_of(&response)).clone();
+    let settings = info["settings"].as_array().expect("settings").clone();
+    assert!(!settings.is_empty(), "{info}");
+    for setting in &settings {
+        let name = setting["name"].as_str().expect("setting name");
+        let sql = format!("SELECT current_setting('{name}') AS v");
+        let query = call_tool(&router, "execute_query", json!({"sql": sql})).await;
+        let rows = result_of(&query)["structuredContent"]["rows"].clone();
+        assert_eq!(rows[0]["v"], setting["value"], "setting {name}");
+    }
+    info
+}
+
+#[tokio::test]
+async fn server_info_settings_match_execute_query_strict_on_18() {
+    let info =
+        assert_server_info_settings_match_queries(PORT_18, "mcp_strict", "test-only-strict").await;
+    let search_path = info["settings"]
+        .as_array()
+        .expect("settings")
+        .iter()
+        .find(|s| s["name"] == "search_path")
+        .expect("search_path is reported");
+    assert_eq!(search_path["value"], "public, pg_catalog", "{info}");
+}
+
+#[tokio::test]
+async fn server_info_settings_match_execute_query_ro_on_19() {
+    let info = assert_server_info_settings_match_queries(PORT_19, DB_USER, DB_PASSWORD).await;
+    assert_eq!(info["warnings"], json!([]), "{info}");
 }
 
 #[test]

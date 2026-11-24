@@ -170,36 +170,15 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
             text::READ_SERVER_LOG,
             &[
                 ("database", text::DATABASE_PARAM),
-                (
-                    "list_files",
-                    "Return the log files and logging settings instead of log entries.",
-                ),
-                (
-                    "since",
-                    "Only entries at or after this time (ISO 8601, e.g. 2026-01-31T14:00:00Z).",
-                ),
-                ("until", "Only entries before this time (ISO 8601)."),
-                (
-                    "min_severity",
-                    "Lowest severity to return: DEBUG, INFO, NOTICE, WARNING, ERROR, FATAL or PANIC. LOG lines rank as INFO.",
-                ),
-                (
-                    "contains",
-                    "Case-insensitive text that must appear in the message, detail or statement.",
-                ),
-                (
-                    "user",
-                    "Only entries of this database role (structured formats only).",
-                ),
-                (
-                    "entry_database",
-                    "Only entries of this database name (structured formats only).",
-                ),
-                ("pid", "Only entries of this backend process id."),
-                (
-                    "file",
-                    "Read this log file instead of the newest ones (a name from list_files).",
-                ),
+                ("list_files", text::READ_SERVER_LOG_LIST_FILES_PARAM),
+                ("since", text::READ_SERVER_LOG_SINCE_PARAM),
+                ("until", text::READ_SERVER_LOG_UNTIL_PARAM),
+                ("min_severity", text::READ_SERVER_LOG_MIN_SEVERITY_PARAM),
+                ("contains", text::READ_SERVER_LOG_CONTAINS_PARAM),
+                ("user", text::READ_SERVER_LOG_USER_PARAM),
+                ("entry_database", text::READ_SERVER_LOG_ENTRY_DATABASE_PARAM),
+                ("pid", text::READ_SERVER_LOG_PID_PARAM),
+                ("file", text::READ_SERVER_LOG_FILE_PARAM),
                 ("limit", text::LIMIT_PARAM),
                 ("cursor", text::CURSOR_PARAM),
             ],

@@ -22,11 +22,8 @@ const FAILURES_ONLY_NOTE: &str = "This TimescaleDB version records failed runs o
 #[serde(deny_unknown_fields)]
 pub struct ListArgs {
     pub database: Option<String>,
-    /// Only this job.
     pub job_id: Option<i32>,
-    /// Return recent runs instead of the job list.
     pub history: Option<bool>,
-    /// With history: only failed runs.
     pub only_failures: Option<bool>,
     pub limit: Option<i64>,
     pub cursor: Option<String>,

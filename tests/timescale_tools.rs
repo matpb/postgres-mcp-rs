@@ -295,6 +295,38 @@ async fn describe_hypertable_resolves_bare_name_and_reports_errors() {
     assert_eq!(error_text(&bad_cursor), "Invalid cursor.");
 }
 
+/// A router for mcp_ro on the `timeline` database, which holds the timestamp and date aggregates.
+fn timeline() -> Router {
+    let entry = json!({
+        "name": "timeline",
+        "host": "127.0.0.1",
+        "port": PORT_18,
+        "database": "timeline",
+        "user": "mcp_ro",
+        "password": "test-only-ro",
+        "sslmode": "disable",
+    });
+    app(config_with(&[entry], &[]))
+}
+
+#[tokio::test]
+async fn list_continuous_aggregates_watermarks_for_timestamp_and_date() {
+    let result = call(&timeline(), "list_continuous_aggregates", json!({})).await;
+    let body = ok(&result);
+    assert_eq!(body["database"], "timeline");
+    assert_eq!(body["warnings"], json!([]), "{body}");
+    let caggs = body["continuousAggregates"].as_array().expect("caggs");
+    let watermark = |name: &str| {
+        caggs
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no cagg {name} in {caggs:?}"))["watermark"]
+            .clone()
+    };
+    assert_eq!(watermark("readings_hourly"), json!("2024-01-04 00:00:00"));
+    assert_eq!(watermark("daily_counts_weekly"), json!("2024-01-22"));
+}
+
 #[tokio::test]
 async fn list_continuous_aggregates_describes_readings_hourly() {
     let router = ro();

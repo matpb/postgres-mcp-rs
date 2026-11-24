@@ -20,10 +20,10 @@ const ORDERS: [(&str, &str); 6] = [
 /// Relations of the schema filter: the system schemas and TimescaleDB internals are left out unless named.
 const SCHEMA_FILTER: &str = "(($1::text IS NULL AND s.schemaname NOT IN ('pg_catalog', 'information_schema', \
     'timescaledb_information', 'timescaledb_experimental', 'toolkit_experimental') \
-    AND NOT starts_with(s.schemaname, 'pg_toast') AND NOT starts_with(s.schemaname, 'pg_temp_') \
-    AND NOT starts_with(s.schemaname, '_timescaledb_')) OR s.schemaname = $1::text) \
+    AND NOT pg_catalog.starts_with(s.schemaname, 'pg_toast') AND NOT pg_catalog.starts_with(s.schemaname, 'pg_temp_') \
+    AND NOT pg_catalog.starts_with(s.schemaname, '_timescaledb_')) OR s.schemaname = $1::text) \
     AND ($2::text IS NULL OR s.relname = $2::text)";
-const INDEXES_JSON: &str = "LEFT JOIN LATERAL (SELECT COALESCE(jsonb_agg(jsonb_build_object(\
+const INDEXES_JSON: &str = "LEFT JOIN LATERAL (SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(\
     'name', ic.relname, 'scans', si.idx_scan, 'tupRead', si.idx_tup_read, 'tupFetch', si.idx_tup_fetch, \
     'sizeBytes', pg_catalog.pg_relation_size(i.indexrelid), 'unique', i.indisunique, \
     'primary', i.indisprimary, 'valid', i.indisvalid) ORDER BY ic.relname), '[]'::jsonb) AS indexes \
@@ -143,7 +143,7 @@ fn tables_sql(include_indexes: bool, order: &str, page: &str) -> String {
         "SELECT s.schemaname AS \"schema\", s.relname AS \"name\", c.reltuples::bigint AS \"rowEstimate\", \
         s.n_live_tup AS \"liveRows\", s.n_dead_tup AS \"deadRows\", \
         CASE WHEN s.n_live_tup + s.n_dead_tup > 0 \
-        THEN ROUND(s.n_dead_tup::numeric / (s.n_live_tup + s.n_dead_tup), 4)::float8 END AS \"deadRatio\", \
+        THEN pg_catalog.ROUND(s.n_dead_tup::numeric / (s.n_live_tup + s.n_dead_tup), 4)::float8 END AS \"deadRatio\", \
         s.seq_scan AS \"seqScan\", s.seq_tup_read AS \"seqTupRead\", s.idx_scan AS \"idxScan\", \
         s.idx_tup_fetch AS \"idxTupFetch\", s.n_tup_ins AS \"inserts\", s.n_tup_upd AS \"updates\", \
         s.n_tup_hot_upd AS \"hotUpdates\", s.n_tup_del AS \"deletes\", \

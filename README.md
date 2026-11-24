@@ -11,7 +11,7 @@ postgres-mcp-rs is a read-only [Model Context Protocol](https://modelcontextprot
 - **Tools that replace catalog SQL.** `describe_table` returns columns, keys, foreign keys in both directions, indexes, policies and statistics in one call. Monitoring tools show sessions, lock waits, statement statistics and replication. Log and TimescaleDB tools cover server logs, hypertables, continuous aggregates and jobs. The model does not have to write `pg_catalog` queries to find its way around.
 - **One binary, a small non-root container.** The server is a single executable. The Dockerfile builds it into a distroless image that runs as a non-root user. The example compose file adds a read-only root filesystem, all capabilities dropped and `no-new-privileges`.
 - **One optional API key.** Set `API_KEY` to require a key on the HTTP endpoint. Leave it unset for a loopback-only server that only you use.
-- **Several databases behind one server.** One process serves any number of configured databases. Every tool takes a `database` argument, which may be omitted when only one is configured.
+- **Several databases behind one server.** One process serves any number of configured databases. Every tool that reads a database takes a `database` argument, which may be omitted when only one is configured.
 - **stdio and Streamable HTTP.** Run it as a process that one client starts for itself, or serve it over HTTP to clients on the same machine or your network.
 
 ## Quick start
@@ -229,7 +229,7 @@ The `*_FILE` variants keep secrets out of the environment. `API_KEY_FILE` reads 
 | `verify-ca` | TLS, and the certificate must chain to a trusted root. The host name is not checked. |
 | `verify-full` | TLS, and the certificate must chain to a trusted root and match the host name. |
 
-The trusted roots are the PEM file named by `sslrootcert` (or `PGSSLROOTCERT`) when set, and otherwise the bundled Mozilla root set (webpki-roots), not the operating system store. A private certificate authority therefore needs `sslrootcert`. `verify-ca` needs `sslrootcert`: without it the configuration fails with an error that ends `sslmode=verify-ca needs sslrootcert`. `verify-full` without `sslrootcert` checks against the bundled roots. The file is read when a TLS connection is made. Use `verify-full` for any database that is reached over a network.
+The trusted roots are the PEM file named by `sslrootcert` (or `PGSSLROOTCERT`) when set, and otherwise the bundled Mozilla root set (webpki-roots), not the operating system store. A private certificate authority therefore needs `sslrootcert`. `verify-ca` needs `sslrootcert`: without it the configuration fails with an error that ends `sslmode=verify-ca needs sslrootcert`. `verify-full` without `sslrootcert` checks against the bundled roots. The file is read once, when the server starts. A file that cannot be read, or holds no certificate, stops startup with a configuration error. Use `verify-full` for any database that is reached over a network.
 
 ### Authentication to PostgreSQL
 
@@ -414,7 +414,7 @@ For this option only, the statement is sent with the simple query protocol, and 
 
 `columns` lists every result column in SELECT order, even when there are no rows. Each column's `type` is the PostgreSQL type name, such as `int4` or `text`. An array column is named `<element>[]`, such as `int4[]` or `text[]`, for built-in and custom element types alike. A custom type outside the `public` and `pg_catalog` schemas is schema-qualified, such as `types.mood`. A domain column reports its base type. A column has `originalName` only when its name was changed. Duplicate names become `id__2`, `id__3` and so on, with `originalName` set to the name the query used. `rows` holds one object per row, keyed by column name. `truncatedReason` appears only when `truncated` is true. `truncatedValues` counts values that were cut, and `rawFallbacks` counts values that were returned as PostgreSQL text because they did not parse as their type.
 
-The server sets the session's DateStyle to ISO, MDY, IntervalStyle to `iso_8601`, TimeZone to UTC and `bytea_output` to hex. Those settings are part of every result.
+The server sets the session's DateStyle to ISO, MDY, IntervalStyle to `iso_8601`, TimeZone to UTC and `bytea_output` to hex. Every result is formatted under those settings.
 
 | PostgreSQL type | JSON value |
 |-----------------|------------|
