@@ -34,7 +34,7 @@ const SIZES_SQL: &str = "WITH leaves AS ( \
     SELECT $1::oid WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_partition_tree($1::oid))) \
     SELECT pg_catalog.jsonb_build_object( \
         'totalBytes', COALESCE(pg_catalog.sum(pg_catalog.pg_total_relation_size(l.relid)), 0)::bigint, \
-        'tableBytes', COALESCE(pg_catalog.sum(pg_catalog.pg_relation_size(l.relid)), 0)::bigint, \
+        'tableBytes', COALESCE(pg_catalog.sum(pg_catalog.pg_table_size(l.relid)), 0)::bigint, \
         'indexBytes', COALESCE(pg_catalog.sum(pg_catalog.pg_indexes_size(l.relid)), 0)::bigint, \
         'toastBytes', COALESCE(pg_catalog.sum(CASE WHEN c.reltoastrelid <> 0::oid THEN pg_catalog.pg_total_relation_size(c.reltoastrelid) ELSE 0 END), 0)::bigint) AS v \
     FROM leaves l JOIN pg_catalog.pg_class c ON c.oid = l.relid";

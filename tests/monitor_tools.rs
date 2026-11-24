@@ -1220,3 +1220,67 @@ async fn query_stats_min_role_hides_other_users_query_text() {
         }
     }
 }
+
+/// Starts a session in pg_sleep under `application` and returns its cancel handle and the task that runs it.
+async fn sleeping_session(
+    port: u16,
+    application: &str,
+) -> (
+    postgres_mcp::pg::wire::CancelHandle,
+    tokio::task::JoinHandle<
+        Result<postgres_mcp::pg::wire::SimpleResult, postgres_mcp::pg::wire::WireError>,
+    >,
+) {
+    let mut conn = raw(port, "mcp_ro", DB_PASSWORD, application).await;
+    let cancel = conn.cancel_handle();
+    let task = tokio::spawn(async move { conn.simple_query("SELECT pg_sleep(20)").await });
+    (cancel, task)
+}
+
+/// The wait_events entry for pg_sleep once it is visible to the stats section, waiting up to 5 seconds.
+async fn pg_sleep_entry(port: u16) -> Value {
+    for _ in 0..50 {
+        let result = call(
+            ro_config(port),
+            "database_stats",
+            json!({"sections": ["wait_events"]}),
+        )
+        .await;
+        let events = structured(&result)["sections"]["waitEvents"]
+            .as_array()
+            .expect("waitEvents array")
+            .clone();
+        if let Some(entry) = events
+            .into_iter()
+            .find(|e| e["type"] == json!("Timeout") && e["event"] == json!("PgSleep"))
+        {
+            return entry;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no Timeout/PgSleep entry on port {port}");
+}
+
+#[tokio::test]
+async fn wait_events_carry_descriptions_on_postgres_17_and_newer() {
+    for port in [PORT_18, PORT_19] {
+        let (cancel, task) = sleeping_session(port, &format!("pgmcp-wait-{port}")).await;
+        let entry = pg_sleep_entry(port).await;
+        assert_eq!(
+            entry["description"],
+            json!("Waiting due to a call to pg_sleep or a sibling function"),
+            "port {port}: {entry}"
+        );
+        cancel.cancel().await.expect("cancel the sleeper");
+        assert!(task.await.expect("sleeper joins").is_err(), "port {port}");
+    }
+}
+
+#[tokio::test]
+async fn wait_event_description_is_null_before_postgres_17() {
+    let (cancel, task) = sleeping_session(PORT_15, "pgmcp-wait-15").await;
+    let entry = pg_sleep_entry(PORT_15).await;
+    assert!(entry["description"].is_null(), "{entry}");
+    cancel.cancel().await.expect("cancel the sleeper");
+    assert!(task.await.expect("sleeper joins").is_err());
+}

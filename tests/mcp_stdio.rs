@@ -687,3 +687,211 @@ fn each_disabled_toolset_is_absent_and_the_others_are_listed() {
         }
     }
 }
+
+fn init_messages() -> Vec<Value> {
+    vec![
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": PROTOCOL_2025, "capabilities": {}, "clientInfo": {"name": "test-client", "version": "0.0.0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    ]
+}
+
+/// Runs `stdio` with JSON logs and the given variables, sends the messages, and returns stderr.
+fn stdio_stderr(env: &[(&str, &str)], messages: &[Value]) -> String {
+    let mut cmd = command(&["stdio"]);
+    cmd.env("LOG_FORMAT", "json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().expect("binary starts");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    for message in messages {
+        writeln!(stdin, "{message}").expect("request is written");
+    }
+    drop(stdin);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("stderr is readable");
+    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    assert!(status.is_some_and(|s| s.success()), "{stderr}");
+    stderr
+}
+
+/// Each stderr line parsed as a JSON object; every line must be one.
+fn json_lines(stderr: &str) -> Vec<Value> {
+    stderr
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON: {l}: {e}")))
+        .collect()
+}
+
+#[test]
+fn connection_failure_log_names_the_connection_not_the_user_or_password() {
+    let databases = json!([{
+        "name": "bad_conn",
+        "host": "127.0.0.1",
+        "port": PORT_19,
+        "database": DB_NAME,
+        "user": DB_USER,
+        "password": "not-the-password-zz",
+        "sslmode": "disable",
+        "max_connections": 1,
+    }]);
+    let mut messages = init_messages();
+    messages.push(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"database": "bad_conn", "sql": "SELECT 1"}}}));
+    let stderr = stdio_stderr(&[("PG_DATABASES", &databases.to_string())], &messages);
+    let failure = json_lines(&stderr)
+        .into_iter()
+        .find(|l| l["fields"]["message"] == "connection failed")
+        .unwrap_or_else(|| panic!("no connection failure line in {stderr}"));
+    assert_eq!(failure["fields"]["connection"], "bad_conn", "{failure}");
+    assert_eq!(failure["fields"]["host"], "127.0.0.1", "{failure}");
+    assert_eq!(failure["fields"]["port"], PORT_19, "{failure}");
+    assert_eq!(
+        failure["fields"]["reason"], "authentication failed",
+        "{failure}"
+    );
+    for secret in [DB_USER, DB_PASSWORD, "not-the-password-zz"] {
+        assert!(!stderr.contains(secret), "{secret} was logged: {stderr}");
+    }
+}
+
+#[test]
+fn default_log_filter_hides_rmcp_info_and_keeps_the_audit_line() {
+    let mut messages = init_messages();
+    messages.push(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"sql": "SELECT 1 AS quiet"}}}));
+    let url = database_url(PORT_19);
+    let stderr = stdio_stderr(&[("DATABASE_URL", &url)], &messages);
+    let lines = json_lines(&stderr);
+    let loud_rmcp: Vec<&Value> = lines
+        .iter()
+        .filter(|l| {
+            l["target"].as_str().unwrap_or_default().starts_with("rmcp") && l["level"] == "INFO"
+        })
+        .collect();
+    assert!(loud_rmcp.is_empty(), "rmcp info lines: {loud_rmcp:?}");
+    assert!(
+        lines.iter().any(|l| l["target"] == "audit"),
+        "no audit line in {stderr}"
+    );
+}
+
+#[test]
+fn completion_writes_one_audit_line_with_tool_completion() {
+    let mut messages = init_messages();
+    messages.push(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "completion/complete", "params": {
+            "ref": {"type": "ref/resource", "uri": "postgres://{database}/{schema}"},
+            "argument": {"name": "schema", "value": ""},
+            "context": {"arguments": {"database": "appdb"}},
+        }}),
+    );
+    let url = database_url(PORT_19);
+    let stderr = stdio_stderr(&[("DATABASE_URL", &url)], &messages);
+    let completions: Vec<Value> = json_lines(&stderr)
+        .into_iter()
+        .filter(|l| l["target"] == "audit" && l["fields"]["tool"] == "completion")
+        .collect();
+    assert_eq!(completions.len(), 1, "{stderr}");
+}
+
+/// One raw HTTP/1.1 POST to `/mcp` on the loopback port; returns the status code.
+fn raw_post(port: u16, target: &str, headers: &[(&str, &str)]) -> u16 {
+    use std::net::TcpStream;
+    let body = "{}";
+    let mut request = format!(
+        "POST {target} HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .expect("request is written");
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).expect("reply is read");
+    reply
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status line")
+}
+
+#[test]
+fn http_guard_rejections_log_reason_and_path_but_no_key_or_origin() {
+    let key = "fixture-key-0123456789abcdef";
+    let (mut child, receiver, port) =
+        spawn_http_free_port(&[("API_KEY", key), ("LOG_FORMAT", "json")]);
+    assert_eq!(raw_post(port, "/mcp?secret=q1", &[]), 401);
+    assert_eq!(
+        raw_post(port, "/mcp", &[("X-API-Key", "wrong-key-value-zzzz")]),
+        401
+    );
+    assert_eq!(
+        raw_post(
+            port,
+            "/mcp",
+            &[
+                ("X-API-Key", key),
+                ("Origin", "https://evil.example.org/?k=1")
+            ]
+        ),
+        403
+    );
+    let seen = lines_until(&receiver, "origin not allowed", Duration::from_secs(5));
+    child.kill().expect("server stops");
+    let _ = child.wait();
+    let stderr = seen.join("\n");
+    let lines = json_lines(&stderr);
+    for reason in ["missing key", "wrong key", "origin not allowed"] {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["fields"]["reason"] == reason && l["fields"]["path"] == "/mcp"),
+            "no {reason} line in {stderr}"
+        );
+    }
+    for secret in [
+        key,
+        "wrong-key-value-zzzz",
+        "evil.example.org",
+        "secret=q1",
+        "k=1",
+    ] {
+        assert!(!stderr.contains(secret), "{secret} was logged: {stderr}");
+    }
+}
+
+#[test]
+fn rust_log_wins_over_log_level_and_is_used_verbatim() {
+    let mut messages = init_messages();
+    messages.push(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"sql": "SELECT 1 AS verbatim"}}}));
+    let url = database_url(PORT_19);
+    let stderr = stdio_stderr(
+        &[
+            ("DATABASE_URL", &url),
+            ("RUST_LOG", "info"),
+            ("LOG_LEVEL", "error"),
+        ],
+        &messages,
+    );
+    let lines = json_lines(&stderr);
+    assert!(
+        lines.iter().any(
+            |l| l["target"].as_str().unwrap_or_default().starts_with("rmcp")
+                && l["level"] == "INFO"
+        ),
+        "RUST_LOG=info should show rmcp info lines: {stderr}"
+    );
+}

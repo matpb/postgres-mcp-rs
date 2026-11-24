@@ -167,6 +167,15 @@ pub struct Statement<'a> {
     pub search_path_catalog_only: bool,
 }
 
+/// Gates SQL on a blocking thread, since a long parse must not stall the runtime; a rejection is a tool error.
+pub async fn check_sql(sql: &str, options: GateOptions) -> Result<Accepted, ToolError> {
+    let sql = sql.to_owned();
+    let outcome = tokio::task::spawn_blocking(move || gate::check(&sql, &options))
+        .await
+        .map_err(|_| ToolError::Internal("the SQL check did not complete".to_owned()))?;
+    outcome.map_err(|r| ToolError::Rejected(format!("Query rejected: {}", r.message)))
+}
+
 /// Runs SQL for the tools: user SQL through the gate, internal SQL without it.
 pub struct Runner<'a> {
     state: &'a AppState,
@@ -190,8 +199,7 @@ impl<'a> Runner<'a> {
             allow_placeholders: false,
             max_sql_bytes: limits.max_sql_bytes,
         };
-        let accepted = gate::check(sql, &options)
-            .map_err(|r| ToolError::Rejected(format!("Query rejected: {}", r.message)))?;
+        let accepted = check_sql(sql, options).await?;
         let statement = Statement {
             sql,
             params: &[],
@@ -436,7 +444,21 @@ impl ServerHandler for PgMcp {
         if !self.resources_enabled() {
             return Err(McpError::method_not_found::<CompleteRequestMethod>());
         }
-        Ok(resources::complete(&self.state, request, &context.ct).await)
+        let started = Instant::now();
+        let result = resources::complete(&self.state, request, &context.ct).await;
+        audit::record(
+            self.state.config.audit_log,
+            &audit::Record {
+                tool: "completion",
+                database: None,
+                ok: true,
+                duration: started.elapsed(),
+                rows: None,
+                sqlstate: None,
+                sql: None,
+            },
+        );
+        Ok(result)
     }
 
     async fn list_tools(
@@ -464,7 +486,10 @@ impl ServerHandler for PgMcp {
         let state = &self.state;
         let started = Instant::now();
         let call = match name.as_str() {
-            "list_databases" => core::list_databases(state.clone(), &ct).await,
+            "list_databases" => {
+                let _: core::NoArgs = parse_args(args)?;
+                core::list_databases(state.clone(), &ct).await
+            }
             "execute_query" => core::execute_query(state, parse_args(args)?, &ct).await,
             "explain_query" => core::explain_query(state, parse_args(args)?, &ct).await,
             "server_info" => core::server_info(state, parse_args(args)?, &ct).await,

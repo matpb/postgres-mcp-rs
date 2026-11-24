@@ -141,7 +141,7 @@ Claude Desktop starts the server itself over stdio with the entry below. Add it 
 
 ## Create a read-only role
 
-Give the server its own database role and grant it read access only. Run this as an administrator, replacing `appdb`, the schema and the password:
+Give the server its own database role and grant it read access only. Run this as an administrator, replacing `appdb`, `app_owner`, the schema and the password:
 
 ```sql
 CREATE ROLE mcp_reader LOGIN PASSWORD 'change-me' CONNECTION LIMIT 10;
@@ -149,12 +149,12 @@ ALTER ROLE mcp_reader SET default_transaction_read_only = on;
 GRANT CONNECT ON DATABASE appdb TO mcp_reader;
 GRANT USAGE ON SCHEMA public TO mcp_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO mcp_reader;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO mcp_reader;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT ON TABLES TO mcp_reader;
 -- optional: see other sessions' queries and statement statistics
 GRANT pg_read_all_stats TO mcp_reader;
 ```
 
-This is the recommended profile. It reads the tables it is granted and nothing else. Tables that the administrator creates in `public` later are readable too, because of the default privileges. For each further schema the server should see, repeat the `GRANT USAGE` and `GRANT SELECT` pair.
+This is the recommended profile. It reads the tables it is granted and nothing else. Replace `app_owner` with the role that creates the tables; default privileges apply only to objects that role creates. Tables that role creates in `public` later are readable too. For each further schema the server should see, repeat the `GRANT USAGE` and `GRANT SELECT` pair.
 
 For local development only, a broader profile is simpler:
 
@@ -282,11 +282,12 @@ When `MCP_HOST` is not a loopback address and no `API_KEY` is set, the server lo
 | `MAX_VALUE_BYTES` | `4096` | 64 to 1048576 | Longest text or JSON value returned before it is cut. An array is cut only when its text is more than 16 times this. |
 | `MAX_BINARY_PREVIEW_BYTES` | `256` | 16 to 65536 | Bytes of a `bytea` value shown as hex before it is cut. |
 | `MAX_RESPONSE_BYTES` | `48000` | 1024 to 16777216 | Budget for the raw bytes of values in one result. |
-| `MAX_REQUEST_BYTES` | `1048576` | 1024 to 16777216 | Largest HTTP request body accepted. A larger body gets 413, whether it is sent with a length or chunked. A body that cannot be read gets 400. |
+| `MAX_REQUEST_BYTES` | `1048576` | 1024 to 16777216 | Largest HTTP request body accepted. A larger body gets 413 with a JSON body, whether it is sent with a length or chunked. A body that cannot be read gets 400. |
 | `MAX_SQL_BYTES` | `102400` | 256 to 1048576 | Longest SQL text accepted by the gate. |
 | `MAX_CONCURRENT_REQUESTS` | `16` | 1 to 1024 | Requests to `/mcp` handled at once. Further requests wait for a slot. |
 | `STATEMENT_TIMEOUT_MS` | `30000` | 100 to 3600000 | Server-side limit for each statement. A per-database value overrides it. |
 | `LOCK_TIMEOUT_MS` | `5000` | 10 to 600000 | Server-side limit for waiting on a lock. A per-database value overrides it. |
+| Request time limit | largest statement timeout plus 30 s | Not set by a variable. A `/mcp` request, body included, that is not complete in time gets 408 with `request_timeout`. |
 
 A database configured through the `DATABASE_URL` or `PG*` forms holds at most 4 pooled connections. The JSON form sets its own `max_connections`. A tool call waits up to 10 seconds for a free connection before it reports that all connections are busy.
 
@@ -297,8 +298,8 @@ A database configured through the `DATABASE_URL` or `PG*` forms holds at most 4 
 | `TOOLSETS` | `schema,monitor,logs,timescale` | Tool groups to enable, comma-separated: `schema`, `monitor`, `logs`, `timescale`, `core` or `all`. The core tools are always enabled. See [Tools](#tools). |
 | `AUDIT_LOG` | `on` | One audit line per tool call. Accepts `on`, `off`, `true`, `false`, `1` or `0`. See [Security model](#security-model). |
 | `LOG_FORMAT` | `text` | Format of log lines on stderr: `text` or `json`. |
-| `LOG_LEVEL` | `info` | Log filter, used when `RUST_LOG` is unset. |
-| `RUST_LOG` | `info` | Log filter in `tracing` syntax. Takes precedence over `LOG_LEVEL`. |
+| `LOG_LEVEL` | `info` | Log level, used when `RUST_LOG` is unset. The filter is `info,rmcp=warn`: `LOG_LEVEL=x` gives `x,rmcp=warn`, except `debug` and `trace`, which apply to `rmcp` too. |
+| `RUST_LOG` | unset | Log filter in `tracing` syntax, used verbatim. Takes precedence over `LOG_LEVEL`. |
 
 ## Tools
 
@@ -319,7 +320,7 @@ The server exposes 20 tools in five toolsets. `core` is always on. Every tool ex
 |------|--------------|
 | `list_schemas` | Lists schemas with owner, comment and counts of tables, views and functions. System schemas are left out unless asked for. |
 | `list_objects` | Lists tables, views, materialized views, sequences, functions, procedures and types, with estimated row counts and sizes. Paged. |
-| `describe_table` | Full definition of a table or view: columns, primary and unique keys, checks, foreign keys in both directions, indexes, triggers, policies and statistics. A bare name that several schemas hold is an error that lists them. A partitioned table lists at most 200 partitions, and `partitionsTruncated` is true when there are more. |
+| `describe_table` | Full definition of a table or view: columns, primary and unique keys, checks, foreign keys in both directions, indexes, triggers, policies and statistics. Sizes: `tableBytes` is `pg_table_size` (heap, TOAST heap and maps), `indexBytes` the indexes and `totalBytes` everything; `toastBytes` is the TOAST table with its indexes and overlaps `tableBytes`. A bare name that several schemas hold is an error that lists them. A partitioned table lists at most 200 partitions, and `partitionsTruncated` is true when there are more. |
 | `describe_function` | Argument and return types, language, volatility, parallel safety, strictness, `SECURITY DEFINER`, owner and source text where readable. |
 | `search_schema` | Finds tables, views, columns and functions whose name or comment contains the text, case-insensitively. |
 | `get_privileges` | Reports what the connected role may read, its predefined roles, its database privileges (`databasePrivileges`), the monitoring features that work, and anything beyond read access. |
@@ -330,7 +331,7 @@ The server exposes 20 tools in five toolsets. `core` is always on. Every tool ex
 |------|--------------|
 | `list_activity` | Sessions from `pg_stat_activity` with state, wait event, durations, query text and the PIDs that block each session. Passwords in the query text are masked on a best-effort basis. |
 | `query_stats` | Top statements from `pg_stat_statements`, ranked by total time, mean time, calls, rows or I/O. Passwords in the statement text are masked on a best-effort basis. |
-| `database_stats` | Cumulative database, I/O, WAL, checkpointer, progress and wait-event statistics, one section or several per call. |
+| `database_stats` | Cumulative database, I/O, WAL, checkpointer, progress and wait-event statistics, one section or several per call. On PostgreSQL 17 and newer each wait event carries its description. |
 | `table_stats` | Per-table scan, write and vacuum activity with sizes, plus each index's scan count, so unused indexes show up. |
 | `replication_status` | Recovery state, standbys with lag, replication slots and the WAL they retain, and logical subscriptions and publications. |
 
@@ -353,7 +354,7 @@ The hypertable and job list tools report `timescaledb: false` with a note when t
 
 ### Resources
 
-Clients that support MCP resources can read three read-only views, which need the `schema` toolset (on by default). Each configured database is listed as `postgres://<database>`, and reading it returns a summary: the PostgreSQL version, the TimescaleDB version when installed, the schemas with their object counts, and the installed extensions. `postgres://<database>/<schema>` returns the `list_objects` result for one schema, its first page, with `nextCursor` when more objects follow. `postgres://<database>/<schema>/<table>` returns the `describe_table` result for one table or view. A name that contains `/` is written with `%2F`, and other names are percent-decoded as usual. The `database`, `schema` and `table` arguments of the two templates have completion. With `TOOLSETS=core` the server offers neither resources nor completions.
+Clients that support MCP resources can read three read-only views, which need the `schema` toolset (on by default). Each configured database is listed as `postgres://<database>`, and reading it returns a summary: the PostgreSQL version, the TimescaleDB version when installed, the schemas with their object counts, and the installed extensions. `postgres://<database>/<schema>` returns the `list_objects` result for one schema, its first page, with `nextCursor` when more objects follow. `postgres://<database>/<schema>/<table>` returns the `describe_table` result for one table or view. A name that contains `/` is written with `%2F`, and other names are percent-decoded as usual. The `database`, `schema` and `table` arguments of the two templates have completion, and schemas and tables are listed only where the role may use the schema. With `TOOLSETS=core` the server offers neither resources nor completions.
 
 ### Switching toolsets
 
@@ -446,6 +447,7 @@ Accepted: `SELECT` in all its forms (`WITH`, set operations, window functions, `
 | `SELECT lo_get(123);` (reads one large object) | `WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d;` (data-modifying CTE) |
 | `SELECT * FROM pg_stat_activity;` and `SELECT * FROM pg_roles;` | `SELECT $1;` (a placeholder is rejected; inline the value) |
 | | `SELECT pg_terminate_backend(1);`, `SELECT nextval('s');` and `SELECT pg_read_file('/etc/passwd');` |
+| | `SELECT (pid).pg_terminate_backend FROM pg_stat_activity;` (a dotted name that would call a denied function) |
 | | `SELECT * FROM dblink('x', 'y') AS t(a int);` (remote SQL functions are denied by name) |
 | | `SELECT * FROM pg_authid;` and `SELECT * FROM pg_settings;` (credential catalogs and settings) |
 | | `SHOW primary_conninfo;` and `SELECT current_setting('ssl_key_file');` (settings that name credentials or paths) |
@@ -537,7 +539,7 @@ The `read_server_log` tool, in the `logs` toolset, uses these functions. Its arg
 
 What the tool can read: the files the collector writes into `log_directory`. What it cannot read: anything outside that directory, such as data files and WAL. With `logging_collector` off, PostgreSQL writes its log to stderr rather than to files, so there is nothing for the functions to read, and the tool's result says what to change.
 
-The gate does not block the functions, so `execute_query` can call them too, and the functions apply their own checks either way.
+The gate refuses calls to these functions in `execute_query`, so log text always passes through the tool's masking.
 
 ## TimescaleDB
 
@@ -567,7 +569,7 @@ The threat model and every layer are described in [SECURITY.md](SECURITY.md). In
 - **Bind.** The HTTP listener binds `127.0.0.1` unless `MCP_HOST` says otherwise.
 - **Origin, key and Host.** A request to `/mcp` is checked in this order. An `Origin` header must be a loopback origin or one in `ALLOWED_ORIGINS`, or the request gets 403. The API key comes next. Then the `Host` header must name a loopback host or one in `ALLOWED_HOSTS`, or the request is refused. Loopback origins are always allowed, so a web page served from the same machine can send requests to the server when no API key is set. It cannot read the responses, but it can still make the calls. When a browser runs on the same machine as the server, set `API_KEY` even on loopback.
 - **API key.** When `API_KEY` is set, `/mcp` requires it in `X-API-Key` or `Authorization: Bearer`. The key is compared in constant time as SHA-256 digests. `GET /health` stays open for probes.
-- **Audit.** With `AUDIT_LOG` on (the default), each tool call, and each resource read, writes one `audit` line to stderr. It holds the tool name, the database name, whether the call succeeded, its duration, the row count, the SQLSTATE of a database error, and the first 16 hex characters of the SHA-256 of the SQL text. It never holds the SQL text, values, error messages, client addresses or keys.
+- **Audit.** With `AUDIT_LOG` on (the default), each tool call, each resource read and each completion request writes one `audit` line to stderr. It holds the tool name, the database name, whether the call succeeded, its duration, the row count, the SQLSTATE of a database error, and the first 16 hex characters of the SHA-256 of the SQL text. It never holds the SQL text, values, error messages, client addresses or keys.
 
 Deliberately absent: no write tool, no flag or setting that enables writes, and no multi-user authentication. One API key is shared by everyone who holds it, and there is no per-user identity or per-user policy inside the server.
 

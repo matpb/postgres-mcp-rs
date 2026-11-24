@@ -14,6 +14,8 @@ use crate::typeinfo::TypeCache;
 
 /// Bounded pool of connections to one server. Opens nothing until the first checkout.
 pub struct Pool {
+    /// The configured connection name, used in the failure log.
+    name: String,
     connect: ConnectConfig,
     auth: AuthPolicy,
     /// Built once at startup and shared by every connection and cancel request of the pool, when set.
@@ -33,6 +35,7 @@ impl Pool {
     /// Like `new`, with the authentication methods every new connection may use.
     pub fn with_auth(connect: ConnectConfig, max_connections: usize, auth: AuthPolicy) -> Pool {
         Pool {
+            name: String::new(),
             connect,
             auth,
             tls: None,
@@ -41,6 +44,12 @@ impl Pool {
             types: TypeCache::new(),
             closed: AtomicBool::new(false),
         }
+    }
+
+    /// Sets the configured connection name that the failure log reports.
+    pub fn with_name(mut self, name: &str) -> Pool {
+        self.name = name.to_owned();
+        self
     }
 
     /// Uses `tls` for every new connection instead of reading the root file again.
@@ -100,15 +109,21 @@ impl Pool {
     }
 
     async fn open<'a>(&'a self, permit: SemaphorePermit<'a>) -> Result<Lease<'a>, PoolError> {
-        let conn = match Connection::connect_with_tls(&self.connect, &self.auth, self.tls.clone())
-            .await
-        {
-            Ok(conn) => conn,
-            Err(error) => {
-                tracing::warn!(database = %self.connect.database, error = %error, "connection failed");
-                return Err(PoolError::Connect(connect_failure_text(&error)));
-            }
-        };
+        let conn =
+            match Connection::connect_with_tls(&self.connect, &self.auth, self.tls.clone()).await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    let reason = connect_failure_text(&error);
+                    tracing::warn!(
+                        connection = %self.name,
+                        host = %self.connect.host,
+                        port = self.connect.port,
+                        reason = %reason,
+                        "connection failed"
+                    );
+                    return Err(PoolError::Connect(reason));
+                }
+            };
         Ok(Lease {
             pool: self,
             _permit: permit,

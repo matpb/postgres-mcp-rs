@@ -103,3 +103,17 @@ CREATE PUBLICATION pub_one FOR TABLE shop.customers;
 CREATE PUBLICATION pub_root FOR TABLE shop.events WITH (publish_via_partition_root = true);
 CREATE PUBLICATION pub_leaves FOR TABLE shop.events;
 CREATE PUBLICATION pub_all FOR ALL TABLES;
+
+-- Large object readable by mcp_ro through lo_get and pg_largeobject_metadata.
+SELECT lo_from_bytea(424243, '\x68656c6c6f206c6f');
+GRANT SELECT ON LARGE OBJECT 424243 TO mcp_ro;
+
+-- A write that only the READ ONLY transaction can stop: try_write() inserts with its owner's privileges.
+CREATE TABLE sess_test.canary (x int);
+CREATE FUNCTION sess_test.try_write() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $fn$
+BEGIN
+  EXECUTE 'INSERT INTO sess_test.canary VALUES (1)';
+END
+$fn$;
+REVOKE EXECUTE ON FUNCTION sess_test.try_write() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION sess_test.try_write() TO mcp_ro;

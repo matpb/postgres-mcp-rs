@@ -2,11 +2,15 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{
-    PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with, db_entry, post_mcp,
-    result_of,
+    PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with, db_entry, one_db,
+    post_mcp, result_of,
 };
 use postgres_mcp::config::Config;
+use postgres_mcp::pg::tls::SslMode;
+use postgres_mcp::pg::wire::{ConnectConfig, Connection};
 use serde_json::{Value, json};
 
 const MARKER: &str = "pgmcp hostile function called";
@@ -230,4 +234,147 @@ async fn list_databases_shows_the_same_short_texts() {
     let serialized = response.to_string();
     assert!(!serialized.contains("mcp_ro"), "{serialized}");
     assert!(!serialized.contains("127.0.0.1"), "{serialized}");
+}
+
+const SERVERS: [u16; 3] = [PORT_18, PORT_19, PORT_15];
+
+const CURRENT_SETTING_DOTTED: &str = "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name.";
+const TERMINATE_DOTTED: &str = "\"pg_terminate_backend\" after a dot would call the function pg_terminate_backend(), which is not allowed: it controls the server or other sessions. If it is a column of yours, give it another name with AS in a subquery.";
+const TS_STAT_DOTTED: &str = "\"ts_stat\" after a dot would call the function ts_stat(), which is not allowed: it executes SQL text the gate cannot inspect. If it is a column of yours, give it another name with AS in a subquery.";
+
+#[tokio::test]
+async fn dotted_function_names_are_refused_on_every_server() {
+    let cases = [
+        (
+            "SELECT ('ssl_key_file'::text).current_setting;",
+            CURRENT_SETTING_DOTTED,
+        ),
+        (
+            "SELECT (pid).pg_terminate_backend FROM pg_stat_activity;",
+            TERMINATE_DOTTED,
+        ),
+        (
+            "SELECT (x).ts_stat FROM (VALUES ('select 1')) v(x);",
+            TS_STAT_DOTTED,
+        ),
+    ];
+    for port in SERVERS {
+        let router = app(one_db(port, &[]));
+        for (sql, message) in cases {
+            let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+            assert_eq!(
+                result_of(&response)["isError"],
+                json!(true),
+                "{port} {sql} {response}"
+            );
+            assert_eq!(
+                text_of(&response),
+                format!("Query rejected: {message}"),
+                "{port} {sql}"
+            );
+        }
+    }
+}
+
+fn superuser_config(port: u16) -> ConnectConfig {
+    ConnectConfig {
+        host: "127.0.0.1".into(),
+        port,
+        database: "appdb".into(),
+        user: "postgres".into(),
+        password: Some("test-only-superuser".into()),
+        ssl_mode: SslMode::Disable,
+        ssl_root_cert: None,
+        connect_timeout: Duration::from_secs(5),
+        startup_params: Vec::new(),
+    }
+}
+
+/// Runs a query as the superuser and returns the first column of the first row.
+async fn superuser_scalar(port: u16, sql: &str) -> String {
+    let mut conn = Connection::connect(&superuser_config(port))
+        .await
+        .expect("superuser connect");
+    let result = conn.simple_query(sql).await.expect("superuser query");
+    result.rows[0][0].clone().expect("non-null value")
+}
+
+#[tokio::test]
+async fn dotted_terminate_leaves_a_live_canary_backend_running() {
+    for port in SERVERS {
+        let canary = format!("pgmcp-canary-{port}");
+        let mut canary_config = superuser_config(port);
+        canary_config.user = "mcp_ro".into();
+        canary_config.password = Some("test-only-ro".into());
+        canary_config.startup_params = vec![("application_name".into(), canary.clone())];
+        let conn = Connection::connect(&canary_config)
+            .await
+            .expect("canary connect");
+        let cancel = conn.cancel_handle();
+        let sleeper = tokio::spawn(async move {
+            let mut conn = conn;
+            conn.simple_query("SELECT pg_sleep(20)").await
+        });
+
+        let count_sql = format!(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = '{canary}' \
+             AND state = 'active' AND query LIKE '%pg_sleep(20)%'"
+        );
+        let mut seen = false;
+        for _ in 0..50 {
+            if superuser_scalar(port, &count_sql).await == "1" {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(seen, "canary backend never became active on {port}");
+
+        let router = app(one_db(port, &[]));
+        let sql = format!(
+            "SELECT (pid).pg_terminate_backend FROM pg_stat_activity WHERE application_name = '{canary}'"
+        );
+        let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+        assert_eq!(result_of(&response)["isError"], json!(true), "{response}");
+        assert_eq!(
+            text_of(&response),
+            format!("Query rejected: {TERMINATE_DOTTED}")
+        );
+
+        assert_eq!(superuser_scalar(port, &count_sql).await, "1", "{port}");
+        cancel.cancel().await.expect("cancel the canary");
+        let outcome = sleeper.await.expect("canary task joins");
+        assert!(outcome.is_err(), "canary query was cancelled on {port}");
+    }
+}
+
+#[tokio::test]
+async fn server_log_helpers_are_refused_in_execute_query_on_every_server() {
+    let log_reason = "the server log helper functions are reserved for the read_server_log tool";
+    let cases = [
+        (
+            "SELECT pgmcp.read_log_file('postgresql.log', 0, 10)",
+            format!("Function read_log_file() is not allowed: {log_reason}."),
+        ),
+        (
+            "SELECT * FROM pgmcp.list_log_files()",
+            format!("Function list_log_files() is not allowed: {log_reason}."),
+        ),
+    ];
+    for port in SERVERS {
+        let router = app(one_db(port, &[]));
+        for (sql, message) in &cases {
+            let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+            assert_eq!(
+                result_of(&response)["isError"],
+                json!(true),
+                "{port} {sql} {response}"
+            );
+            assert_eq!(
+                text_of(&response),
+                format!("Query rejected: {message}"),
+                "{port}"
+            );
+        }
+    }
 }

@@ -925,3 +925,174 @@ fn denied_names_are_rejected_when_nested() {
         }
     }
 }
+
+/// The dotted forms that name a function without a FuncCall node: `(NULL::text).x`, `(x).x`, `s.x`, `s.a.x`.
+fn dotted_statements(name: &str) -> [String; 4] {
+    [
+        format!("SELECT (NULL::text).{name}"),
+        format!("SELECT (x).{name} FROM (VALUES (1)) v(x)"),
+        format!("SELECT s.{name} FROM (SELECT 1 AS a) s"),
+        format!("SELECT s.a.{name} FROM (SELECT 1 AS a) s"),
+    ]
+}
+
+/// A concrete name for each deny entry: the exact name, or the prefix plus a suffix for `prefix*` entries.
+fn name_for_entry(pattern: &str) -> String {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => format!("{prefix}x"),
+        None => pattern.to_string(),
+    }
+}
+
+#[test]
+fn every_denied_name_is_rejected_after_a_dot() {
+    for &(pattern, reason) in postgres_mcp::gate::denied_functions() {
+        let name = name_for_entry(pattern);
+        for sql in dotted_statements(&name) {
+            let rejection = gate(&sql).expect_err(&sql);
+            assert_eq!(rejection.code, "function_denied", "{sql}");
+            assert_eq!(
+                rejection.message,
+                format!(
+                    "\"{name}\" after a dot would call the function {name}(), which is not allowed: {reason}. If it is a column of yours, give it another name with AS in a subquery."
+                ),
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dotted_current_setting_is_rejected_with_the_computed_name_message() {
+    for sql in [
+        "SELECT ('ssl_key_file'::text).current_setting",
+        "SELECT (x).current_setting FROM (VALUES ('ssl_key_file')) v(x)",
+        "SELECT s.current_setting FROM (SELECT 1 AS a) s",
+        "SELECT s.a.current_setting FROM (SELECT 1 AS a) s",
+        "SELECT (NULL::text).Current_Setting",
+    ] {
+        let rejection = gate(sql).expect_err(sql);
+        assert_eq!(rejection.code, "setting_denied", "{sql}");
+        assert_eq!(
+            rejection.message,
+            "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name.",
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn dotted_names_report_the_identifier_as_written() {
+    let rejection = gate("SELECT (x).\"pg_terminate_backend\" FROM (VALUES (1)) v(x)")
+        .expect_err("quoted dotted name");
+    assert_eq!(rejection.code, "function_denied");
+    assert_eq!(
+        rejection.message,
+        "\"pg_terminate_backend\" after a dot would call the function pg_terminate_backend(), which is not allowed: it controls the server or other sessions. If it is a column of yours, give it another name with AS in a subquery."
+    );
+}
+
+#[test]
+fn dotted_names_in_clauses_are_rejected() {
+    for sql in [
+        "SELECT * FROM t ORDER BY (t).pg_terminate_backend",
+        "SELECT count(*) FROM t GROUP BY (t).pg_advisory_lock",
+        "SELECT rank() OVER (PARTITION BY (t).pg_reload_conf) FROM t",
+        "SELECT * FROM t ORDER BY t.pg_read_file",
+        "SELECT * FROM t WHERE (x).nextval > 0",
+        "SELECT ARRAY[(1).set_config]",
+    ] {
+        assert_eq!(code_of(sql), "function_denied", "{sql}");
+    }
+}
+
+#[test]
+fn schema_qualified_log_helpers_are_denied_with_exact_message() {
+    let rejection =
+        gate("SELECT pgmcp.read_log_file('postgresql.log', 0, 10)").expect_err("log helper");
+    assert_eq!(rejection.code, "function_denied");
+    assert_eq!(
+        rejection.message,
+        "Function read_log_file() is not allowed: the server log helper functions are reserved for the read_server_log tool."
+    );
+    let rejection = gate("SELECT * FROM PGMCP.list_log_files()").expect_err("log helper");
+    assert_eq!(
+        rejection.message,
+        "Function list_log_files() is not allowed: the server log helper functions are reserved for the read_server_log tool."
+    );
+}
+
+#[test]
+fn dotted_and_schema_forms_of_ordinary_names_stay_accepted() {
+    for sql in [
+        "SELECT (name).upper FROM app.items",
+        "SELECT s.to_json FROM (SELECT 1 AS a) s",
+        "SELECT (r).field FROM (SELECT ROW(1, 2) AS r) s",
+        "SELECT (v).x, t.col, s.t.col FROM (VALUES (1)) v(x), t, s.t",
+        "SELECT (arr)[1], (arr)[1:2] FROM t",
+        "SELECT (composite_col).sub.field FROM app.items",
+        "SELECT t.* FROM t",
+        "SELECT (r).* FROM (SELECT ROW(1, 2) AS r) s",
+        "SELECT (x)._timescaledb_functions FROM (VALUES (1)) v(x)",
+    ] {
+        assert_eq!(
+            gate(sql).map(|a| a.kind),
+            Ok(StatementKind::Select),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn computed_names_in_dotted_form_cannot_bypass_the_function_gate() {
+    for sql in [
+        "SELECT (x).current_setting FROM (VALUES ('work_mem')) v(x)",
+        "SELECT ('x'::text).set_config",
+    ] {
+        assert!(gate(sql).is_err(), "should be rejected: {sql}");
+    }
+}
+
+#[test]
+fn internal_schema_and_pgmcp_qualified_relations_use_exact_messages() {
+    let rejection = gate("SELECT * FROM information_schema.user_mapping_options")
+        .expect_err("user mapping options");
+    assert_eq!(rejection.code, "relation_denied");
+    assert_eq!(
+        rejection.message,
+        "user_mapping_options can expose credentials and is not readable through this server. Use the server_info tool for settings."
+    );
+    let rejection = gate("SELECT * FROM pg_catalog.pg_statistic").expect_err("statistics");
+    assert_eq!(rejection.code, "relation_denied");
+    assert_eq!(
+        rejection.message,
+        "pg_statistic can expose credentials and is not readable through this server. Use the server_info tool for settings."
+    );
+}
+
+/// Dotted forms of every deny entry, for the mutation test below.
+fn dotted_corpus() -> Vec<String> {
+    postgres_mcp::gate::denied_functions()
+        .iter()
+        .flat_map(|&(pattern, _)| dotted_statements(&name_for_entry(pattern)))
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn denied_dotted_forms_stay_denied(
+        idx in any::<proptest::sample::Index>(),
+        seed in any::<u64>(),
+        flags in 0u8..8,
+    ) {
+        let forms = dotted_corpus();
+        let block = &forms[idx.index(forms.len())];
+        let mutated = mutate(block, seed, flags);
+        match gate(&mutated) {
+            Err(rejection) => prop_assert_eq!(rejection.code, "function_denied", "{}", mutated),
+            Ok(accepted) => prop_assert!(false, "accepted as {:?}: {}", accepted, mutated),
+        }
+    }
+}

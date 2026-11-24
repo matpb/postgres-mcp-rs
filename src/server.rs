@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::{Request, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
@@ -18,8 +19,9 @@ use axum::routing::get;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tower::limit::ConcurrencyLimitLayer;
+use tower::timeout::TimeoutLayer;
+use tower::{BoxError, ServiceBuilder};
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -56,7 +58,8 @@ impl AppState {
                     db.name.clone(),
                     Arc::new(
                         Pool::with_auth(db.connect.clone(), db.max_connections, db.auth.clone())
-                            .with_tls(db.tls.clone()),
+                            .with_tls(db.tls.clone())
+                            .with_name(&db.name),
                     ),
                 )
             })
@@ -138,8 +141,10 @@ fn init_logging(format: LogFormat) -> Result<(), String> {
     let filter = match env_value("RUST_LOG")? {
         Some(value) => EnvFilter::try_new(&value).map_err(|e| format!("RUST_LOG: {e}"))?,
         None => match env_value("LOG_LEVEL")? {
-            Some(value) => EnvFilter::try_new(&value).map_err(|e| format!("LOG_LEVEL: {e}"))?,
-            None => EnvFilter::new("info"),
+            Some(value) => {
+                EnvFilter::try_new(level_filter(&value)).map_err(|e| format!("LOG_LEVEL: {e}"))?
+            }
+            None => EnvFilter::new("info,rmcp=warn"),
         },
     };
     // Colour only when stderr is a terminal, so piped logs stay plain text.
@@ -152,6 +157,15 @@ fn init_logging(format: LogFormat) -> Result<(), String> {
         LogFormat::Json => builder.json().try_init(),
     };
     installed.map_err(|e| format!("cannot start logging: {e}"))
+}
+
+/// The filter for LOG_LEVEL: the level, with the rmcp protocol library held at warn unless it is debug or trace.
+fn level_filter(level: &str) -> String {
+    if level.eq_ignore_ascii_case("debug") || level.eq_ignore_ascii_case("trace") {
+        level.to_owned()
+    } else {
+        format!("{level},rmcp=warn")
+    }
 }
 
 /// A variable's value; unset and empty both count as unset.
@@ -280,6 +294,23 @@ async fn shutdown_signal() {
 
 /// The HTTP router: `/health` open, `/mcp` behind the guard, every other path 404.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let timeout = request_timeout(&state.config);
+    build_router_with_request_timeout(state, timeout)
+}
+
+/// The longest a /mcp request may take, body included: the largest statement timeout of any database plus 30 seconds.
+fn request_timeout(config: &Config) -> Duration {
+    let statement_ms = config
+        .databases
+        .iter()
+        .map(|db| db.statement_timeout_ms)
+        .max()
+        .unwrap_or(0);
+    Duration::from_millis(statement_ms) + Duration::from_secs(30)
+}
+
+/// The router with `timeout` as the limit for each /mcp request; a request past it gets 408.
+pub fn build_router_with_request_timeout(state: Arc<AppState>, timeout: Duration) -> Router {
     let config = state.config.clone();
     let limits = &config.limits;
 
@@ -311,12 +342,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             limits.max_request_bytes,
             buffer_request_body,
         ))
-        .layer(from_fn_with_state(guard, crate::http_guard::guard));
+        .layer(from_fn_with_state(guard, crate::http_guard::guard))
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(request_timed_out))
+                .layer(TimeoutLayer::new(timeout)),
+        );
 
-    let mut router = Router::new()
-        .route("/health", get(health))
-        .merge(mcp)
-        .layer(RequestBodyLimitLayer::new(limits.max_request_bytes));
+    let mut router = Router::new().route("/health", get(health)).merge(mcp);
     if !config.allowed_origins.is_empty() {
         router = router.layer(cors_layer(&config.allowed_origins));
     }
@@ -338,6 +371,16 @@ async fn buffer_request_body(State(max): State<usize>, request: Request, next: N
         Err(error) if error.to_string() == LENGTH_LIMIT_TEXT => payload_too_large(max),
         Err(_) => bad_request(),
     }
+}
+
+/// The 408 for a /mcp request that ran past its timeout, including a body that never finished arriving.
+async fn request_timed_out(_error: BoxError) -> Response {
+    (
+        StatusCode::REQUEST_TIMEOUT,
+        [(CONTENT_TYPE, "application/json")],
+        r#"{"error":"request_timeout","message":"The request took too long."}"#,
+    )
+        .into_response()
 }
 
 fn bad_request() -> Response {

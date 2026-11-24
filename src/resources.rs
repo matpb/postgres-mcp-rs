@@ -30,6 +30,8 @@ const TABLE_TEMPLATE: &str = "postgres://{database}/{schema}/{table}";
 const TABLE_COMPLETION_SQL: &str = "SELECT c.relname::text AS name, pg_catalog.count(*) OVER () AS total \
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
     WHERE n.nspname::text = $1::text AND c.relkind::text IN ('r', 'p', 'v', 'm', 'f') \
+    AND (pg_catalog.pg_has_role(current_user, 'pg_read_all_data', 'MEMBER') \
+         OR pg_catalog.has_schema_privilege(n.oid, 'USAGE')) \
     AND pg_catalog.starts_with(pg_catalog.lower(c.relname::text), pg_catalog.lower($2::text)) \
     ORDER BY c.relname::text COLLATE \"C\" LIMIT 100";
 
@@ -106,7 +108,7 @@ fn parse(uri: &str) -> Option<Target> {
     }
 }
 
-/// Percent-decodes one URI segment; None for a malformed escape or bytes that are not UTF-8.
+/// Percent-decodes one URI segment; None for a malformed escape, a NUL byte, or bytes that are not UTF-8.
 fn decode(segment: &str) -> Option<String> {
     let mut out = Vec::with_capacity(segment.len());
     let mut bytes = segment.bytes();
@@ -118,6 +120,9 @@ fn decode(segment: &str) -> Option<String> {
         let high = (bytes.next()? as char).to_digit(16)?;
         let low = (bytes.next()? as char).to_digit(16)?;
         out.push(u8::try_from(high * 16 + low).ok()?);
+    }
+    if out.contains(&0) {
+        return None;
     }
     String::from_utf8(out).ok()
 }

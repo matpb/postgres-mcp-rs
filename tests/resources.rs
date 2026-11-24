@@ -617,3 +617,55 @@ async fn database_error_completes_to_nothing() {
     .await;
     assert_eq!(completion["values"], json!([]), "{completion}");
 }
+
+#[tokio::test]
+async fn nul_and_invalid_bytes_in_a_uri_segment_are_resource_not_found() {
+    let router = app(one_db(PORT_18, &[]));
+    for uri in [
+        "postgres://appdb/app/%00",
+        "postgres://appdb/app/items%00x",
+        "postgres://appdb/app/items/%00",
+        "postgres://appdb/%00",
+        "postgres://appdb/app/%ff",
+    ] {
+        let response = rpc(&router, "resources/read", json!({"uri": uri})).await;
+        assert_eq!(
+            error_of(&response),
+            (RESOURCE_NOT_FOUND, UNKNOWN_URI.to_owned()),
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn table_completion_lists_nothing_in_a_schema_the_role_may_not_use() {
+    let entry = json!({
+        "name": "appdb",
+        "host": "127.0.0.1",
+        "port": PORT_18,
+        "database": "appdb",
+        "user": "mcp_min",
+        "password": "test-only-min",
+        "sslmode": "disable",
+        "max_connections": 1,
+    });
+    let router = app(config_with(&[entry], &[]));
+    let hidden = complete(
+        &router,
+        TABLE_TEMPLATE,
+        "table",
+        "",
+        Some(json!({"arguments": {"database": "appdb", "schema": "shop"}})),
+    )
+    .await;
+    assert_eq!(hidden["values"], json!([]), "{hidden}");
+    let usable = complete(
+        &router,
+        TABLE_TEMPLATE,
+        "table",
+        "it",
+        Some(json!({"arguments": {"database": "appdb", "schema": "app"}})),
+    )
+    .await;
+    assert_eq!(usable["values"], json!(["items"]), "{usable}");
+}

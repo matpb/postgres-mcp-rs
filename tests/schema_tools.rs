@@ -1453,6 +1453,30 @@ async fn scalar_through_query(router: &Router, sql: &str) -> Value {
 }
 
 #[tokio::test]
+async fn table_bytes_agree_across_describe_table_table_stats_and_pg_table_size() {
+    let router = app(one_db(PORT_18, &[]));
+    let described = call_on(&router, "describe_table", json!({"table": "shop.orders"})).await;
+    let described_table = ok(&described)["sizes"]["tableBytes"].clone();
+    let stats = call_on(
+        &router,
+        "table_stats",
+        json!({"schema": "shop", "table": "orders", "include_indexes": false}),
+    )
+    .await;
+    let rows = array(&ok(&stats)["tables"], "tables").clone();
+    assert_eq!(rows.len(), 1, "{stats}");
+    let stats_table = rows[0]["tableBytes"].clone();
+    let pg_table = scalar_through_query(
+        &router,
+        "SELECT pg_table_size('shop.orders'::regclass) AS v",
+    )
+    .await;
+    assert_eq!(described_table, pg_table, "{described}");
+    assert_eq!(stats_table, pg_table, "{stats}");
+    assert!(pg_table.as_i64().unwrap_or_default() > 0, "{pg_table}");
+}
+
+#[tokio::test]
 async fn describe_table_sizes_match_postgres_for_leaf_parent_and_plain_table() {
     let router = app(one_db(PORT_18, &[]));
     let leaf = call_on(
@@ -1470,7 +1494,7 @@ async fn describe_table_sizes_match_postgres_for_leaf_parent_and_plain_table() {
     assert_eq!(leaf_sizes["totalBytes"], leaf_total, "{leaf_sizes}");
     let leaf_table = scalar_through_query(
         &router,
-        "SELECT pg_relation_size('shop.events_2024_q1'::regclass) AS v",
+        "SELECT pg_table_size('shop.events_2024_q1'::regclass) AS v",
     )
     .await;
     assert_eq!(leaf_sizes["tableBytes"], leaf_table, "{leaf_sizes}");

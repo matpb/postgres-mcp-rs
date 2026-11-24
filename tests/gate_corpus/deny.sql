@@ -663,3 +663,108 @@ SELECT dblink_connect('x');
 --;;
 -- code: function_denied
 SELECT pg_catalog.dblink_connect('x');
+--;;
+-- code: setting_denied
+SELECT ('ssl_key_file'::text).current_setting;
+--;;
+-- code: setting_denied
+SELECT (x).current_setting FROM (VALUES ('ssl_key_file')) v(x);
+--;;
+-- code: function_denied
+SELECT (pid).pg_terminate_backend FROM pg_stat_activity;
+--;;
+-- code: function_denied
+SELECT (pid).pg_cancel_backend FROM pg_stat_activity;
+--;;
+-- code: function_denied
+SELECT (x).ts_stat FROM (VALUES ('select 1')) v(x);
+--;;
+-- code: function_denied
+SELECT (0.5::float8).setseed;
+--;;
+-- code: function_denied
+SELECT (12345::bigint).pg_advisory_lock;
+--;;
+-- code: function_denied
+SELECT (ARRAY['x'])[1].pg_read_file;
+--;;
+-- code: function_denied
+SELECT (v).x.pg_read_file FROM (VALUES ('a')) v(x);
+--;;
+-- code: function_denied
+SELECT s.pg_restore_relation_stats FROM (SELECT 1) s;
+--;;
+-- code: function_denied
+SELECT v.x.nextval FROM (VALUES ('s'::regclass)) v(x);
+--;;
+-- code: function_denied
+SELECT ('s'::regclass).nextval;
+--;;
+-- code: function_denied
+SELECT (x)."pg_terminate_backend" FROM (VALUES (1)) v(x);
+--;;
+-- code: function_denied
+SELECT (x).query_to_xml FROM (VALUES ('select 1')) v(x);
+--;;
+-- code: function_denied
+SELECT ts_rewrite('foo'::tsquery, 'select ''foo''::tsquery, ''bar''::tsquery');
+--;;
+-- code: function_denied
+SELECT (x).ts_rewrite FROM (VALUES ('select 1')) v(x);
+--;;
+-- code: function_denied
+SELECT (x).pg_terminate_backend.y FROM (VALUES (1)) v(x);
+--;;
+-- code: function_denied
+SELECT pgmcp.read_log_file('postgresql.log', 0, 10);
+--;;
+-- code: function_denied
+SELECT pgmcp.list_log_files();
+--;;
+-- code: function_denied
+SELECT read_log_file('postgresql.log', 0, 10);
+--;;
+-- code: function_denied
+SELECT * FROM list_log_files();
+--;;
+-- code: function_denied
+SELECT (x).read_log_file FROM (VALUES (1)) v(x);
+--;;
+-- code: relation_denied
+SELECT * FROM pg_statistic;
+--;;
+-- code: relation_denied
+SELECT * FROM pg_catalog.pg_statistic;
+--;;
+-- code: relation_denied
+SELECT * FROM "pg_catalog"."pg_statistic";
+--;;
+-- code: relation_denied
+SELECT * FROM "PG_STATISTIC";
+--;;
+-- code: relation_denied
+TABLE pg_statistic;
+--;;
+-- code: relation_denied
+SELECT s.staop FROM pg_statistic s;
+--;;
+-- code: relation_denied
+SELECT * FROM pg_statistic_ext_data;
+--;;
+-- code: relation_denied
+SELECT * FROM pg_catalog.pg_statistic_ext_data;
+--;;
+-- code: relation_denied
+SELECT * FROM information_schema.user_mapping_options;
+--;;
+-- code: relation_denied
+SELECT * FROM user_mapping_options;
+--;;
+-- code: relation_denied
+SELECT * FROM "information_schema"."user_mapping_options";
+--;;
+-- code: relation_denied
+SELECT (u).umoptions FROM (SELECT * FROM information_schema.user_mapping_options) u;
+--;;
+-- code: relation_denied
+SELECT (u).umoptions FROM (SELECT * FROM pg_catalog.pg_statistic) u;

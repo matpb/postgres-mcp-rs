@@ -1301,3 +1301,454 @@ async fn explain_generic_plan_lists_every_partition_of_shop_events() {
         }
     }
 }
+
+const ITEM_PLAN_SQL: &str = "SELECT * FROM app.items WHERE id = 1";
+
+/// The text plan of an explain_query result, which must be a success.
+fn plan_text(result: &Value) -> String {
+    assert!(!is_error(result), "{}", text_of(result));
+    structured(result)["plan"]
+        .as_str()
+        .expect("text plan")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn explain_serialize_reports_the_serialization_step() {
+    for port in [PORT_18, PORT_19] {
+        let result = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": ITEM_PLAN_SQL, "analyze": true, "serialize": true}),
+        )
+        .await;
+        let plan = plan_text(&result);
+        assert!(plan.contains("Serialization: time="), "port {port}: {plan}");
+        assert!(plan.contains("format=text"), "port {port}: {plan}");
+    }
+}
+
+#[tokio::test]
+async fn explain_serialize_is_version_gated_on_pg15() {
+    let result = tool(
+        one_db(PORT_15, &[]),
+        "explain_query",
+        json!({"sql": ITEM_PLAN_SQL, "analyze": true, "serialize": true}),
+    )
+    .await;
+    assert!(is_error(&result), "{result}");
+    assert!(
+        text_of(&result).starts_with(
+            "Option serialize needs PostgreSQL 17 or newer; this server is PostgreSQL 15."
+        ),
+        "{}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn explain_buffers_reports_buffer_counts_on_every_server() {
+    for port in [PORT_18, PORT_19, PORT_15] {
+        let result = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": ITEM_PLAN_SQL, "analyze": true, "buffers": true}),
+        )
+        .await;
+        let plan = plan_text(&result);
+        assert!(plan.contains("Buffers: shared hit="), "port {port}: {plan}");
+    }
+}
+
+#[tokio::test]
+async fn explain_verbose_reports_output_columns_on_every_server() {
+    for port in [PORT_18, PORT_19, PORT_15] {
+        let result = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": ITEM_PLAN_SQL, "verbose": true}),
+        )
+        .await;
+        let plan = plan_text(&result);
+        assert!(
+            plan.contains("Output: id, name, qty, price"),
+            "port {port}: {plan}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explain_settings_is_accepted_on_every_server() {
+    for port in [PORT_18, PORT_19, PORT_15] {
+        let result = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": ITEM_PLAN_SQL, "settings": true}),
+        )
+        .await;
+        let plan = plan_text(&result);
+        assert!(plan.contains("Index Cond: (id = 1)"), "port {port}: {plan}");
+    }
+}
+
+#[tokio::test]
+async fn explain_wal_is_accepted_with_analyze_on_every_server() {
+    for port in [PORT_18, PORT_19, PORT_15] {
+        let result = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": ITEM_PLAN_SQL, "analyze": true, "wal": true}),
+        )
+        .await;
+        let plan = plan_text(&result);
+        assert!(plan.contains("Execution Time: "), "port {port}: {plan}");
+    }
+}
+
+#[tokio::test]
+async fn explain_memory_reports_memory_on_pg17_and_newer() {
+    for port in [PORT_18, PORT_19] {
+        let result = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": ITEM_PLAN_SQL, "memory": true}),
+        )
+        .await;
+        let plan = plan_text(&result);
+        assert!(plan.contains("Memory: used="), "port {port}: {plan}");
+    }
+}
+
+#[tokio::test]
+async fn explain_formats_yaml_and_xml_on_every_server() {
+    for port in [PORT_18, PORT_19, PORT_15] {
+        let yaml = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": ITEM_PLAN_SQL, "format": "yaml"}),
+        )
+        .await;
+        assert!(plan_text(&yaml).starts_with("- Plan:"), "port {port}");
+        assert_eq!(structured(&yaml)["format"], "yaml", "port {port}");
+
+        let xml = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": ITEM_PLAN_SQL, "format": "xml"}),
+        )
+        .await;
+        let plan = plan_text(&xml);
+        assert!(
+            plan.contains("<Node-Type>Index Scan</Node-Type>"),
+            "port {port}: {plan}"
+        );
+        assert_eq!(structured(&xml)["format"], "xml", "port {port}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_argument_fields_are_invalid_params_for_every_tool() {
+    let router = app(one_db(PORT_18, &[]));
+    let listing = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let reply = post_mcp(
+        &router,
+        &listing,
+        &[("mcp-protocol-version", PROTOCOL_2025)],
+    )
+    .await;
+    let names: Vec<String> = result_of(&reply.json())["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(names.len(), 20, "{names:?}");
+    for name in names {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": {"zz_unknown": 1}},
+        });
+        let reply = post_mcp(&router, &body, &[("mcp-protocol-version", PROTOCOL_2025)])
+            .await
+            .json();
+        assert_eq!(reply["error"]["code"], json!(-32602), "{name}: {reply}");
+        let message = reply["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unknown field `zz_unknown`"),
+            "{name}: {reply}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explain_rejects_a_misspelled_option_by_name() {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "explain_query", "arguments": {"sql": "select 1", "analyse": true}},
+    });
+    let reply = post_mcp(
+        &app(one_db(PORT_18, &[])),
+        &body,
+        &[("mcp-protocol-version", PROTOCOL_2025)],
+    )
+    .await
+    .json();
+    assert_eq!(reply["error"]["code"], json!(-32602), "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field `analyse`"),
+        "{reply}"
+    );
+}
+
+/// A statement the gate parses for a while and then rejects, so no database round trip follows.
+#[tokio::test(flavor = "current_thread")]
+async fn gate_check_does_not_block_the_async_runtime() {
+    let router = app(one_db(PORT_18, &[]));
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = ticks.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let branches = vec!["SELECT 1"; 1000].join(" UNION ALL ");
+    let sql = format!("INSERT INTO t SELECT * FROM ({branches}) x");
+    let before = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+    let during = ticks.load(std::sync::atomic::Ordering::SeqCst) - before;
+    ticker.abort();
+    assert_eq!(
+        text_of_result(&response),
+        "Query rejected: Only read-only statements are accepted (SELECT, WITH, VALUES, TABLE, EXPLAIN, SHOW). This is a INSERT statement.",
+        "{response}"
+    );
+    assert!(
+        during >= 5,
+        "the runtime ticked {during} times during the gate"
+    );
+}
+
+fn text_of_result(response: &Value) -> String {
+    result_of(response)["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// An oversized POST to /mcp, with or without a Content-Length header.
+async fn oversized_post(router: &axum::Router, sized: bool) -> common::Reply {
+    let payload = "x".repeat(4096);
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost:8432")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if sized {
+        builder = builder.header("content-length", payload.len().to_string());
+    }
+    let request = builder
+        .body(axum::body::Body::from(payload))
+        .expect("request is well formed");
+    send(router, request).await
+}
+
+#[tokio::test]
+async fn oversized_request_gets_one_json_body_sized_or_chunked() {
+    let router = app(one_db(PORT_18, &[("MAX_REQUEST_BYTES", "1024")]));
+    let sized = oversized_post(&router, true).await;
+    let chunked = oversized_post(&router, false).await;
+    let expected = json!({
+        "error": "payload_too_large",
+        "message": "Request body exceeds 1024 bytes.",
+    });
+    assert_eq!(sized.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(chunked.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(sized.json(), expected, "{}", sized.text());
+    assert_eq!(chunked.json(), expected, "{}", chunked.text());
+    assert_eq!(sized.body, chunked.body);
+}
+
+#[tokio::test]
+async fn zero_row_select_still_reports_columns_and_types() {
+    for port in [PORT_18, PORT_19, PORT_15] {
+        let result = tool(
+            one_db(port, &[]),
+            "execute_query",
+            json!({"sql": "SELECT id, name FROM app.items WHERE false"}),
+        )
+        .await;
+        assert!(!is_error(&result), "{}", text_of(&result));
+        let body = structured(&result);
+        assert_eq!(
+            body["columns"],
+            json!([
+                {"name": "id", "type": "int4", "typeOid": 23},
+                {"name": "name", "type": "text", "typeOid": 25},
+            ]),
+            "port {port}"
+        );
+        assert_eq!(body["rows"], json!([]), "port {port}");
+        assert_eq!(body["rowCount"], json!(0), "port {port}");
+        assert_eq!(body["truncated"], json!(false), "port {port}");
+    }
+}
+
+#[tokio::test]
+async fn large_object_reads_through_lo_get_and_is_listed_in_its_metadata() {
+    for port in [PORT_18, PORT_19, PORT_15] {
+        let router = app(one_db(port, &[]));
+        let data = result_of(
+            &call_tool(
+                &router,
+                "execute_query",
+                json!({"sql": "SELECT lo_get(424243) AS data"}),
+            )
+            .await,
+        )
+        .clone();
+        assert!(!is_error(&data), "{}", text_of(&data));
+        assert_eq!(
+            structured(&data)["rows"][0]["data"],
+            json!("\\x68656c6c6f206c6f"),
+            "port {port}"
+        );
+        let listed = result_of(
+            &call_tool(
+                &router,
+                "execute_query",
+                json!({"sql": "SELECT oid FROM pg_catalog.pg_largeobject_metadata WHERE oid = 424243"}),
+            )
+            .await,
+        )
+        .clone();
+        assert!(!is_error(&listed), "{}", text_of(&listed));
+        assert_eq!(structured(&listed)["rowCount"], json!(1), "port {port}");
+    }
+}
+
+/// A router that answers 408 after `bound`, served on a loopback port for a raw client.
+async fn serve_with_bound(bound: Duration) -> (u16, axum::Router) {
+    let state = std::sync::Arc::new(postgres_mcp::AppState::new(one_db(PORT_18, &[])));
+    let router = postgres_mcp::server::build_router_with_request_timeout(state, bound);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let port = listener.local_addr().expect("local address").port();
+    tokio::spawn(axum::serve(listener, router.clone()).into_future());
+    (port, router)
+}
+
+#[tokio::test]
+async fn request_with_a_stalled_body_gets_408_within_the_bound() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (port, router) = serve_with_bound(Duration::from_millis(500)).await;
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    let head = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+        Accept: application/json, text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{";
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("head is sent");
+    let started = std::time::Instant::now();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply))
+        .await
+        .expect("the server answered within 5 seconds")
+        .expect("reply is read");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+    assert!(
+        text.ends_with(r#"{"error":"request_timeout","message":"The request took too long."}"#),
+        "{text}"
+    );
+
+    let normal = call_tool(&router, "list_databases", json!({})).await;
+    assert!(!is_error(result_of(&normal)), "{normal}");
+}
+
+#[tokio::test]
+async fn client_disconnect_cancels_the_backend_query() {
+    use tokio::io::AsyncWriteExt;
+    let (port, _router) = serve_with_bound(Duration::from_secs(60)).await;
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "execute_query", "arguments": {"sql": "SELECT pg_sleep(25) /* pgmcp-disconnect-marker */"}},
+    })
+    .to_string();
+    let head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+        Accept: application/json, text/event-stream\r\nmcp-protocol-version: {PROTOCOL_2025}\r\n\
+        Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("request is sent");
+    // The LIKE pattern splits the marker so this query's own text does not match it.
+    let running = "SELECT count(*)::text FROM pg_catalog.pg_stat_activity \
+        WHERE state = 'active' AND query LIKE '%pgmcp-dis' || 'connect-marker%'";
+    let mut seen = String::from("0");
+    for _ in 0..50 {
+        seen = superuser_scalar(PORT_18, running).await;
+        if seen == "1" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(seen, "1", "the pg_sleep backend never started");
+    drop(stream);
+
+    let mut remaining = String::from("1");
+    for _ in 0..80 {
+        remaining = superuser_scalar(PORT_18, running).await;
+        if remaining == "0" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        remaining, "0",
+        "the pg_sleep backend kept running after the disconnect"
+    );
+}
+
+/// Runs a query as the superuser on the port and returns the first column of the first row.
+async fn superuser_scalar(port: u16, sql: &str) -> String {
+    let mut conn = Connection::connect(&ConnectConfig {
+        host: "127.0.0.1".into(),
+        port,
+        database: DB_NAME.into(),
+        user: "postgres".into(),
+        password: Some("test-only-superuser".into()),
+        ssl_mode: SslMode::Disable,
+        ssl_root_cert: None,
+        connect_timeout: Duration::from_secs(5),
+        startup_params: Vec::new(),
+    })
+    .await
+    .expect("superuser connect");
+    let result = conn.simple_query(sql).await.expect("superuser query");
+    result.rows[0][0].clone().expect("non-null value")
+}

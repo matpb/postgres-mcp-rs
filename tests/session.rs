@@ -803,3 +803,42 @@ async fn state_left_by_a_function_is_gone_for_the_next_caller() {
         }
     }
 }
+
+/// The mcp_ro configuration with the role default overridden, so only the READ ONLY transaction can stop a write.
+fn config_without_role_read_only(port: u16) -> ConnectConfig {
+    let mut cfg = config(port, "test-only-ro");
+    for (name, value) in &mut cfg.startup_params {
+        if name == "default_transaction_read_only" {
+            *value = "off".into();
+        }
+    }
+    cfg
+}
+
+#[tokio::test]
+async fn writes_below_the_gate_fail_in_the_read_only_transaction() {
+    for (port, _) in VERSIONS {
+        let pool = Pool::new(config_without_role_read_only(port), 1);
+        // query_to_xml is STABLE, so PostgreSQL refuses the INSERT before the transaction check (0A000).
+        // try_write() is VOLATILE and reaches the READ ONLY transaction check (25006).
+        for (sql, expected) in [
+            (
+                "SELECT query_to_xml('INSERT INTO sess_test.canary VALUES (1)', false, false, '')",
+                "0A000",
+            ),
+            ("SELECT sess_test.try_write()", "25006"),
+        ] {
+            match run(&pool, sql).await {
+                Err(RunError::Db(db)) => {
+                    assert_eq!(db.code, expected, "port {port} {sql}: {}", db.message)
+                }
+                other => panic!("port {port} {sql}: expected SQLSTATE {expected}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            scalar(port, "SELECT count(*)::text FROM sess_test.canary").await,
+            "0",
+            "port {port}"
+        );
+    }
+}

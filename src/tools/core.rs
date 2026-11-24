@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::envelope::{QueryEnvelope, elapsed_ms};
 use super::text;
 use super::{Call, INTERNAL_MAX_ROWS, Runner, Statement, ToolError, Toolset, value_of};
-use crate::gate::{self, GateOptions, StatementKind};
+use crate::gate::{GateOptions, StatementKind};
 use crate::pg::session::RunOutput;
 use crate::pg::wire::{FetchLimits, Field, Truncation};
 use crate::server::AppState;
@@ -81,16 +81,19 @@ const VERSION_SQL: &str = "SELECT pg_catalog.current_setting('server_version') A
     pg_catalog.current_setting('server_version_num')::int AS server_version_num";
 
 /// Arguments of list_databases, which takes none.
-#[derive(JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct NoArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteArgs {
     pub database: Option<String>,
     pub sql: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseArgs {
     pub database: Option<String>,
 }
@@ -117,6 +120,7 @@ impl ExplainFormat {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExplainArgs {
     pub database: Option<String>,
     pub sql: String,
@@ -477,8 +481,7 @@ async fn explain(
         allow_placeholders: args.generic_plan,
         max_sql_bytes: limits.max_sql_bytes,
     };
-    let accepted = gate::check(&args.sql, &options)
-        .map_err(|r| ToolError::Rejected(format!("Query rejected: {}", r.message)))?;
+    let accepted = super::check_sql(&args.sql, options).await?;
     if accepted.kind != StatementKind::Select {
         return Err(ToolError::Rejected(
             "Query rejected: explain_query takes a SELECT, WITH, VALUES or TABLE statement."
@@ -603,7 +606,6 @@ fn explain_prefix(args: &ExplainArgs) -> String {
         ("SETTINGS", args.settings),
         ("WAL", args.wal),
         ("MEMORY", args.memory),
-        ("SERIALIZE", args.serialize),
         ("GENERIC_PLAN", args.generic_plan),
     ];
     options.extend(
@@ -612,6 +614,10 @@ fn explain_prefix(args: &ExplainArgs) -> String {
             .filter(|(_, on)| *on)
             .map(|(name, _)| format!("{name} true")),
     );
+    // SERIALIZE takes NONE, TEXT or BINARY on PostgreSQL 17 and newer, not a boolean.
+    if args.serialize {
+        options.push("SERIALIZE TEXT".to_owned());
+    }
     format!("EXPLAIN ({}) ", options.join(", "))
 }
 

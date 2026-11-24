@@ -158,7 +158,7 @@ pub const DATABASE_STATS: &str = "Cumulative statistics, one section per call or
      deadlocks, conflicts, temp files, cache hit ratio, sessions), io (pg_stat_io, PostgreSQL 16+), wal, \
      checkpointer (bgwriter on older versions), progress (running VACUUM, ANALYZE, CREATE INDEX, COPY, base \
      backup) and wait_events (what active sessions wait on). A section the server version or the role's \
-     grants do not provide is returned as unavailable with the reason.";
+     grants do not provide is returned as unavailable with the reason. On PostgreSQL 17 and newer each wait event carries its description.";
 
 pub const TABLE_STATS_TITLE: &str = "Table and index usage statistics";
 pub const TABLE_STATS: &str = "Per-table activity from pg_stat_user_tables and pg_statio_user_tables: sequential and index \

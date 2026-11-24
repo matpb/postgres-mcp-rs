@@ -66,6 +66,9 @@ const CREDENTIAL_RELATIONS: &[&str] = &[
     "pg_ident_file_mappings",
     "pg_config",
     "pg_db_role_setting",
+    "user_mapping_options",
+    "pg_statistic",
+    "pg_statistic_ext_data",
 ];
 
 /// Schemas whose functions are TimescaleDB internals; a call qualified with one is denied.
@@ -193,6 +196,8 @@ const R_RAW_PAGES: &str = "it changes or reads table pages directly";
 const R_EXTENSION: &str = "it is an extension routine the gate does not allow";
 const R_NETWORK: &str = "it makes network requests";
 const R_TIMESCALE_INTERNAL: &str = "it calls TimescaleDB internals the gate cannot classify";
+const R_LOG_HELPERS: &str =
+    "the server log helper functions are reserved for the read_server_log tool";
 
 /// Function names denied by name or prefix (a trailing `*`); matched on the last name part.
 const DENIED_FUNCTIONS: &[(&str, &str)] = &[
@@ -358,10 +363,18 @@ const DENIED_FUNCTIONS: &[(&str, &str)] = &[
     ("pg_wait_sampling_reset_profile", R_STATS),
     ("pg_stat_monitor_reset", R_STATS),
     ("pgr_*", R_EXTENSION),
+    ("read_log_file", R_LOG_HELPERS),
+    ("list_log_files", R_LOG_HELPERS),
 ];
 
 /// Functions that stay allowed even where a deny prefix would match them.
 const ALLOWED_FUNCTIONS: &[&str] = &["pg_current_xact_id_if_assigned", "pg_stat_get_*", "lo_get"];
+
+/// The function deny list as (name or `prefix*`, reason); the tests generate cases from it.
+#[doc(hidden)]
+pub fn denied_functions() -> &'static [(&'static str, &'static str)] {
+    DENIED_FUNCTIONS
+}
 
 /// Checks one SQL string and accepts it only when it is a single read-only statement.
 pub fn check(sql: &str, opts: &GateOptions) -> Result<Accepted, Rejection> {
@@ -528,6 +541,8 @@ fn check_node(variant: &str, body: &Value, opts: &GateOptions) -> Result<(), Rej
         )),
         "CommonTableExpr" => check_cte(body),
         "FuncCall" => check_function(body),
+        "AIndirection" => check_indirection(body),
+        "ColumnRef" => check_column_ref(body),
         "RangeVar" => check_relation(body),
         "VariableShowStmt" => check_setting(str_field(body, "name").unwrap_or_default()),
         _ => Ok(()),
@@ -566,6 +581,9 @@ fn check_function(body: &Value) -> Result<(), Rejection> {
     if qualifier.as_deref() == Some("cron") && CRON_JOB_FUNCTIONS.contains(&lowered.as_str()) {
         return Err(function_denied(last, R_CRON));
     }
+    if qualifier.as_deref() == Some("pgmcp") {
+        return Err(function_denied(last, R_LOG_HELPERS));
+    }
     if let Some(qualifier) = qualifier.as_deref()
         && INTERNAL_SCHEMAS.contains(&qualifier)
     {
@@ -576,6 +594,41 @@ fn check_function(body: &Value) -> Result<(), Rejection> {
     }
     if lowered == "current_setting" {
         check_current_setting(body)?;
+    }
+    Ok(())
+}
+
+/// `(expr).name` calls name(expr) when no field has that name, so every name after the dot is checked.
+fn check_indirection(body: &Value) -> Result<(), Rejection> {
+    items(body, "indirection")
+        .iter()
+        .try_for_each(check_dotted_name)
+}
+
+/// `rel.name` calls name(rel) when rel has no column of that name; the last name is the one called.
+fn check_column_ref(body: &Value) -> Result<(), Rejection> {
+    let fields = items(body, "fields");
+    if fields.len() < 2 {
+        return Ok(());
+    }
+    fields.last().map_or(Ok(()), check_dotted_name)
+}
+
+/// Applies the function rules to one name after a dot; a non-string item is not a name.
+fn check_dotted_name(part: &Value) -> Result<(), Rejection> {
+    let Some(("String", body)) = node_of(part) else {
+        return Ok(());
+    };
+    let Some(name) = str_field(body, "sval") else {
+        return Ok(());
+    };
+    let lowered = name.to_ascii_lowercase();
+    if let Some(reason) = deny_reason(&lowered) {
+        return Err(dotted_denied(name, reason));
+    }
+    if lowered == "current_setting" {
+        let message = "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name.";
+        return Err(reject("setting_denied", message));
     }
     Ok(())
 }
@@ -602,7 +655,7 @@ fn check_relation(body: &Value) -> Result<(), Rejection> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if CREDENTIAL_RELATIONS.contains(&relname.as_str())
-        && (schema.is_empty() || schema == "pg_catalog")
+        && matches!(schema.as_str(), "" | "pg_catalog" | "information_schema")
     {
         let message = format!(
             "{relname} can expose credentials and is not readable through this server. Use the server_info tool for settings."
@@ -641,6 +694,13 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
         Some(prefix) => name.starts_with(prefix),
         None => pattern == name,
     }
+}
+
+fn dotted_denied(name: &str, reason: &str) -> Rejection {
+    let message = format!(
+        "\"{name}\" after a dot would call the function {name}(), which is not allowed: {reason}. If it is a column of yours, give it another name with AS in a subquery."
+    );
+    reject("function_denied", message)
 }
 
 fn function_denied(name: &str, reason: &str) -> Rejection {

@@ -110,12 +110,17 @@ pub async fn guard(State(state): State<GuardState>, req: Request, next: Next) ->
                 .to_str()
                 .is_ok_and(|o| origin_allowed(o, &state.allowed_origins));
         if !allowed {
+            tracing::warn!(path = %req.uri().path(), reason = "origin not allowed", "request rejected");
             return forbidden();
         }
     }
     if let Some(key) = &state.api_key {
-        let authorized = presented_key(req.headers()).is_some_and(|p| key.matches(&p));
-        if !authorized {
+        let Some(presented) = presented_key(req.headers()) else {
+            tracing::warn!(path = %req.uri().path(), reason = "missing key", "request rejected");
+            return unauthorized();
+        };
+        if !key.matches(&presented) {
+            tracing::warn!(path = %req.uri().path(), reason = "wrong key", "request rejected");
             return unauthorized();
         }
     }

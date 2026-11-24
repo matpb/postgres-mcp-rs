@@ -89,9 +89,16 @@ const CHECKPOINTER_BGWRITER_SQL: &str = "SELECT s.checkpoints_timed AS \"checkpo
     s.checkpoint_sync_time AS \"syncTimeMs\", s.buffers_checkpoint AS \"buffersWritten\", \
     s.stats_reset AS \"statsReset\", 'pg_stat_bgwriter' AS source FROM pg_catalog.pg_stat_bgwriter s";
 const WAIT_EVENTS_SQL: &str = "SELECT a.wait_event_type AS \"type\", a.wait_event AS \"event\", \
-    pg_catalog.count(*) AS \"sessions\" FROM pg_catalog.pg_stat_activity a \
+    pg_catalog.count(*) AS \"sessions\", NULL::text AS \"description\" FROM pg_catalog.pg_stat_activity a \
     WHERE a.wait_event_type IS NOT NULL \
     GROUP BY a.wait_event_type, a.wait_event \
+    ORDER BY pg_catalog.count(*) DESC, a.wait_event_type, a.wait_event";
+/// PostgreSQL 17 and newer: each wait event with its description from pg_wait_events.
+const WAIT_EVENTS_DESCRIBED_SQL: &str = "SELECT a.wait_event_type AS \"type\", a.wait_event AS \"event\", \
+    pg_catalog.count(*) AS \"sessions\", e.description AS \"description\" FROM pg_catalog.pg_stat_activity a \
+    LEFT JOIN pg_catalog.pg_wait_events e ON e.type = a.wait_event_type AND e.name = a.wait_event \
+    WHERE a.wait_event_type IS NOT NULL \
+    GROUP BY a.wait_event_type, a.wait_event, e.description \
     ORDER BY pg_catalog.count(*) DESC, a.wait_event_type, a.wait_event";
 
 /// One pg_stat_progress_* view with the counter columns it may have.
@@ -352,7 +359,12 @@ async fn section_of(
             Ok(Outcome::Ready(Value::Object(lists)))
         }
         _ => {
-            let envelope = wide_rows(state, database, WAIT_EVENTS_SQL, &[], ct).await?;
+            let sql = if version_num >= 170_000 {
+                WAIT_EVENTS_DESCRIBED_SQL
+            } else {
+                WAIT_EVENTS_SQL
+            };
+            let envelope = wide_rows(state, database, sql, &[], ct).await?;
             Ok(Outcome::Ready(Value::Array(
                 envelope.rows.into_iter().map(Value::Object).collect(),
             )))
