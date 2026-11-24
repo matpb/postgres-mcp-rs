@@ -2,9 +2,13 @@
 
 pub mod core;
 pub mod envelope;
+pub mod logs;
+pub mod monitor;
+pub mod schema;
 // text.rs is committed unformatted and must not be edited; rustfmt leaves it alone.
 #[rustfmt::skip]
 pub mod text;
+pub mod timescale;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -293,6 +297,10 @@ impl PgMcp {
     pub fn new(state: Arc<AppState>) -> PgMcp {
         let tools = core::catalog()
             .into_iter()
+            .chain(schema::catalog())
+            .chain(monitor::catalog())
+            .chain(logs::catalog())
+            .chain(timescale::catalog())
             .filter(|(set, _)| set.enabled(&state.config.toolsets))
             .map(|(_, tool)| tool)
             .collect();
@@ -303,7 +311,7 @@ impl PgMcp {
     }
 }
 
-fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, McpError> {
+pub fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, McpError> {
     serde_json::from_value(args)
         .map_err(|e| McpError::invalid_params(format!("invalid arguments: {e}"), None))
 }
@@ -363,10 +371,25 @@ impl ServerHandler for PgMcp {
             "explain_query" => core::explain_query(state, parse_args(args)?, &ct).await,
             "server_info" => core::server_info(state, parse_args(args)?, &ct).await,
             _ => {
-                return Err(McpError::invalid_params(
-                    format!("unknown tool: {name}"),
-                    None,
-                ));
+                let routed = match schema::dispatch(state, &name, args.clone(), &ct).await {
+                    Some(call) => Some(call),
+                    None => match monitor::dispatch(state, &name, args.clone(), &ct).await {
+                        Some(call) => Some(call),
+                        None => match logs::dispatch(state, &name, args.clone(), &ct).await {
+                            Some(call) => Some(call),
+                            None => timescale::dispatch(state, &name, args, &ct).await,
+                        },
+                    },
+                };
+                match routed {
+                    Some(call) => call?,
+                    None => {
+                        return Err(McpError::invalid_params(
+                            format!("unknown tool: {name}"),
+                            None,
+                        ));
+                    }
+                }
             }
         };
         audit::record(

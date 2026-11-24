@@ -279,7 +279,7 @@ pub fn catalog() -> Vec<(Toolset, Tool)> {
 }
 
 /// Builds one tool: read-only annotations, schemas from the types, and the given property descriptions.
-fn tool<I: JsonSchema + 'static, O: JsonSchema + 'static>(
+pub fn tool<I: JsonSchema + 'static, O: JsonSchema + 'static>(
     name: &'static str,
     title: &'static str,
     description: &'static str,
@@ -313,7 +313,7 @@ fn set_descriptions(schema: &mut Arc<Map<String, Value>>, docs: &[(&str, &str)])
     }
 }
 
-fn failed(error: ToolError, database: Option<String>) -> Call {
+pub fn failed(error: ToolError, database: Option<String>) -> Call {
     Call {
         result: Err(error),
         database,
