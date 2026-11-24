@@ -28,7 +28,7 @@ Each script prints its steps and ends with `OK` when it passes. Quote the last l
 
 - **Read-only forever.** There is no write path, no write tool and no opt-in flag, and changes that add one will not be merged.
 - **The gate is the only way in.** Every SQL statement from a client goes through the gate in `src/gate.rs` and runs inside the read-only session in `src/pg/session.rs`. Do not add a path that skips either. Internal SQL the server runs itself is fixed text in the tool modules.
-- **Every client-facing string lives in `src/tools/text.rs`.** Tool titles, descriptions, parameter descriptions and the server instructions are there and nowhere else.
+- **Tool text lives in `src/tools/text.rs`.** Tool titles, descriptions, parameter descriptions and the server instructions are there and nowhere else. Error texts stay with the code that raises them.
 - **New SQL uses parameters only.** Values go through bind parameters. A name from a client that must appear as an identifier goes through `quote_ident`. Catalog names are schema-qualified (`pg_catalog.x`), so a role's `search_path` cannot change what they resolve to.
 - **A new tool needs integration tests on every supported version.** Those are PostgreSQL 15, 18 and 19 where the tool applies, and TimescaleDB 2.32 on 18 for the TimescaleDB tools. Tests run against the compose stack, not a mock.
 - **Change the README with the behaviour.** A change to a tool's behaviour or result shape updates `README.md` and the text in `src/tools/text.rs` in the same commit.

@@ -150,7 +150,7 @@ The server works with any role and never needs write privileges. `get_privileges
 
 ## Configuration
 
-The server reads only environment variables. Every variable is read when the server starts in `http` or `stdio` mode, so an invalid value stops startup in both. An empty value counts as unset. A configuration error is printed as `configuration error: ...` on stderr and the process exits with status 2.
+The server reads only environment variables. It reads them when it starts in `http` or `stdio` mode, and an invalid value stops startup in both. A variable of a database form that is not in use is not checked: with `DATABASE_URL` set, for example, a bad `PGPORT` is ignored. An empty value counts as unset. A configuration error is printed as `configuration error: ...` on stderr and the process exits with status 2.
 
 ### Databases
 
@@ -158,7 +158,7 @@ The server reads only environment variables. Every variable is read when the ser
 |----------|---------|---------|
 | `PG_DATABASES` | unset | JSON array of database objects. The most complete form, and the only one that holds several databases. See below. |
 | `PG_DATABASES_FILE` | unset | Path to a file with the same JSON array. Cannot be combined with `PG_DATABASES`. |
-| `DATABASE_URL` | unset | One `postgres://` or `postgresql://` URL. Takes precedence over the `PG*` variables. |
+| `DATABASE_URL` | unset | One `postgres://` or `postgresql://` URL, whose query may hold only `sslmode`, `sslrootcert`, `require_auth`, `application_name` and `connect_timeout`. Takes precedence over the `PG*` variables. |
 | `PG_NAME` | database name | Connection name for the `DATABASE_URL` or `PGDATABASE` form. Required when the database name has characters outside A-Z, a-z, 0-9, `_` and `-`. |
 | `PGHOST` | `127.0.0.1` | Host for the `PG*` form. This is not libpq's socket default. |
 | `PGPORT` | `5432` | Port for the `PG*` form. |
@@ -167,6 +167,7 @@ The server reads only environment variables. Every variable is read when the ser
 | `PGPASSWORD` | unset | Password for the `PG*` form. |
 | `PGSSLMODE` | `prefer` | TLS mode for the `PG*` form. See [TLS](#tls). |
 | `PGSSLROOTCERT` | bundled roots | PEM file of trusted CA certificates for the `PG*` form. |
+| `PGREQUIREAUTH` | `scram-sha-256,none` | Authentication methods the server may use for the `PG*` form. See [Authentication to PostgreSQL](#authentication-to-postgresql). |
 | `PGAPPNAME` | `postgres-mcp` | `application_name` for every connection. Overrides an `application_name` in a URL. |
 
 The three ways to name databases, in the order the server checks them, are:
@@ -175,7 +176,7 @@ The three ways to name databases, in the order the server checks them, are:
 2. `DATABASE_URL`, one database named after the URL's database name (or `PG_NAME`).
 3. `PGDATABASE` with `PGUSER` and the other `PG*` variables, one database.
 
-If none of them is set, startup fails with `no database configured`. When `PG_DATABASES` is set, `DATABASE_URL` is ignored without a warning.
+If none of them is set, startup fails with a configuration error that begins `no database configured`. When `PG_DATABASES` is set, `DATABASE_URL` and the `PG*` variables are ignored without a warning.
 
 One database from a URL:
 
@@ -205,11 +206,12 @@ A JSON entry takes these fields. An unknown field, or a field of the wrong type,
 | Field | Meaning |
 |-------|---------|
 | `name` | Required. The connection name, 1 to 63 characters of A-Z, a-z, 0-9, `_` or `-`. Names must be unique. |
-| `url` | A `postgres://` URL. Its query may hold only `sslmode`, `sslrootcert`, `application_name` and `connect_timeout` (1 to 3600 seconds). Cannot be combined with `host`, `port`, `database`, `user`, `password`, `sslmode` or `sslrootcert`. |
+| `url` | A `postgres://` URL. Its query may hold only `sslmode`, `sslrootcert`, `require_auth`, `application_name` and `connect_timeout` (1 to 3600 seconds). Cannot be combined with `host`, `port`, `database`, `user`, `password`, `sslmode`, `sslrootcert` or `require_auth`. |
 | `host`, `port` | Host (default `127.0.0.1`) and port (default 5432, 1 to 65535). |
 | `database`, `user` | Required in the discrete form. |
-| `password`, `password_file` | At most one. `password_file` is read at startup, and its trailing line break is dropped. An empty file means no password. |
+| `password`, `password_file` | At most one. `password_file` is read at startup, and its trailing line break is dropped. An empty file means no password. With `url`, `password_file` replaces the password in the URL. |
 | `sslmode`, `sslrootcert` | As for the `PG*` variables. |
+| `require_auth` | The authentication methods the server may use, as for `PGREQUIREAUTH`. Cannot be combined with `url`. |
 | `max_connections` | Pooled connections for this database, 1 to 64. Default 4. |
 | `statement_timeout_ms`, `lock_timeout_ms` | Per-database timeouts, with the same bounds as the global variables below. |
 
@@ -227,7 +229,19 @@ The `*_FILE` variants keep secrets out of the environment. `API_KEY_FILE` reads 
 | `verify-ca` | TLS, and the certificate must chain to a trusted root. The host name is not checked. |
 | `verify-full` | TLS, and the certificate must chain to a trusted root and match the host name. |
 
-The trusted roots are the PEM file named by `sslrootcert` (or `PGSSLROOTCERT`) when set, and otherwise the bundled Mozilla root set (webpki-roots), not the operating system store. A private certificate authority therefore needs `sslrootcert`. The file is read when a TLS connection is made. Use `verify-full` for any database that is reached over a network.
+The trusted roots are the PEM file named by `sslrootcert` (or `PGSSLROOTCERT`) when set, and otherwise the bundled Mozilla root set (webpki-roots), not the operating system store. A private certificate authority therefore needs `sslrootcert`. `verify-ca` needs `sslrootcert`: without it the configuration fails with an error that ends `sslmode=verify-ca needs sslrootcert`. `verify-full` without `sslrootcert` checks against the bundled roots. The file is read when a TLS connection is made. Use `verify-full` for any database that is reached over a network.
+
+### Authentication to PostgreSQL
+
+`require_auth` lists the authentication methods the server may use. It takes a comma list of `scram-sha-256`, `md5`, `password` (cleartext) and `none` (trust, no password). It is set by `PGREQUIREAUTH`, by the `require_auth` query parameter of a URL, or by the `require_auth` field of a JSON entry. When it is unset the list is `scram-sha-256,none`.
+
+A method that the server asks for and the list does not name is refused, and no password is sent for it. `md5` and `password` are refused unless they are listed. `password` also needs TLS: a server that asks for a cleartext password on an unencrypted connection is refused, whatever the list says. An unknown name, or a list with no name in it, is a configuration error.
+
+The client also refuses a SCRAM server that ends authentication without proving that it knows the password. SCRAM-SHA-256-PLUS (channel binding) is not implemented.
+
+### Connection errors
+
+A failed connection reaches the client as one short text that names the database, for example `Database "appdb" is unavailable: authentication failed`. The text is one of `authentication failed`, `the database does not exist`, `too many connections`, `the server refused the connection (SQLSTATE code)`, `cannot connect to the server`, `TLS negotiation failed`, `connection timed out` or `unexpected reply from the server`. When every pooled connection of a database is in use, the text is `all connections are busy, retry shortly`. The PostgreSQL message and its detail are written to the server log only.
 
 ### HTTP and authentication
 
@@ -247,10 +261,10 @@ When `MCP_HOST` is not a loopback address and no `API_KEY` is set, the server lo
 | Variable | Default | Bounds | Meaning |
 |----------|---------|--------|---------|
 | `MAX_ROWS` | `1000` | 1 to 100000 | Most rows one `execute_query` call returns. |
-| `MAX_VALUE_BYTES` | `4096` | 64 to 1048576 | Longest text, JSON or array value returned before it is cut. |
+| `MAX_VALUE_BYTES` | `4096` | 64 to 1048576 | Longest text or JSON value returned before it is cut. An array is cut only when its text is more than 16 times this. |
 | `MAX_BINARY_PREVIEW_BYTES` | `256` | 16 to 65536 | Bytes of a `bytea` value shown as hex before it is cut. |
 | `MAX_RESPONSE_BYTES` | `48000` | 1024 to 16777216 | Budget for the raw bytes of values in one result. |
-| `MAX_REQUEST_BYTES` | `1048576` | 1024 to 16777216 | Largest HTTP request body accepted. |
+| `MAX_REQUEST_BYTES` | `1048576` | 1024 to 16777216 | Largest HTTP request body accepted. A larger body gets 413, whether it is sent with a length or chunked. A body that cannot be read gets 400. |
 | `MAX_SQL_BYTES` | `102400` | 256 to 1048576 | Longest SQL text accepted by the gate. |
 | `MAX_CONCURRENT_REQUESTS` | `16` | 1 to 1024 | Requests to `/mcp` handled at once. Further requests wait for a slot. |
 | `STATEMENT_TIMEOUT_MS` | `30000` | 100 to 3600000 | Server-side limit for each statement. A per-database value overrides it. |
@@ -270,7 +284,7 @@ A database configured through the `DATABASE_URL` or `PG*` forms holds at most 4 
 
 ## Tools
 
-The server exposes 20 tools in five toolsets. `core` is always on. Every tool that reads a database takes an optional `database` argument, which is required only when several databases are configured. Every tool carries the MCP `readOnlyHint` annotation.
+The server exposes 20 tools in five toolsets. `core` is always on. Every tool except `list_databases` takes an optional `database` argument, which is required only when several databases are configured. Every tool carries the MCP `readOnlyHint` annotation.
 
 ### Core
 
@@ -287,17 +301,17 @@ The server exposes 20 tools in five toolsets. `core` is always on. Every tool th
 |------|--------------|
 | `list_schemas` | Lists schemas with owner, comment and counts of tables, views and functions. System schemas are left out unless asked for. |
 | `list_objects` | Lists tables, views, materialized views, sequences, functions, procedures and types, with estimated row counts and sizes. Paged. |
-| `describe_table` | Full definition of a table or view: columns, primary and unique keys, checks, foreign keys in both directions, indexes, triggers, policies and statistics. |
+| `describe_table` | Full definition of a table or view: columns, primary and unique keys, checks, foreign keys in both directions, indexes, triggers, policies and statistics. A bare name that several schemas hold is an error that lists them. A partitioned table lists at most 200 partitions, and `partitionsTruncated` is true when there are more. |
 | `describe_function` | Argument and return types, language, volatility, parallel safety, strictness, `SECURITY DEFINER`, owner and source text where readable. |
 | `search_schema` | Finds tables, views, columns and functions whose name or comment contains the text, case-insensitively. |
-| `get_privileges` | Reports what the connected role may read, its predefined roles, the monitoring features that work, and anything beyond read access. |
+| `get_privileges` | Reports what the connected role may read, its predefined roles, its database privileges (`databasePrivileges`), the monitoring features that work, and anything beyond read access. |
 
 ### Monitor (`monitor`)
 
 | Tool | What it does |
 |------|--------------|
-| `list_activity` | Sessions from `pg_stat_activity` with state, wait event, durations, query text and the PIDs that block each session. |
-| `query_stats` | Top statements from `pg_stat_statements`, ranked by total time, mean time, calls, rows or I/O. |
+| `list_activity` | Sessions from `pg_stat_activity` with state, wait event, durations, query text and the PIDs that block each session. Passwords in the query text are masked on a best-effort basis. |
+| `query_stats` | Top statements from `pg_stat_statements`, ranked by total time, mean time, calls, rows or I/O. Passwords in the statement text are masked on a best-effort basis. |
 | `database_stats` | Cumulative database, I/O, WAL, checkpointer, progress and wait-event statistics, one section or several per call. |
 | `table_stats` | Per-table scan, write and vacuum activity with sizes, plus each index's scan count, so unused indexes show up. |
 | `replication_status` | Recovery state, standbys with lag, replication slots and the WAL they retain, and logical subscriptions and publications. |
@@ -359,7 +373,7 @@ Accepted: `SELECT` in all its forms (`WITH`, set operations, window functions, `
 | `SELECT time_bucket('1 hour', ts) AS h, avg(v) FROM metrics GROUP BY h;` | `SELECT 1; SELECT 2;` (more than one statement) |
 | `SELECT pg_sleep(1);` (allowed, and still limited by the time limit) | `SELECT 1 INTO x;` and `SELECT * FROM t FOR UPDATE;` |
 | `SELECT lo_get(123);` (reads one large object) | `WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d;` (data-modifying CTE) |
-| `SELECT * FROM pg_stat_activity;` and `SELECT * FROM pg_roles;` | `SELECT $1;` (placeholders are refused; inline the value) |
+| `SELECT * FROM pg_stat_activity;` and `SELECT * FROM pg_roles;` | `SELECT $1;` (a placeholder is rejected; inline the value) |
 | | `SELECT pg_terminate_backend(1);`, `SELECT nextval('s');` and `SELECT pg_read_file('/etc/passwd');` |
 | | `SELECT * FROM dblink('x', 'y') AS t(a int);` (remote SQL functions are denied by name) |
 | | `SELECT * FROM pg_authid;` and `SELECT * FROM pg_settings;` (credential catalogs and settings) |
@@ -371,11 +385,15 @@ A rejected statement comes back as `Query rejected:` followed by the reason, whi
 
 Three things happen in order. The gate runs first and rejects the statement before the database sees it. The statement then runs in a `READ ONLY` transaction, which PostgreSQL enforces on its own, and that transaction is always rolled back. Finally the connection is reset with `ROLLBACK` and `DISCARD ALL` before it returns to the pool. A statement the gate misses still cannot write, because PostgreSQL refuses writes in a read-only transaction.
 
-The gate accepts only a fixed set of node types, so a statement with a construct it does not recognise is refused. It checks the functions a statement calls by name, and the catalogs and settings it reads. [SECURITY.md](SECURITY.md) lists what the gate cannot stop.
+The gate accepts only a fixed set of node types, so a statement with a construct it does not recognise is refused. It checks the functions a statement calls by name against a deny-list of side-effect, file and network functions of PostgreSQL and common extensions, and it refuses calls into TimescaleDB internal schemas. A deny-list cannot name every extension function, so the read-only transaction and the role's privileges are the real barrier. It also checks the catalogs and settings a statement reads. `current_setting()` takes only a literal setting name, such as `current_setting('work_mem')`. `current_setting('work_mem'::text)` and a computed name are refused, and so is a setting that can expose credentials. [SECURITY.md](SECURITY.md) lists what the gate cannot stop.
 
 ### Placeholders and generic plans
 
-The gate accepts `$1` placeholders in an `explain_query` call with `generic_plan` set, because a generic plan is about a statement with parameters. The tool then binds no values, so such a statement is refused with `generic_plan is not available through this server.` In this version, placeholders therefore do not work through either tool. `generic_plan` works for a statement without placeholders on PostgreSQL 16 or newer, and an older server answers with an error that names the version it needs.
+`execute_query` refuses `$1` placeholders: `Query rejected: Parameter placeholders ($1) are not supported. Inline the value.`
+
+`explain_query` with `generic_plan` set plans the statement as a generic plan, so the statement may contain `$1` placeholders. The tool binds no values and does not run the statement, so the plan shows the placeholders as they are. `generic_plan` needs PostgreSQL 16 or newer, and it cannot be combined with `analyze`. An older server answers `Option generic_plan needs PostgreSQL 16 or newer; this server is PostgreSQL` followed by its own version.
+
+For this option only, the statement is sent with the simple query protocol, and only after the server has parsed the identical text through the extended protocol as a single statement. The reply must be exactly one EXPLAIN result. A reply of any other shape is refused as an internal error, and its connection is closed. A database error is returned as usual.
 
 ## Result format and value encoding
 
@@ -394,7 +412,7 @@ The gate accepts `$1` placeholders in an `explain_query` call with `generic_plan
 }
 ```
 
-`columns` lists every result column in SELECT order, even when there are no rows. Each column's `type` is the PostgreSQL type name, such as `int4` or `text`. A column has `originalName` only when its name was changed. Duplicate names become `id__2`, `id__3` and so on, with `originalName` set to the name the query used. `rows` holds one object per row, keyed by column name. `truncatedReason` appears only when `truncated` is true. `truncatedValues` counts values that were cut, and `rawFallbacks` counts values that were returned as PostgreSQL text because they did not parse as their type.
+`columns` lists every result column in SELECT order, even when there are no rows. Each column's `type` is the PostgreSQL type name, such as `int4` or `text`. An array column is named `<element>[]`, such as `int4[]` or `text[]`, for built-in and custom element types alike. A custom type outside the `public` and `pg_catalog` schemas is schema-qualified, such as `types.mood`. A domain column reports its base type. A column has `originalName` only when its name was changed. Duplicate names become `id__2`, `id__3` and so on, with `originalName` set to the name the query used. `rows` holds one object per row, keyed by column name. `truncatedReason` appears only when `truncated` is true. `truncatedValues` counts values that were cut, and `rawFallbacks` counts values that were returned as PostgreSQL text because they did not parse as their type.
 
 The server sets the session's DateStyle to ISO, MDY, IntervalStyle to `iso_8601`, TimeZone to UTC and `bytea_output` to hex. Those settings are part of every result.
 
@@ -406,7 +424,7 @@ The server sets the session's DateStyle to ISO, MDY, IntervalStyle to `iso_8601`
 | `numeric`, `decimal` | string with the exact digits and scale, such as `"1.50"`, or `"NaN"`, `"Infinity"`, `"-Infinity"` |
 | `real`, `double precision` | number, or the strings `"NaN"`, `"Infinity"`, `"-Infinity"` |
 | `date`, `time`, `timetz`, `timestamp`, `timestamptz` | ISO text such as `"2024-02-29 13:00:00.123456"`. timestamptz is in UTC and ends in `+00`. `infinity`, `-infinity` and a ` BC` suffix can appear. |
-| `interval` | ISO 8601 duration such as `"P1Y2M3DT4H5M6S"` |
+| `interval` | ISO 8601 duration such as `"P1Y2M3DT4H5M6.789S"`. Parts can be negative, as in `"P-1M2DT-3H"`. |
 | `json`, `jsonb` | inline JSON, with numbers kept exact. A `json` value with duplicate keys comes back as its original text. |
 | arrays | nested JSON arrays, with elements encoded by the same rules and SQL NULL as `null`. An array with non-default lower bounds is `{"lowerBounds": [...], "elements": [...]}`. |
 | ranges | `{"lower": ..., "upper": ..., "lowerInc": true, "upperInc": false}`, where an unbounded bound is `null`, or `{"empty": true}` |
@@ -417,13 +435,13 @@ The server sets the session's DateStyle to ISO, MDY, IntervalStyle to `iso_8601`
 | domain | the encoding of its base type, so a domain over `integer` is a number |
 | SQL NULL | `null` |
 
-Text values longer than `MAX_VALUE_BYTES` are cut on a character boundary and end with `…[truncated: X of Y bytes]`. The cut value is counted in `truncatedValues`. Re-query with `substr()` to get the rest.
+Text values longer than `MAX_VALUE_BYTES` are cut on a character boundary and end with `…[truncated: X of Y bytes]`. The cut value is counted in `truncatedValues`. Re-query with `substr()` to get the rest. A wide value is cut while it is read: the rest of it is discarded without being held in memory, and the row is still returned.
 
 Size caps apply in this order:
 
 - **Rows.** At most `MAX_ROWS` rows (default 1000) are returned. If another row exists, `truncated` is true and `truncatedReason` is `row_limit`.
 - **Response budget.** The raw bytes of the kept values are summed. When the next row would take the total past `MAX_RESPONSE_BYTES` (default 48000), the result stops there with `truncatedReason` set to `response_size`. The first row is always returned, even when it alone exceeds the budget. The JSON text can be somewhat larger than the raw byte count.
-- **Values.** Each text, JSON or array value is cut at `MAX_VALUE_BYTES`, and each `bytea` value at `MAX_BINARY_PREVIEW_BYTES`.
+- **Values.** Each text or JSON value is cut at `MAX_VALUE_BYTES`. An array is decoded in full unless its text is more than 16 times that size, and then it is cut as text at `MAX_VALUE_BYTES`. Each `bytea` value is cut at `MAX_BINARY_PREVIEW_BYTES`.
 
 `truncated: true` always means the result is partial, and it is never silent. Add a `LIMIT`, an aggregate or fewer columns, and use `ORDER BY` for a stable page.
 
@@ -442,9 +460,9 @@ GRANT USAGE ON SCHEMA pgmcp TO mcp_reader;
 GRANT EXECUTE ON FUNCTION pgmcp.read_log_file(text, bigint, integer), pgmcp.list_log_files() TO mcp_reader;
 ```
 
-`read_log_file` reads at most 1 MiB per call. It accepts only a file name that matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` and that PostgreSQL lists in `log_directory`. The functions run with a fixed `search_path`, and `EXECUTE` is revoked from `PUBLIC`, so only roles granted it can call them. An invalid request raises `invalid log file request`.
+`read_log_file` reads at most 1 MiB per call. It accepts only a file name that matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` and that PostgreSQL lists in `log_directory`. The functions run with a fixed `search_path`, and `EXECUTE` is revoked from `PUBLIC`, so only roles granted it can call them. An invalid request raises `invalid log file request`. Both functions must be `SECURITY DEFINER` and owned by `pgmcp_log_reader` or by a superuser. Otherwise `read_server_log` reports that they were not installed by `sql/log_reader.sql`.
 
-The `read_server_log` tool, in the `logs` toolset, uses these functions. Its arguments are `list_files` (true to list the log files and the logging settings instead of entries), `since` and `until` (ISO timestamps), `min_severity` (`DEBUG` up to `PANIC`), `contains` (case-insensitive text), `user`, `entry_database` (the database named in the log entry, not the connection), `pid`, `file` (one log file by name), `limit`, and `cursor`. Entries are newest first. Each has a timestamp, a severity and the message, and, when the log format provides them, the user, database, pid, SQLSTATE, detail, hint and statement. jsonlog and csvlog are parsed into fields, and plain stderr lines have their severity read from the prefix when possible. Passwords in log text are masked on a best-effort basis. One call scans a bounded amount of log, so it can return zero entries with `scannedToEnd` false. That means to call again with the `nextCursor`. pgaudit records are in the same log, and `contains: "AUDIT:"` finds them.
+The `read_server_log` tool, in the `logs` toolset, uses these functions. Its arguments are `list_files` (true to list the log files and the logging settings instead of entries), `since` and `until` (ISO timestamps), `min_severity` (`DEBUG` up to `PANIC`), `contains` (case-insensitive text), `user`, `entry_database` (the database named in the log entry, not the connection), `pid`, `file` (one log file by name), `limit`, and `cursor`. Entries are newest first. Each has a timestamp, a severity and the message, and, when the log format provides them, the user, database, pid, SQLSTATE, detail, hint and statement. jsonlog and csvlog are parsed into fields, and plain stderr lines have their severity read from the prefix when possible. Passwords in log entries (the message, detail, statement and context) are masked on a best-effort basis, and so are passwords in statement text from `list_activity` and `query_stats`. Masking covers `PASSWORD` literals, including escape-string (`E'...'`), Unicode (`U&'...'`) and dollar-quoted ones, the `password=`, `sslpassword=` and `passfile=` settings, and passwords in URLs. One call scans a bounded amount of log, so it can return zero entries with `scannedToEnd` false. That means to call again with the `nextCursor`. pgaudit records are in the same log, and `contains: "AUDIT:"` finds them.
 
 What the tool can read: the files the collector writes into `log_directory`. What it cannot read: anything outside that directory, such as data files and WAL. With `logging_collector` off, PostgreSQL writes its log to stderr rather than to files, so there is nothing for the functions to read, and the tool's result says what to change.
 
@@ -464,7 +482,7 @@ ORDER BY bucket DESC
 LIMIT 100;
 ```
 
-Versions tested. The test stack runs PostgreSQL 15, 18 and 19. TimescaleDB runs in the test stack on PostgreSQL 18 only, at version 2.32.1, which was checked against that stack. At the time of testing, TimescaleDB 2.29 and later did not support PostgreSQL 15, and PostgreSQL 19 support was not confirmed in the upstream release notes. The timescale tools are tested only where the extension is installed.
+Versions tested. The test stack runs PostgreSQL 15, 18 and 19. TimescaleDB runs in the test stack on PostgreSQL 18 only, at version 2.32.1. The timescale tools are tested only where the extension is installed.
 
 ## Security model
 
@@ -476,7 +494,7 @@ The threat model and every layer are described in [SECURITY.md](SECURITY.md). In
 - **Session.** Each connection is checked before use and reset with `ROLLBACK` and `DISCARD ALL` after it, so no session state reaches the next caller.
 - **Caps.** Rows, values, response bytes, request bytes and SQL text are all capped.
 - **Bind.** The HTTP listener binds `127.0.0.1` unless `MCP_HOST` says otherwise.
-- **Origin, key and Host.** A request to `/mcp` is checked in this order. An `Origin` header must be a loopback origin or one in `ALLOWED_ORIGINS`, or the request gets 403. The API key comes next. Then the `Host` header must name a loopback host or one in `ALLOWED_HOSTS`, or the request is refused.
+- **Origin, key and Host.** A request to `/mcp` is checked in this order. An `Origin` header must be a loopback origin or one in `ALLOWED_ORIGINS`, or the request gets 403. The API key comes next. Then the `Host` header must name a loopback host or one in `ALLOWED_HOSTS`, or the request is refused. Loopback origins are always allowed, so a web page served from the same machine can send requests to the server when no API key is set. It cannot read the responses, but it can still make the calls. When a browser runs on the same machine as the server, set `API_KEY` even on loopback.
 - **API key.** When `API_KEY` is set, `/mcp` requires it in `X-API-Key` or `Authorization: Bearer`. The key is compared in constant time as SHA-256 digests. `GET /health` stays open for probes.
 - **Audit.** With `AUDIT_LOG` on (the default), each tool call writes one `audit` line to stderr. It holds the tool name, the database name, whether the call succeeded, its duration, the row count, the SQLSTATE of a database error, and the first 16 hex characters of the SHA-256 of the SQL text. It never holds the SQL text, values, error messages, client addresses or keys.
 
@@ -487,16 +505,17 @@ Deliberately absent: no write tool, no flag or setting that enables writes, and 
 Three scripts prove a change. None of them needs a CI service, because the project has no CI configuration by design. Run the first two before you open a pull request.
 
 - **`scripts/verify.sh`** needs no database. It runs `cargo fmt --check`, `cargo clippy` with warnings as errors, the library and non-database test targets (`lib`, `config`, `encode`, `gate` and `http_guard`), `cargo audit` and `cargo deny check`. The last two need `cargo-audit` and `cargo-deny` installed.
-- **`scripts/integration.sh`** starts [`docker-compose.test.yml`](docker-compose.test.yml), runs every cargo test target with `--test-threads=4`, and removes the stack afterwards. Pass `--keep` to leave the stack running for the next run. The stack has three PostgreSQL servers on loopback: `timescaledb-ha` on PostgreSQL 18 with TimescaleDB 2.32.1 on port 15432, `postgres` 19 on port 15433 (csvlog) and `postgres` 15 on port 15434. The TimescaleDB server also preloads `pg_stat_statements` and pgaudit. The databases are seeded with the `app`, `shop` and `types` schemas, a `metrics` schema on the TimescaleDB server, and two test roles with throwaway passwords: `mcp_ro`, which has the broad profile (`pg_read_all_data` and `pg_monitor`), and `mcp_strict`, which has per-schema `SELECT` grants and `pg_read_all_stats`.
+- **`scripts/integration.sh`** starts [`docker-compose.test.yml`](docker-compose.test.yml), runs every cargo test target with `--test-threads=4`, and removes the stack afterwards. Pass `--keep` to leave the stack running for the next run. The stack has three PostgreSQL servers on loopback: `timescaledb-ha` on PostgreSQL 18 with TimescaleDB 2.32.1 on port 15432, `postgres` 19 on port 15433 (csvlog) and `postgres` 15 on port 15434. The TimescaleDB server also preloads `pg_stat_statements` and pgaudit. The databases are seeded with the `app`, `shop` and `types` schemas, a `metrics` schema on the TimescaleDB server, and test roles with throwaway passwords: `mcp_ro`, which has the broad profile (`pg_read_all_data` and `pg_monitor`), `mcp_strict`, which has per-schema `SELECT` grants and `pg_read_all_stats`, and `mcp_min`, which may select only from `app.items`.
 - **`scripts/docker-smoke.sh`** builds the image as `postgres-mcp:smoke`, runs it against the test database on PostgreSQL 19, and checks the health route, the 401 without a key, `tools/list`, a `SELECT`, a refused `INSERT`, the absence of a shell and the read-only root filesystem.
+
+The cargo test targets are these. `lib` (the unit tests in `src/`), `config`, `encode`, `gate`, `http_guard`, `tls` and `wire_fake` need no database. `wire`, `session`, `types_exact`, `hardening`, `schema_tools`, `monitor_tools`, `timescale_tools`, `logs_tools`, `mcp_http` and `mcp_stdio` need the test stack. `tests/types_exact.rs` checks the value-encoding table above against PostgreSQL 15, 18 and 19. `tls` runs a server in-process with certificates made at test time, and `wire_fake` runs the wire client against scripted servers. The test databases are seeded from [`docker/initdb`](docker/initdb), and the tests do not run DDL, so an object that a test needs belongs in the seed.
 
 Tests that need a database connect only to the test stack on loopback ports 15432 to 15434. The library and non-database tests run without any database.
 
 ## Limitations
 
-- **One statement per call.** A call that sends two statements is refused. Placeholders (`$1`) are refused by `execute_query`, and `explain_query` cannot bind them either (see [Placeholders and generic plans](#placeholders-and-generic-plans)).
-- **Time limits come before row caps.** A set-returning function that is slow to produce its first rows can reach the statement time limit before the row cap is reached. The caller then gets a time-limit error, not a partial result.
-- **Authentication to PostgreSQL.** SCRAM-SHA-256 is used without channel binding (SCRAM-SHA-256-PLUS is not implemented). MD5 passwords are accepted, and cleartext passwords only over TLS.
+- **One statement per call.** A call that sends two statements is refused. `execute_query` refuses placeholders (`$1`). `explain_query` accepts them only with `generic_plan`, and then binds no values (see [Placeholders and generic plans](#placeholders-and-generic-plans)).
+- **Authentication to PostgreSQL.** SCRAM-SHA-256 is used without channel binding (SCRAM-SHA-256-PLUS is not implemented). MD5 and cleartext passwords are refused unless `require_auth` lists them, and cleartext also needs TLS. See [Authentication to PostgreSQL](#authentication-to-postgresql).
 - **Certificate checks.** `prefer` and `require` do not verify the server certificate. Use `verify-ca` or `verify-full` wherever the network is not trusted.
 - **No LISTEN, NOTIFY or COPY.** The gate refuses them.
 - **Large objects.** `lo_get(oid)` reads a large object through `execute_query`, and the value limits apply to its bytes. Writing, importing and exporting large objects are refused.

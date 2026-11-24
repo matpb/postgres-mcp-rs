@@ -6,7 +6,7 @@ postgres-mcp-rs is a read-only MCP server for PostgreSQL and TimescaleDB, writte
 
 These invariants are the product. A change that weakens one is wrong, even when the tests still pass.
 
-- **Read-only, always.** There is no write tool, no write flag and no path that sends a client's SQL around the gate. Enforced by: the gate in `src/gate.rs` (`check`, `ALLOWED_NODES`, `DENIED_FUNCTIONS`), and the read-only transaction in `src/pg/session.rs` (`begin_sql`, `run_held`).
+- **Read-only, always.** There is no write tool, no write flag and no path that sends a client's SQL around the gate. Enforced by: the gate in `src/gate.rs` (`check`, `ALLOWED_NODES`, `DENIED_FUNCTIONS`), and the read-only transaction in `src/pg/session.rs` (`begin_sql`, `run_held`). The `generic_plan` option of `explain_query` sends user SQL over the simple protocol, but only behind the server-side preflight in `explain_unbound`.
 - **One statement per call, parser-based.** `src/gate.rs` parses with PostgreSQL's parser and refuses anything not on the node allow-list. Unknown constructs are refused, not allowed. Adding a node type means adding a corpus case in `tests/gate_corpus/allow.sql` or `deny.sql`.
 - **Session state never leaks.** Each connection is checked before use (`verify_session`, `SESSION_CHECK` in `src/pg/session.rs`), pinned at connect time (`connect_config` in `src/config.rs`), and reset with `ROLLBACK` then `DISCARD ALL` (`reset` in `src/pg/session.rs`).
 - **Credentials stay out of output.** Credential catalogs and secret settings are denied in `src/gate.rs` (`CREDENTIAL_RELATIONS`, `SECRET_SETTINGS`), and `SHOW ALL` rows for them are dropped in `src/tools/envelope.rs`. Passwords are redacted in `Debug` output (`src/pg/wire.rs`, `src/config.rs`).
@@ -40,18 +40,19 @@ Tests that need PostgreSQL expect the test stack on `127.0.0.1` ports 15432 (Tim
 - `src/http_guard.rs`: Origin check, API key digest comparison, 401 and 403 bodies.
 - `src/audit.rs`: the per-call audit line.
 - `src/gate.rs`: the SQL gate: allow-lists, deny-lists, credential and secret rules.
-- `src/pg/wire.rs`: PostgreSQL wire client: startup, SCRAM and MD5 auth, extended query, cancel, row and byte caps.
+- `src/pg/wire.rs`: PostgreSQL wire client: startup, auth under `AuthPolicy` (SCRAM, MD5, cleartext, trust), extended and simple query (`explain_unbound` for user text), cancel, streamed rows with value and byte caps.
 - `src/pg/session.rs`: `run_readonly`: transaction, session check, timeouts, reset.
 - `src/pg/pool.rs`: per-database semaphore pool.
 - `src/pg/tls.rs`: sslmode handling and certificate verifiers.
 - `src/encode/`: value encoding; `mod.rs` decodes, `types.rs` holds the built-in OID table, `array.rs`, `range.rs`, `json.rs`, `columns.rs`.
 - `src/typeinfo.rs`: type lookups for non-built-in OIDs, cached per database.
 - `src/tools/mod.rs`: `Runner`, `ToolError`, the MCP handler (`list_tools`, `call_tool`).
-- `src/tools/text.rs`: every client-facing string.
+- `src/tools/text.rs`: tool titles, descriptions, parameter descriptions and server instructions.
+- `src/tools/mask.rs`: best-effort masking of passwords in log text and statement text.
 - `src/tools/core.rs`, `envelope.rs`: core tools and the result envelope.
 - `src/tools/schema.rs` and `schema/`: schema tools. `monitor/`: monitor tools. `logs.rs` and `logs/`: the log tool. `timescale.rs` and `timescale/`: TimescaleDB tools.
-- `tests/`: one file per area, plus `common/mod.rs` for helpers and ports, and `gate_corpus/` for the gate cases.
-- `docker/initdb/`: seed SQL for the test stack (roles, schemas, TimescaleDB data).
+- `tests/`: one file per area, plus `common/mod.rs` for helpers and ports, and `gate_corpus/` for the gate cases. `wire_fake.rs` runs the wire client against scripted fake servers, `tls.rs` runs TLS in-process with generated certificates, `types_exact.rs` pins the value encoding on PostgreSQL 15, 18 and 19, and `hardening.rs` checks that hostile public functions do not reach the server's own SQL.
+- `docker/initdb/`: seed SQL for the test stack (roles, schemas, TimescaleDB data). `55_hostile.sql` creates the hostile functions, and `56_test_objects.sql` creates the objects the tests use.
 - `sql/log_reader.sql`: the operator's setup for the server log functions.
 - `scripts/`: `verify.sh`, `integration.sh`, `docker-smoke.sh`.
 - `Dockerfile`, `docker-compose.yml` (example deployment), `docker-compose.test.yml` (test stack), `deny.toml` (cargo-deny policy).
@@ -61,11 +62,11 @@ Tests that need PostgreSQL expect the test stack on `127.0.0.1` ports 15432 (Tim
 - Comments are one or two factual lines. Say what the code does or why it must be so.
 - No `unwrap()` or `expect()` in `src/`. Errors are `ToolError` values.
 - A failed database or gate call is a tool result with `isError` set to true. Protocol errors are reserved for unknown tool names and invalid arguments (`invalid_params`).
-- Client-facing strings live in `src/tools/text.rs` only. A behaviour change updates `text.rs` and `README.md` together.
+- Tool titles, descriptions, parameter descriptions and server instructions live in `src/tools/text.rs` only. Error texts stay with the code that raises them. A behaviour change updates `text.rs` and `README.md` together.
 - SQL uses bind parameters for values. Catalog names are schema-qualified (`pg_catalog.x`).
 - Tests assert exact values and exact error messages, not only that something failed. Expected values come from the spec or from a live run, not from the code under test.
 - Integration tests run against the test stack. Do not mock PostgreSQL.
-- Config values are validated at startup with bounds. An invalid value stops startup with `configuration error: ...`, exit 2.
+- Config values are validated at startup with bounds. An invalid value stops startup with `configuration error: ...`, exit 2. The variables of a database form that is not in use are not checked.
 
 ## Landmines
 
@@ -84,6 +85,9 @@ Each of these looks harmless and breaks a guarantee or a test.
 - **`prefer` falls back to plaintext.** A server that answers `N` to the TLS request gets an unencrypted connection in `prefer` mode. Keep that behaviour documented, and do not describe `prefer` as encrypted.
 - **`text.rs` layout.** The module is marked `#[rustfmt::skip]` in `src/tools/mod.rs`, so rustfmt leaves its string continuation layout alone. Keep the layout when editing it.
 - **Log file access.** The log functions in `sql/log_reader.sql` are `SECURITY DEFINER`. Do not widen their argument checks or the file list they read.
+- **User text on the simple protocol.** User SQL reaches the simple protocol only through `explain_unbound`, behind its extended-protocol preflight. Never add a second call site.
+- **No DDL in tests.** Tests must not run DDL. Put the objects a test needs in the seed under `docker/initdb/`.
+- **Internal SQL search path.** Internal SQL runs with `search_path = pg_catalog`, so an object from an extension installed in another schema needs an explicit schema qualification.
 
 ## Deeper docs
 
