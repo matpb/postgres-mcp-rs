@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-use crate::pg::wire::{ConnectConfig, Connection, WireError};
+use crate::pg::wire::{AuthPolicy, ConnectConfig, Connection, WireError};
 use crate::typeinfo::TypeCache;
 
 /// Bounded pool of connections to one server. Opens nothing until the first checkout.
 pub struct Pool {
     connect: ConnectConfig,
+    auth: AuthPolicy,
     permits: Semaphore,
     idle: Mutex<Vec<Connection>>,
     types: TypeCache,
@@ -21,10 +22,16 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Lazy: opens nothing until first use.
+    /// Lazy: opens nothing until first use. Authenticates with the default policy.
     pub fn new(connect: ConnectConfig, max_connections: usize) -> Pool {
+        Pool::with_auth(connect, max_connections, AuthPolicy::default())
+    }
+
+    /// Like `new`, with the authentication methods every new connection may use.
+    pub fn with_auth(connect: ConnectConfig, max_connections: usize, auth: AuthPolicy) -> Pool {
         Pool {
             connect,
+            auth,
             permits: Semaphore::new(max_connections),
             idle: Mutex::new(Vec::new()),
             types: TypeCache::new(),
@@ -83,7 +90,7 @@ impl Pool {
     }
 
     async fn open<'a>(&'a self, permit: SemaphorePermit<'a>) -> Result<Lease<'a>, PoolError> {
-        let conn = match Connection::connect(&self.connect).await {
+        let conn = match Connection::connect_with(&self.connect, &self.auth).await {
             Ok(conn) => conn,
             Err(error) => {
                 tracing::warn!(database = %self.connect.database, error = %error, "connection failed");

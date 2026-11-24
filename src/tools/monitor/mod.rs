@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::core::{failed, tool};
 use super::envelope::{self, QueryEnvelope};
+use super::mask::mask;
 use super::{Call, INTERNAL_MAX_ROWS, Runner, Statement, ToolError, Toolset, parse_args, text};
 use crate::config::Limits;
 use crate::pg::wire::FetchLimits;
@@ -207,7 +208,6 @@ pub async fn wide_rows(
         },
         offset: 0,
         search_path_catalog_only: true,
-        unbound: false,
     };
     let (name, output) = Runner::new(state)
         .internal_raw(database, statement, ct)
@@ -272,11 +272,11 @@ pub fn cut_chars(text: &str, limit: usize) -> (String, bool) {
     }
 }
 
-/// Sets a row's `query` to its visible text cut to `chars`, and `queryTruncated` to whether it was cut.
+/// Sets a row's `query` to its visible text, masked for secrets, cut to `chars`; `queryTruncated` says whether it was cut.
 pub fn shape_query(row: &mut Map<String, Value>, chars: usize) {
     let (text, truncated) = match visible_text(row.get("query").and_then(Value::as_str)) {
         Some(full) => {
-            let (cut, was_cut) = cut_chars(full, chars);
+            let (cut, was_cut) = cut_chars(&mask(full), chars);
             (Value::String(cut), was_cut)
         }
         None => (Value::Null, false),

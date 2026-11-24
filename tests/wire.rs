@@ -439,13 +439,12 @@ fn ssl_mode_parses_names() {
 
 #[test]
 fn tls_client_config_builds_for_each_mode() {
-    for mode in [
-        SslMode::Prefer,
-        SslMode::Require,
-        SslMode::VerifyCa,
-        SslMode::VerifyFull,
-    ] {
+    for mode in [SslMode::Prefer, SslMode::Require, SslMode::VerifyFull] {
         assert!(client_config(mode, None).is_ok(), "{mode:?}");
+    }
+    match client_config(SslMode::VerifyCa, None) {
+        Err(WireError::Tls(m)) => assert_eq!(m, "sslmode=verify-ca needs sslrootcert"),
+        other => panic!("expected Tls error for verify-ca without a root, got {other:?}"),
     }
 }
 
@@ -469,28 +468,199 @@ fn tls_root_cert_errors_are_exact() {
     }
 }
 
-#[tokio::test]
-async fn oversized_row_is_skipped_not_buffered_on_real_server() {
-    let mut conn = connect(15432).await;
-    // Row cap for max_bytes 48000: 4 * 48000 + 1 MiB = 1240576 bytes.
-    let limits = FetchLimits {
-        max_rows: 1_000,
+/// The limits of a default configuration: 48000 response bytes, 4096 bytes per value, 10 rows.
+fn default_like() -> FetchLimits {
+    FetchLimits {
+        max_rows: 10,
         max_bytes: 48_000,
         max_value_bytes: 4_096,
-    };
+    }
+}
+
+#[tokio::test]
+async fn wide_row_with_a_multi_megabyte_value_keeps_the_prefix() {
+    let mut conn = connect(15433).await;
     let r = conn
-        .query("SELECT repeat('x', 300000000)", &[], false, &limits)
+        .query(
+            "SELECT repeat('x', 3000000) AS big, 1 AS n",
+            &[],
+            false,
+            &default_like(),
+        )
         .await
-        .expect("truncated query");
-    assert_eq!(r.truncated, Some(Truncation::Bytes));
-    assert!(r.rows.len() <= 1, "rows: {}", r.rows.len());
-    assert_eq!(r.command_tag, None);
+        .expect("query");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.truncated, None);
+    let big = r.rows[0][0].as_ref().expect("big");
+    assert_eq!(big.data.len(), 4096);
+    assert_eq!(big.full_len, 3_000_000);
+    assert_eq!(big.data, Bytes::from(vec![b'x'; 4096]));
+    let n = r.rows[0][1].as_ref().expect("n");
+    assert_eq!(n.data, Bytes::from_static(b"1"));
+    assert_eq!(n.full_len, 1);
+    assert!(!conn.is_poisoned());
+}
+
+#[tokio::test]
+async fn huge_value_streams_with_bounded_memory_on_real_server() {
+    let mut conn = connect(15433).await;
+    let r = conn
+        .query("SELECT repeat('x', 300000000)", &[], false, &default_like())
+        .await
+        .expect("query");
+    assert_eq!(r.truncated, None);
+    assert_eq!(r.command_tag.as_deref(), Some("SELECT 1"));
+    assert_eq!(r.rows.len(), 1);
+    let field = r.rows[0][0].as_ref().expect("value");
+    assert_eq!(field.data.len(), 4096);
+    assert_eq!(field.full_len, 300_000_000);
     assert!(
-        conn.peak_message_bytes() <= 1_240_576,
+        conn.peak_message_bytes() <= 1 << 20,
         "largest buffered message: {}",
         conn.peak_message_bytes()
     );
     assert!(!conn.is_poisoned());
     let r = conn.simple_query("SELECT 1").await.expect("usable again");
     assert_eq!(r.rows, vec![vec![s("1")]]);
+}
+
+#[tokio::test]
+async fn many_wide_rows_stop_at_the_byte_budget_on_real_server() {
+    let mut conn = connect(15433).await;
+    // Each row keeps 4096 bytes, so 11 rows fit in 48000 bytes and the twelfth does not.
+    let limits = FetchLimits {
+        max_rows: 1_000,
+        max_bytes: 48_000,
+        max_value_bytes: 4_096,
+    };
+    let r = conn
+        .query(
+            "SELECT repeat('x', 102400) FROM generate_series(1, 100)",
+            &[],
+            false,
+            &limits,
+        )
+        .await
+        .expect("truncated query");
+    assert_eq!(r.rows.len(), 11);
+    assert_eq!(r.truncated, Some(Truncation::Bytes));
+    assert_eq!(r.command_tag, None);
+    for row in &r.rows {
+        let field = row[0].as_ref().expect("value");
+        assert_eq!(field.data.len(), 4096);
+        assert_eq!(field.full_len, 102_400);
+    }
+    assert!(!conn.is_poisoned());
+    let r = conn.simple_query("SELECT 1").await.expect("usable again");
+    assert_eq!(r.rows, vec![vec![s("1")]]);
+}
+
+fn superuser(port: u16) -> ConnectConfig {
+    ConnectConfig {
+        user: "postgres".into(),
+        password: Some("test-only-superuser".into()),
+        ..cfg(port)
+    }
+}
+
+#[tokio::test]
+async fn explain_unbound_refuses_a_smuggled_statement_on_real_servers() {
+    for port in [15432, 15433] {
+        let mut conn = connect(port).await;
+        conn.simple_query("BEGIN READ ONLY").await.expect("begin");
+        let text =
+            "EXPLAIN (GENERIC_PLAN true) SELECT 1; COMMIT; CREATE TABLE public.smuggle_probe()";
+        match conn.explain_unbound(text, 1 << 20).await {
+            Err(WireError::Db(db)) => {
+                assert_eq!(db.code, "42601", "port {port}");
+                assert_eq!(
+                    db.message, "cannot insert multiple commands into a prepared statement",
+                    "port {port}"
+                );
+            }
+            other => panic!("port {port}: expected a preflight error, got {other:?}"),
+        }
+        assert!(!conn.is_poisoned(), "port {port}");
+        let r = conn.simple_query("ROLLBACK").await.expect("rollback");
+        assert_eq!(r.status, TxStatus::Idle, "port {port}");
+
+        let mut admin = Connection::connect(&superuser(port))
+            .await
+            .expect("superuser connect");
+        let r = admin
+            .simple_query("SELECT to_regclass('public.smuggle_probe') IS NULL")
+            .await
+            .expect("superuser query");
+        assert_eq!(r.rows, vec![vec![s("t")]], "port {port}");
+    }
+}
+
+#[tokio::test]
+async fn explain_unbound_returns_the_generic_plan_on_real_servers() {
+    for port in [15432, 15433] {
+        let mut conn = connect(port).await;
+        conn.simple_query("BEGIN READ ONLY").await.expect("begin");
+        let r = conn
+            .explain_unbound(
+                "EXPLAIN (GENERIC_PLAN true, FORMAT TEXT) SELECT * FROM app.items WHERE id = $1",
+                1 << 20,
+            )
+            .await
+            .expect("explain");
+        assert_eq!(r.command_tag.as_deref(), Some("EXPLAIN"), "port {port}");
+        assert_eq!(r.status, TxStatus::InTransaction, "port {port}");
+        assert_eq!(r.columns.len(), 1, "port {port}");
+        let plan: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| {
+                let field = row[0].as_ref().expect("plan line");
+                String::from_utf8_lossy(&field.data).into_owned()
+            })
+            .collect();
+        assert!(
+            plan.iter().any(|line| line.contains("$1")),
+            "port {port}: {plan:?}"
+        );
+        assert!(!conn.is_poisoned(), "port {port}");
+        conn.simple_query("ROLLBACK").await.expect("rollback");
+    }
+}
+
+/// Every `.rs` file under `dir`, as paths relative to the crate root, sorted.
+fn rust_files_containing(dir: &Path, needle: &str) -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut pending = vec![dir.to_path_buf()];
+    let mut found = Vec::new();
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).expect("read src directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                if text.contains(needle) {
+                    let relative = path.strip_prefix(root).expect("under the crate root");
+                    found.push(relative.display().to_string());
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn explain_unbound_has_one_call_site_and_simple_query_has_three_files() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    assert_eq!(
+        rust_files_containing(&src, "explain_unbound("),
+        ["src/pg/session.rs", "src/pg/wire.rs"]
+    );
+    let session = std::fs::read_to_string(src.join("pg/session.rs")).expect("session.rs");
+    assert_eq!(session.matches("explain_unbound(").count(), 1);
+    assert_eq!(
+        rust_files_containing(&src, "simple_query("),
+        ["src/pg/session.rs", "src/pg/wire.rs", "src/typeinfo.rs"]
+    );
 }

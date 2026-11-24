@@ -6,8 +6,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use common::{
-    DB_NAME, DECOY_SETUP, PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with,
-    db_entry, one_db, post_mcp, result_of, superuser_setup,
+    DB_NAME, PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with, db_entry,
+    one_db, post_mcp, result_of,
 };
 use postgres_mcp::config::Config;
 use serde_json::{Value, json};
@@ -395,7 +395,6 @@ async fn unavailable_when_functions_are_not_installed() {
 /// Same-named functions that are not SECURITY DEFINER and not owned by pgmcp_log_reader are refused.
 #[tokio::test]
 async fn unavailable_when_functions_are_not_authentic() {
-    superuser_setup(PORT_19, "postgres", DECOY_SETUP).await;
     let entry = json!({
         "name": "decoy",
         "host": "127.0.0.1",
@@ -557,5 +556,89 @@ async fn max_value_bytes_truncates_and_counts_long_messages() {
             .unwrap_or_default()
             >= 1,
         "{limited}"
+    );
+}
+
+/// The mcp_strict entry on PORT_19; that role has no pg_read_all_settings.
+fn strict_19() -> Config {
+    config_with(
+        &[json!({
+            "name": "appdb",
+            "host": "127.0.0.1",
+            "port": PORT_19,
+            "database": DB_NAME,
+            "user": "mcp_strict",
+            "password": "test-only-strict",
+            "sslmode": "disable",
+        })],
+        &[],
+    )
+}
+
+#[tokio::test]
+async fn strict_role_list_files_logs_no_permission_errors() {
+    // Control: a direct read of a restricted setting is logged, and the log reader shows it.
+    let control = call(
+        strict_19(),
+        "execute_query",
+        json!({"sql": "SELECT pg_catalog.current_setting('log_directory')"}),
+    )
+    .await;
+    assert!(is_error(&control), "{control}");
+    let seen = poll(PORT_19, json!({"contains": "permission denied to examine"})).await;
+    assert!(
+        entries_of(&seen)
+            .iter()
+            .any(|entry| mentions(entry, "permission denied to examine")),
+        "{seen}"
+    );
+
+    // The control error must be older than `since`, which has whole-second precision.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let started = iso_at(0);
+    for _ in 0..2 {
+        let listing = call(strict_19(), "read_server_log", json!({"list_files": true})).await;
+        assert!(!is_error(&listing), "{listing}");
+        let settings = &structured(&listing)["settings"];
+        assert_eq!(settings["logDirectory"], Value::Null, "{listing}");
+        assert_eq!(settings["logFilename"], Value::Null, "{listing}");
+        assert_eq!(settings["loggingCollector"], json!("on"), "{listing}");
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let log = call(
+        one_db(PORT_19, &[]),
+        "read_server_log",
+        json!({"since": started, "contains": "permission denied to examine"}),
+    )
+    .await;
+    assert!(!is_error(&log), "{log}");
+    assert!(entries_of(&log).is_empty(), "{log}");
+}
+
+#[tokio::test]
+async fn read_server_log_min_role_is_unavailable_without_the_reader_grant() {
+    let entry = json!({
+        "name": "appdb",
+        "host": "127.0.0.1",
+        "port": PORT_19,
+        "database": DB_NAME,
+        "user": "mcp_min",
+        "password": "test-only-min",
+        "sslmode": "disable",
+    });
+    let result = call(config_with(&[entry], &[]), "read_server_log", json!({})).await;
+    assert!(!is_error(&result), "{result}");
+    assert_eq!(structured(&result)["available"], false, "{result}");
+    assert_eq!(
+        structured(&result)["reason"],
+        json!("The connected role may not execute pgmcp.read_log_file."),
+        "{result}"
+    );
+    assert_eq!(
+        structured(&result)["howToEnable"],
+        json!(
+            "Run sql/log_reader.sql as a superuser, then: GRANT USAGE ON SCHEMA pgmcp TO mcp_min; GRANT EXECUTE ON FUNCTION pgmcp.read_log_file(text, bigint, integer), pgmcp.list_log_files() TO mcp_min;"
+        ),
+        "{result}"
     );
 }

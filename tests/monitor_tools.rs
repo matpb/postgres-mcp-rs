@@ -1037,3 +1037,136 @@ async fn no_secret_in_any_output() {
         assert!(!text.contains("conninfo"), "{name}");
     }
 }
+
+const MASK_HOLDER_APP: &str = "pgmcp-monitor-mask";
+const MASK_MARKER: &str = "mask_marker_7731";
+
+/// A harmless SELECT whose text carries a PASSWORD literal, as a superuser session on PORT_18.
+fn password_text_sql(sleep: &str) -> String {
+    format!("SELECT 'ALTER ROLE nobody PASSWORD ''hunter2-{MASK_MARKER}''' AS x, pg_sleep({sleep})")
+}
+
+#[tokio::test]
+async fn list_activity_masks_password_in_statement_text() {
+    let mut holder = raw(PORT_18, "postgres", SUPER_PASSWORD, MASK_HOLDER_APP).await;
+    let sql = password_text_sql("5");
+    let sleeper = tokio::spawn(async move { holder.simple_query(&sql).await });
+
+    let mut last = Value::Null;
+    for _ in 0..50 {
+        last = call(ro_config(PORT_18), "list_activity", json!({})).await;
+        let all = sessions(&last);
+        if session_of(&all, MASK_HOLDER_APP).is_some_and(|s| s["state"] == json!("active")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let all = sessions(&last);
+    let row = session_of(&all, MASK_HOLDER_APP)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let query = row["query"].as_str().unwrap_or_default().to_owned();
+    assert!(query.contains("pg_sleep(5)"), "{last}");
+    assert!(query.contains("PASSWORD '***'"), "{query}");
+    assert!(!query.contains("hunter2"), "{query}");
+    assert!(!last.to_string().contains("hunter2"), "{last}");
+    let finished = sleeper.await.expect("holder task");
+    assert!(finished.is_ok(), "pg_sleep holder failed");
+}
+
+#[tokio::test]
+async fn query_stats_masks_password_in_statement_text() {
+    let mut holder = raw(PORT_18, "postgres", SUPER_PASSWORD, MASK_HOLDER_APP).await;
+    let marker_alias = format!("mask_probe_{MASK_MARKER}");
+    let sql =
+        format!("SELECT 'ALTER ROLE nobody PASSWORD ''hunter2-{MASK_MARKER}''' AS {marker_alias}");
+    holder.simple_query(&sql).await.expect("statement runs");
+    let result = call(
+        ro_config(PORT_18),
+        "query_stats",
+        json!({"contains": MASK_MARKER, "query_chars": 4000}),
+    )
+    .await;
+    let statements = structured(&result)["statements"]
+        .as_array()
+        .expect("statements array")
+        .clone();
+    assert!(!statements.is_empty(), "{result}");
+    for statement in &statements {
+        let query = statement["query"].as_str().unwrap_or_default();
+        assert!(!query.contains("hunter2"), "{query}");
+    }
+    assert!(!result.to_string().contains("hunter2"), "{result}");
+}
+
+/// The role with CONNECT and USAGE on app and SELECT on app.items only (docker/initdb/56_test_objects.sql).
+fn min_config(port: u16) -> Config {
+    config_with(
+        &[json!({
+            "name": "appdb",
+            "host": "127.0.0.1",
+            "port": port,
+            "database": DB_NAME,
+            "user": "mcp_min",
+            "password": "test-only-min",
+            "sslmode": "disable",
+        })],
+        &[],
+    )
+}
+
+const MIN_NOTE: &str = "Query text of other users is hidden: GRANT pg_read_all_stats TO mcp_min;";
+
+#[tokio::test]
+async fn list_activity_min_role_hides_other_users_query_text() {
+    let mut holder = raw(PORT_18, "postgres", SUPER_PASSWORD, "pgmcp-min-holder").await;
+    let pid = backend_pid(&mut holder).await;
+    let sleeper = tokio::spawn(async move { holder.simple_query("SELECT pg_sleep(6)").await });
+    let mut last = Value::Null;
+    for _ in 0..50 {
+        last = call(
+            min_config(PORT_18),
+            "list_activity",
+            json!({"include_background": true}),
+        )
+        .await;
+        let all = sessions(&last);
+        if all.iter().any(|s| s["pid"] == json!(pid)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!is_error(&last), "{last}");
+    assert_eq!(
+        structured(&last)["queryTextVisible"],
+        json!(false),
+        "{last}"
+    );
+    assert_eq!(structured(&last)["note"], json!(MIN_NOTE), "{last}");
+    let all = sessions(&last);
+    let holder_row = all
+        .iter()
+        .find(|s| s["pid"] == json!(pid))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(holder_row["user"], "postgres", "{last}");
+    assert_eq!(holder_row["query"], Value::Null, "{last}");
+    assert!(sleeper.await.expect("holder task").is_ok());
+}
+
+#[tokio::test]
+async fn query_stats_min_role_hides_other_users_query_text() {
+    let result = call(min_config(PORT_18), "query_stats", json!({})).await;
+    assert!(!is_error(&result), "{result}");
+    assert_eq!(structured(&result)["note"], json!(MIN_NOTE), "{result}");
+    let statements = structured(&result)["statements"]
+        .as_array()
+        .expect("statements array")
+        .clone();
+    assert!(!statements.is_empty(), "{result}");
+    for statement in &statements {
+        if statement["user"] != json!("mcp_min") {
+            assert_eq!(statement["query"], Value::Null, "{statement}");
+        }
+    }
+}

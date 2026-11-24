@@ -11,19 +11,29 @@ use crate::tools::{Runner, Statement, ToolError};
 /// Bytes requested per read_log_file call.
 pub const READ_LEN: usize = 1_048_576;
 
-const SETUP_SQL: &str = "SELECT \
-    (pg_catalog.to_regprocedure('pgmcp.read_log_file(text,bigint,integer)') IS NOT NULL \
-     AND pg_catalog.to_regprocedure('pgmcp.list_log_files()') IS NOT NULL) AS installed, \
-    CASE WHEN pg_catalog.to_regprocedure('pgmcp.read_log_file(text,bigint,integer)') IS NULL \
-     OR pg_catalog.to_regprocedure('pgmcp.list_log_files()') IS NULL THEN false \
-     ELSE has_schema_privilege('pgmcp', 'USAGE') \
-     AND has_function_privilege('pgmcp.read_log_file(text,bigint,integer)', 'EXECUTE') \
-     AND has_function_privilege('pgmcp.list_log_files()', 'EXECUTE') END AS allowed, \
-    COALESCE((SELECT bool_and(p.prosecdef AND (o.rolname = 'pgmcp_log_reader' OR o.rolsuper)) \
-     FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_roles o ON o.oid = p.proowner \
-     WHERE p.oid IN (pg_catalog.to_regprocedure('pgmcp.read_log_file(text,bigint,integer)'), \
-                     pg_catalog.to_regprocedure('pgmcp.list_log_files()'))), false) AS authentic, \
-    pg_catalog.current_user() AS role";
+/// Three log reader flags in one select list: installed, allowed, authentic. The functions are found in pg_proc,
+/// so a role without USAGE on pgmcp gets false, not an error. read_server_log and get_privileges both use it.
+pub fn log_reader_flags() -> String {
+    let read = "(SELECT p.oid FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+        WHERE n.nspname = 'pgmcp' AND p.proname = 'read_log_file' AND p.proargtypes::text = '25 20 23')";
+    let list = "(SELECT p.oid FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+        WHERE n.nspname = 'pgmcp' AND p.proname = 'list_log_files' AND p.proargtypes::text = '')";
+    format!(
+        "COALESCE({read} IS NOT NULL AND {list} IS NOT NULL, false) AS installed, \
+        COALESCE(has_schema_privilege(pg_catalog.to_regnamespace('pgmcp')::oid, 'USAGE') \
+        AND has_function_privilege({read}, 'EXECUTE') AND has_function_privilege({list}, 'EXECUTE'), false) AS allowed, \
+        COALESCE((SELECT bool_and(p.prosecdef AND (o.rolname = 'pgmcp_log_reader' OR o.rolsuper)) \
+        FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_roles o ON o.oid = p.proowner \
+        WHERE p.oid IN ({read}, {list})), false) AS authentic"
+    )
+}
+
+fn setup_sql() -> String {
+    format!(
+        "SELECT {}, pg_catalog.current_user() AS role",
+        log_reader_flags()
+    )
+}
 const FILES_SQL: &str = "SELECT l.name AS name, l.size AS size, l.modification::text AS modified \
     FROM pgmcp.list_log_files() AS l ORDER BY l.modification DESC, l.name DESC";
 const BOUNDS_SQL: &str = "SELECT \
@@ -32,6 +42,8 @@ const BOUNDS_SQL: &str = "SELECT \
 const BOUND_SQL: &str = "SELECT \
     pg_catalog.to_char($1::timestamptz AT TIME ZONE pg_catalog.current_setting('log_timezone'), 'YYYY-MM-DD HH24:MI:SS.MS') AS bound";
 const READ_SQL: &str = "SELECT pgmcp.read_log_file($1::text, $2::bigint, $3::int)";
+const SETTINGS_SQL: &str = "SELECT s.name::text AS name, pg_catalog.current_setting(s.name) AS value \
+    FROM pg_catalog.pg_settings AS s WHERE s.name = ANY($1::text[])";
 
 /// Logging settings reported by list_files: (setting name, result key).
 pub const SETTINGS: &[(&str, &str)] = &[
@@ -71,7 +83,7 @@ pub async fn setup(
     ct: &CancellationToken,
 ) -> Result<Setup, ToolError> {
     let envelope = Runner::new(state)
-        .internal_query(database, SETUP_SQL, &[], ct)
+        .internal_query(database, &setup_sql(), &[], ct)
         .await?;
     let row = envelope
         .rows
@@ -111,24 +123,31 @@ pub async fn files(
 }
 
 /// The logging settings, each as its text value or null when the role cannot read it.
+/// pg_settings lists only the settings this role may examine, so restricted ones are never passed to current_setting.
 pub async fn settings(
     state: &AppState,
     database: Option<&str>,
     ct: &CancellationToken,
 ) -> Result<Map<String, Value>, ToolError> {
-    let runner = Runner::new(state);
+    let names = format!(
+        "{{{}}}",
+        SETTINGS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let envelope = Runner::new(state)
+        .internal_query(database, SETTINGS_SQL, &[Some(names.as_str())], ct)
+        .await?;
     let mut out = Map::new();
     for (name, key) in SETTINGS {
-        let sql = format!("SELECT pg_catalog.current_setting('{name}', true) AS value");
-        let value = match runner.internal_query(database, &sql, &[], ct).await {
-            Ok(envelope) => envelope
-                .rows
-                .first()
-                .and_then(|row| row.get("value").cloned())
-                .unwrap_or(Value::Null),
-            Err(ToolError::Db(_)) => Value::Null,
-            Err(other) => return Err(other),
-        };
+        let value = envelope
+            .rows
+            .iter()
+            .find(|row| text_of(row, "name").as_deref() == Some(name))
+            .and_then(|row| row.get("value").cloned())
+            .unwrap_or(Value::Null);
         out.insert((*key).to_owned(), value);
     }
     Ok(out)
@@ -219,7 +238,6 @@ pub async fn read_chunk(
         },
         offset: 0,
         search_path_catalog_only: true,
-        unbound: false,
     };
     let (_, output) = Runner::new(state)
         .internal_raw(database, statement, ct)

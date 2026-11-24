@@ -1082,6 +1082,44 @@ async fn chunked_body_over_the_limit_gets_413() {
     );
 }
 
+/// A chunked body that stops mid-chunk: the client half-closes after 10 of the 1024 announced bytes.
+#[tokio::test]
+async fn chunked_body_cut_off_mid_stream_gets_400() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let router = app(one_db(PORT_18, &[("MAX_REQUEST_BYTES", "2048")]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to the test server");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost:8432\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: {PROTOCOL_2025}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n400\r\n0123456789"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send the partial request");
+    stream.shutdown().await.expect("half-close the request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read the response");
+    let text = String::from_utf8_lossy(&response).into_owned();
+    assert!(text.starts_with("HTTP/1.1 400 "), "{text}");
+    assert!(
+        text.ends_with(r#"{"error":"bad_request","message":"Could not read the request body."}"#),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn chunked_body_under_the_limit_still_works() {
     let router = app(one_db(PORT_18, &[("MAX_REQUEST_BYTES", "2048")]));
@@ -1089,4 +1127,70 @@ async fn chunked_body_under_the_limit_still_works() {
     let (status, text) = post_chunked(router, &body.to_string(), 7).await;
     assert_eq!(status, 200, "{text}");
     assert!(text.contains("\"name\":\"execute_query\""), "{text}");
+}
+
+#[tokio::test]
+async fn execute_query_returns_the_row_with_a_multi_megabyte_value_truncated() {
+    let router = app(one_db(PORT_19, &[]));
+    let response = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT repeat('x', 3000000) AS big, 1 AS n"}),
+    )
+    .await;
+    let result = result_of(&response);
+    assert_eq!(result["isError"], json!(false), "{response}");
+    let body = &result["structuredContent"];
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(1), "{body}");
+    assert!(
+        body["truncatedValues"].as_u64().unwrap_or_default() >= 1,
+        "{body}"
+    );
+    assert_eq!(body["rows"][0]["n"], json!(1), "{body}");
+}
+
+#[tokio::test]
+async fn explain_generic_plan_on_hypertable_keeps_placeholder_and_every_chunk() {
+    let result = tool(
+        one_db(PORT_18, &[]),
+        "explain_query",
+        json!({"sql": "SELECT * FROM metrics.readings WHERE device_id = $1", "generic_plan": true}),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let plan = structured(&result)["plan"]
+        .as_str()
+        .expect("plan text")
+        .to_owned();
+    assert!(plan.contains("$1"), "{plan}");
+    // PostgreSQL prints this line for every ChunkAppend; a generic plan excludes no chunk at startup.
+    assert!(plan.contains("Chunks excluded during startup: 0"), "{plan}");
+    let chunks: std::collections::BTreeSet<&str> = plan
+        .lines()
+        .filter_map(|line| line.split(" on ").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter(|name| name.starts_with("_hyper_1_") && !name.contains("_compressed"))
+        .collect();
+    assert_eq!(chunks.len(), 7, "{plan}");
+}
+
+#[tokio::test]
+async fn explain_generic_plan_lists_every_partition_of_shop_events() {
+    for port in [PORT_18, PORT_19] {
+        let result = tool(
+            one_db(port, &[]),
+            "explain_query",
+            json!({"sql": "SELECT * FROM shop.events WHERE happened_at > $1", "generic_plan": true}),
+        )
+        .await;
+        assert!(!is_error(&result), "port {port}: {}", text_of(&result));
+        let plan = structured(&result)["plan"]
+            .as_str()
+            .expect("plan text")
+            .to_owned();
+        assert!(plan.contains("$1"), "port {port}: {plan}");
+        for partition in ["events_2024_q1", "events_2024_q2", "events_default"] {
+            assert!(plan.contains(partition), "port {port}: {plan}");
+        }
+    }
 }

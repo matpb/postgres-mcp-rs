@@ -47,6 +47,9 @@ pub fn client_config(
     mode: SslMode,
     root_cert: Option<&Path>,
 ) -> Result<Arc<ClientConfig>, WireError> {
+    if mode == SslMode::VerifyCa && root_cert.is_none() {
+        return Err(WireError::Tls("sslmode=verify-ca needs sslrootcert".into()));
+    }
     let roots = Arc::new(load_roots(root_cert)?);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let webpki = WebPkiServerVerifier::builder_with_provider(roots.clone(), provider.clone())

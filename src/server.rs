@@ -54,7 +54,11 @@ impl AppState {
             .map(|db| {
                 (
                     db.name.clone(),
-                    Arc::new(Pool::new(db.connect.clone(), db.max_connections)),
+                    Arc::new(Pool::with_auth(
+                        db.connect.clone(),
+                        db.max_connections,
+                        db.auth.clone(),
+                    )),
                 )
             })
             .collect();
@@ -320,8 +324,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     router.layer(TraceLayer::new_for_http())
 }
 
+/// The Display text of http_body_util's LengthLimitError, which is what `to_bytes` reports for an oversized body.
+const LENGTH_LIMIT_TEXT: &str = "length limit exceeded";
+
 /// Buffers the body up to `max` bytes, so a chunked body over the limit gets the same 413 as a sized one.
-/// Any failure to read the body is answered as too large, since the limit is the only read failure this path expects.
+/// Any other read failure, such as an aborted client, is a 400.
 async fn buffer_request_body(State(max): State<usize>, request: Request, next: Next) -> Response {
     let (parts, body) = request.into_parts();
     match to_bytes(body, max).await {
@@ -329,8 +336,18 @@ async fn buffer_request_body(State(max): State<usize>, request: Request, next: N
             next.run(Request::from_parts(parts, Body::from(bytes)))
                 .await
         }
-        Err(_) => payload_too_large(max),
+        Err(error) if error.to_string() == LENGTH_LIMIT_TEXT => payload_too_large(max),
+        Err(_) => bad_request(),
     }
+}
+
+fn bad_request() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(CONTENT_TYPE, "application/json")],
+        r#"{"error":"bad_request","message":"Could not read the request body."}"#,
+    )
+        .into_response()
 }
 
 fn payload_too_large(max: usize) -> Response {

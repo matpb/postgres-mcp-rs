@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use common::{DB_NAME, DB_PASSWORD, DB_USER, PORT_19, PROTOCOL_2025};
 use serde_json::{Value, json};
@@ -41,14 +41,10 @@ fn wait_with_timeout(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
     }
 }
 
-/// A port from the 20000..40000 range, varied by attempt and time.
-fn pick_port(attempt: u64) -> u16 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let spread = u64::try_from(nanos % 20_000).unwrap_or_default();
-    20_000 + u16::try_from(spread.wrapping_add(attempt * 7919) % 20_000).unwrap_or_default()
+/// A loopback port that was free a moment ago: bound to port 0, read, and released.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+    listener.local_addr().expect("local address").port()
 }
 
 #[test]
@@ -161,8 +157,8 @@ fn healthcheck_fails_on_closed_port() {
 
 #[test]
 fn healthcheck_passes_against_running_http_server() {
-    for attempt in 0..10 {
-        let port = pick_port(attempt);
+    for _ in 0..5 {
+        let port = free_port();
         let mut server = command(&["http"])
             .env("DATABASE_URL", database_url(PORT_19))
             .env("MCP_PORT", port.to_string())
@@ -289,6 +285,19 @@ fn log_format_json_writes_only_json_lines_to_stderr() {
 }
 
 /// Starts `http` on `port` and forwards each stderr line over a channel.
+/// Starts the HTTP server on a free port. A child that exits at once, such as on a bind race, is retried on another port.
+fn spawn_http_free_port(extra: &[(&str, &str)]) -> (Child, mpsc::Receiver<String>, u16) {
+    for _ in 0..5 {
+        let port = free_port();
+        let (mut child, receiver) = spawn_http(port, extra);
+        thread::sleep(Duration::from_millis(500));
+        if child.try_wait().expect("child can be polled").is_none() {
+            return (child, receiver, port);
+        }
+    }
+    panic!("the HTTP server exited on five different ports");
+}
+
 fn spawn_http(port: u16, extra: &[(&str, &str)]) -> (Child, mpsc::Receiver<String>) {
     let mut cmd = command(&["http"]);
     cmd.env("DATABASE_URL", database_url(PORT_19))
@@ -328,8 +337,7 @@ fn lines_until(receiver: &mpsc::Receiver<String>, needle: &str, limit: Duration)
 
 #[test]
 fn non_loopback_bind_without_api_key_warns() {
-    let port = pick_port(0);
-    let (mut child, receiver) = spawn_http(port, &[("MCP_HOST", "0.0.0.0")]);
+    let (mut child, receiver, _port) = spawn_http_free_port(&[("MCP_HOST", "0.0.0.0")]);
     let seen = lines_until(
         &receiver,
         "listening on a non-loopback address without an API key",
@@ -346,9 +354,8 @@ fn non_loopback_bind_without_api_key_warns() {
 
 #[test]
 fn non_loopback_bind_with_api_key_does_not_warn() {
-    let port = pick_port(1);
     let key = ("API_KEY", "test-only-api-key-0123456789");
-    let (mut child, receiver) = spawn_http(port, &[("MCP_HOST", "0.0.0.0"), key]);
+    let (mut child, receiver, _port) = spawn_http_free_port(&[("MCP_HOST", "0.0.0.0"), key]);
     let mut seen = lines_until(&receiver, "serving MCP", Duration::from_secs(10));
     // The warning, when it exists, follows the startup line at once; the pause lets it arrive.
     thread::sleep(Duration::from_millis(500));
@@ -362,8 +369,7 @@ fn non_loopback_bind_with_api_key_does_not_warn() {
 #[cfg(unix)]
 #[test]
 fn sigterm_stops_http_with_exit_status_zero() {
-    let port = pick_port(2);
-    let (mut child, receiver) = spawn_http(port, &[]);
+    let (mut child, receiver, port) = spawn_http_free_port(&[]);
     let seen = lines_until(&receiver, "serving MCP", Duration::from_secs(10));
     assert!(seen.iter().any(|l| l.contains("serving MCP")), "{seen:?}");
     // The listener is up once /health answers; only then is the shutdown handler surely armed.

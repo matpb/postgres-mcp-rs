@@ -33,33 +33,26 @@ const DISCARD_MAX_BYTES: usize = 64 << 20;
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Read size used when a DataRow is discarded without being buffered.
 const SKIP_CHUNK: usize = 64 << 10;
-const ROW_CAP_FLOOR: usize = 64 << 10;
-const ROW_CAP_HEADROOM: usize = 1 << 20;
-const ROW_CAP_CEILING: usize = 256 << 20;
+/// Bytes of a message header: the tag and the length word.
+const HEADER_LEN: usize = 5;
 
-/// Largest DataRow buffered for one query: 4 x max_bytes plus 1 MiB, within 64 KiB to 256 MiB.
-fn row_cap(limits: &FetchLimits) -> usize {
-    limits
-        .max_bytes
-        .saturating_mul(4)
-        .saturating_add(ROW_CAP_HEADROOM)
-        .clamp(ROW_CAP_FLOOR, ROW_CAP_CEILING)
-}
-
-/// What `recv_frame` may skip instead of failing.
+/// What `recv_frame` does beyond returning whole messages.
 #[derive(Clone, Copy)]
 enum Skip {
     Nothing,
-    /// Query rows: DataRows over `row_cap` are discarded unbuffered, NotificationResponse is ignored.
+    /// Query rows: DataRows are read field by field, keeping `max_value_bytes` of each; NotificationResponse is ignored.
     Rows {
-        row_cap: usize,
+        max_value_bytes: usize,
     },
 }
 
-/// One received frame: a whole message, or a DataRow discarded unbuffered.
+/// One received frame: a whole message, or a streamed DataRow with its kept fields.
 enum Frame {
     Message(Incoming),
-    SkippedRow { len: usize },
+    Row {
+        fields: Vec<Option<Field>>,
+        len: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -273,7 +266,7 @@ impl Connection {
             .map_err(|_| WireError::Timeout)?
     }
 
-    /// Largest message this connection has buffered so far, header included.
+    /// Largest message held whole, or the kept bytes of one streamed DataRow.
     pub fn peak_message_bytes(&self) -> usize {
         self.peak_message_bytes
     }
@@ -311,6 +304,22 @@ impl Connection {
     ) -> Result<QueryResult, WireError> {
         self.ensure_usable()?;
         let result = self.query_inner(sql, params, user_sql, limits).await;
+        self.note(&result);
+        result
+    }
+
+    /// Runs one EXPLAIN text through the simple protocol. The server must parse it as one statement first,
+    /// and no Query is sent unless it does. The plan's bytes are capped at `max_bytes` while they are read.
+    pub async fn explain_unbound(
+        &mut self,
+        sql: &str,
+        max_bytes: usize,
+    ) -> Result<QueryResult, WireError> {
+        self.ensure_usable()?;
+        let result = self.explain_unbound_inner(sql, max_bytes).await;
+        if let Err(WireError::Protocol(reason)) = &result {
+            tracing::error!(reason = %reason, "explain response rejected; connection dropped");
+        }
         self.note(&result);
         result
     }
@@ -357,7 +366,7 @@ impl Connection {
     async fn recv(&mut self) -> Result<Incoming, WireError> {
         match self.recv_frame(Skip::Nothing).await? {
             Frame::Message(incoming) => Ok(incoming),
-            Frame::SkippedRow { .. } => Err(protocol("DataRow is too large")),
+            Frame::Row { .. } => Err(unexpected(b'D')),
         }
     }
 
@@ -383,12 +392,11 @@ impl Connection {
                     )));
                 }
                 let total = usize::try_from(len).map_err(protocol)? + 1;
-                if let Skip::Rows { row_cap } = skip
+                if let Skip::Rows { max_value_bytes } = skip
                     && tag == b'D'
-                    && total > row_cap
                 {
-                    self.discard_message(total).await?;
-                    return Ok(Frame::SkippedRow { len: total });
+                    let fields = self.stream_row(total, max_value_bytes).await?;
+                    return Ok(Frame::Row { fields, len: total });
                 }
                 if self.buf.len() >= total {
                     self.peak_message_bytes = self.peak_message_bytes.max(total);
@@ -425,13 +433,79 @@ impl Connection {
         }
     }
 
-    /// Drops the next `total` bytes of the stream in SKIP_CHUNK steps, using buffered bytes first.
-    async fn discard_message(&mut self, total: usize) -> Result<(), WireError> {
-        let mut remaining = total;
-        let buffered = remaining.min(self.buf.len());
+    /// Reads one DataRow of `total` bytes field by field: `max_value_bytes` of each field are kept, the rest is discarded.
+    async fn stream_row(
+        &mut self,
+        total: usize,
+        max_value_bytes: usize,
+    ) -> Result<Vec<Option<Field>>, WireError> {
+        self.buf.advance(HEADER_LEN);
+        let mut left = total
+            .checked_sub(HEADER_LEN)
+            .ok_or_else(|| protocol("data row is too short"))?;
+        let mut count = [0u8; 2];
+        left = left
+            .checked_sub(count.len())
+            .ok_or_else(|| protocol("data row is truncated"))?;
+        self.read_exact_into(&mut count).await?;
+        let mut fields = Vec::with_capacity(usize::from(u16::from_be_bytes(count)));
+        let mut held = 0usize;
+        for _ in 0..u16::from_be_bytes(count) {
+            let mut word = [0u8; 4];
+            left = left
+                .checked_sub(word.len())
+                .ok_or_else(|| protocol("data row is truncated"))?;
+            self.read_exact_into(&mut word).await?;
+            let length = i32::from_be_bytes(word);
+            if length == -1 {
+                fields.push(None);
+                continue;
+            }
+            let full = usize::try_from(length)
+                .map_err(|_| protocol("data row field has a negative length"))?;
+            if full > left {
+                return Err(protocol("data row field is longer than the message"));
+            }
+            left -= full;
+            let kept = full.min(max_value_bytes);
+            let mut data = vec![0u8; kept];
+            self.read_exact_into(&mut data).await?;
+            self.discard(full - kept).await?;
+            held += kept;
+            fields.push(Some(Field {
+                data: Bytes::from(data),
+                full_len: full,
+            }));
+        }
+        if left != 0 {
+            return Err(protocol("data row is longer than its fields"));
+        }
+        self.peak_message_bytes = self.peak_message_bytes.max(held);
+        Ok(fields)
+    }
+
+    /// Fills `out` from the stream, buffered bytes first.
+    async fn read_exact_into(&mut self, out: &mut [u8]) -> Result<(), WireError> {
+        let from_buf = out.len().min(self.buf.len());
+        out[..from_buf].copy_from_slice(&self.buf[..from_buf]);
+        self.buf.advance(from_buf);
+        let mut filled = from_buf;
+        while filled < out.len() {
+            let read = self.stream.read(&mut out[filled..]).await?;
+            if read == 0 {
+                return Err(eof());
+            }
+            filled += read;
+        }
+        Ok(())
+    }
+
+    /// Drops the next `count` bytes of the stream in SKIP_CHUNK steps, using buffered bytes first.
+    async fn discard(&mut self, count: usize) -> Result<(), WireError> {
+        let buffered = count.min(self.buf.len());
         self.buf.advance(buffered);
-        remaining -= buffered;
-        let mut chunk = vec![0u8; SKIP_CHUNK];
+        let mut remaining = count - buffered;
+        let mut chunk = vec![0u8; SKIP_CHUNK.min(remaining)];
         while remaining > 0 {
             let want = remaining.min(SKIP_CHUNK);
             let read = self.stream.read(&mut chunk[..want]).await?;
@@ -503,6 +577,119 @@ impl Connection {
             )));
         }
         self.execute(params, limits, columns).await
+    }
+
+    async fn explain_unbound_inner(
+        &mut self,
+        sql: &str,
+        max_bytes: usize,
+    ) -> Result<QueryResult, WireError> {
+        if sql.contains('\0') {
+            return Err(nul_refusal());
+        }
+        self.explain_preflight(sql).await?;
+        let mut out = BytesMut::new();
+        frontend::query(sql, &mut out).map_err(protocol)?;
+        self.send(&mut out).await?;
+
+        let skip = Skip::Rows {
+            max_value_bytes: max_bytes,
+        };
+        let mut columns: Option<Vec<Column>> = None;
+        let mut rows = Vec::new();
+        let mut plan_bytes = 0usize;
+        let mut tags = Vec::new();
+        let mut empty = false;
+        let mut error = None;
+        let status = loop {
+            let incoming = match self.recv_frame(skip).await? {
+                Frame::Message(incoming) => incoming,
+                Frame::Row { fields, .. } => {
+                    if columns.is_none() {
+                        return Err(explain_shape("data row before the row description"));
+                    }
+                    for field in fields.iter().flatten() {
+                        plan_bytes = plan_bytes.saturating_add(field.full_len);
+                    }
+                    if plan_bytes > max_bytes {
+                        self.poisoned = true;
+                        return Err(WireError::Refused("plan too large".into()));
+                    }
+                    rows.push(fields);
+                    continue;
+                }
+            };
+            match incoming.message {
+                Message::RowDescription(body) => {
+                    if columns.is_some() {
+                        return Err(explain_shape("more than one row description"));
+                    }
+                    columns = Some(column_list(&body)?);
+                }
+                Message::CommandComplete(body) => {
+                    tags.push(body.tag().map_err(protocol)?.to_owned());
+                }
+                Message::EmptyQueryResponse => empty = true,
+                Message::ErrorResponse(body) => {
+                    if error.is_none() {
+                        error = Some(db_error(&body)?);
+                    }
+                }
+                Message::ReadyForQuery(body) => break tx_status(body.status())?,
+                _ => return Err(unexpected(incoming.tag)),
+            }
+        };
+        if let Some(e) = error {
+            return Err(WireError::Db(e));
+        }
+        let columns = columns.ok_or_else(|| explain_shape("no row description"))?;
+        if empty || tags != ["EXPLAIN"] || status != TxStatus::InTransaction {
+            return Err(explain_shape("unexpected response to the explain query"));
+        }
+        Ok(QueryResult {
+            columns,
+            rows,
+            truncated: None,
+            command_tag: tags.pop(),
+            status,
+        })
+    }
+
+    /// Parse + Describe + Sync on the unnamed statement. Succeeds only for one statement that returns rows.
+    async fn explain_preflight(&mut self, sql: &str) -> Result<(), WireError> {
+        let mut out = BytesMut::new();
+        frontend::parse("", sql, std::iter::empty(), &mut out).map_err(protocol)?;
+        frontend::describe(b'S', "", &mut out).map_err(protocol)?;
+        frontend::sync(&mut out);
+        self.send(&mut out).await?;
+
+        let mut parsed = false;
+        let mut described = false;
+        let mut error = None;
+        let status = loop {
+            let incoming = self.recv().await?;
+            match incoming.message {
+                Message::ParseComplete => parsed = true,
+                Message::ParameterDescription(_) | Message::NoData => {}
+                Message::RowDescription(_) => described = true,
+                Message::ErrorResponse(body) => {
+                    if error.is_none() {
+                        error = Some(db_error(&body)?);
+                    }
+                }
+                Message::ReadyForQuery(body) => break tx_status(body.status())?,
+                _ => return Err(unexpected(incoming.tag)),
+            }
+        };
+        if let Some(e) = error {
+            return Err(WireError::Db(e));
+        }
+        if parsed && described && status == TxStatus::InTransaction {
+            return Ok(());
+        }
+        Err(explain_shape(
+            "unexpected response to the explain preflight",
+        ))
     }
 
     /// Parse + Describe on the unnamed statement. Returns the columns (None for NoData) and the parameter count.
@@ -589,25 +776,22 @@ impl Connection {
         let mut error = None;
         let mut status = None;
         let skip = Skip::Rows {
-            row_cap: row_cap(limits),
+            max_value_bytes: limits.max_value_bytes,
         };
         loop {
             let incoming = match self.recv_frame(skip).await? {
                 Frame::Message(incoming) => incoming,
-                Frame::SkippedRow { .. } if bound => {
-                    truncated = Some(Truncation::Bytes);
-                    break;
-                }
-                Frame::SkippedRow { .. } => return Err(unexpected(b'D')),
-            };
-            match incoming.message {
-                Message::BindComplete if !bound => bound = true,
-                Message::DataRow(body) if bound => {
-                    if let Some(t) = keep_row(&body, &mut rows, &mut kept, limits)? {
+                Frame::Row { fields, .. } if bound => {
+                    if let Some(t) = keep_row(fields, &mut rows, &mut kept, limits) {
                         truncated = Some(t);
                         break;
                     }
+                    continue;
                 }
+                Frame::Row { .. } => return Err(unexpected(b'D')),
+            };
+            match incoming.message {
+                Message::BindComplete if !bound => bound = true,
                 Message::CommandComplete(body) => {
                     command_tag = Some(body.tag().map_err(protocol)?.to_owned());
                 }
@@ -670,7 +854,7 @@ impl Connection {
             let frame = self.recv_frame(skip).await?;
             let len = match &frame {
                 Frame::Message(incoming) => incoming.len,
-                Frame::SkippedRow { len } => *len,
+                Frame::Row { len, .. } => *len,
             };
             discarded = discarded.saturating_add(len);
             if discarded > DISCARD_MAX_BYTES {
@@ -1048,38 +1232,32 @@ fn text_row(body: &DataRowBody) -> Result<Vec<Option<String>>, WireError> {
     Ok(row)
 }
 
-/// Keeps one DataRow within the limits. Returns the truncation when this row must not be kept.
+/// Keeps one streamed row within the limits. Returns the truncation when this row must not be kept.
 fn keep_row(
-    body: &DataRowBody,
+    fields: Vec<Option<Field>>,
     rows: &mut Vec<Vec<Option<Field>>>,
     kept: &mut usize,
     limits: &FetchLimits,
-) -> Result<Option<Truncation>, WireError> {
+) -> Option<Truncation> {
     if rows.len() >= limits.max_rows {
-        return Ok(Some(Truncation::Rows));
+        return Some(Truncation::Rows);
     }
-    let mut fields = Vec::new();
-    let mut row_bytes = 0usize;
-    for value in field_slices(body)? {
-        fields.push(value.map(|bytes| {
-            let keep = bytes.len().min(limits.max_value_bytes);
-            row_bytes += keep;
-            Field {
-                data: Bytes::copy_from_slice(&bytes[..keep]),
-                full_len: bytes.len(),
-            }
-        }));
-    }
+    let row_bytes: usize = fields.iter().flatten().map(|f| f.data.len()).sum();
     if *kept + row_bytes > limits.max_bytes {
         if rows.is_empty() {
             *kept += row_bytes;
             rows.push(fields);
         }
-        return Ok(Some(Truncation::Bytes));
+        return Some(Truncation::Bytes);
     }
     *kept += row_bytes;
     rows.push(fields);
-    Ok(None)
+    None
+}
+
+/// A response the explain path does not accept. Logged by `explain_unbound`, which never logs SQL text.
+fn explain_shape(reason: &'static str) -> WireError {
+    protocol(reason)
 }
 
 fn eof() -> WireError {

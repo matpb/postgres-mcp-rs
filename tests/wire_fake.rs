@@ -3,12 +3,19 @@
 
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use postgres_mcp::pg::pool::{Pool, PoolError};
 use postgres_mcp::pg::tls::SslMode;
 use postgres_mcp::pg::wire::{
-    AuthPolicy, ConnectConfig, Connection, DbError, FetchLimits, Truncation, TxStatus, WireError,
+    AuthPolicy, ConnectConfig, Connection, DbError, FetchLimits, QueryResult, Truncation, TxStatus,
+    WireError,
 };
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+mod common;
+use common::{app, call_tool, config_with, db_entry, result_of};
 
 const PASSWORD: &str = "fake-server-pw-9f2";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -841,8 +848,8 @@ async fn notice_and_notification_between_rows_are_skipped() {
 }
 
 #[tokio::test]
-async fn oversized_data_row_is_skipped_not_buffered() {
-    // The row cap is max(64 KiB, 4 * max_bytes + 1 MiB), so 1 MiB here.
+async fn oversized_data_row_keeps_its_prefix_and_stops_at_the_budget() {
+    // A 3 MiB value with 1 MiB kept per value and a zero byte budget: the first row is kept and truncated.
     let big = vec![b'x'; 3 << 20];
     let mut steps = startup_ok();
     steps.extend(describe_one_int4());
@@ -861,7 +868,10 @@ async fn oversized_data_row_is_skipped_not_buffered() {
         .query("SELECT 1", &[], false, &limits(0))
         .await
         .expect("truncated query");
-    assert!(r.rows.is_empty());
+    assert_eq!(r.rows.len(), 1);
+    let field = r.rows[0][0].as_ref().expect("value");
+    assert_eq!(field.data.len(), 1 << 20);
+    assert_eq!(field.full_len, 3 << 20);
     assert_eq!(r.truncated, Some(Truncation::Bytes));
     assert_eq!(r.command_tag, None);
     assert_eq!(r.status, TxStatus::Idle);
@@ -871,4 +881,349 @@ async fn oversized_data_row_is_skipped_not_buffered() {
         conn.peak_message_bytes()
     );
     assert!(!conn.is_poisoned());
+}
+
+#[tokio::test]
+async fn data_row_field_longer_than_the_message_is_protocol_error_and_poisons() {
+    // One field declares 100 bytes, but the message holds 10 after its length word.
+    let mut body = 1u16.to_be_bytes().to_vec();
+    body.extend_from_slice(&100i32.to_be_bytes());
+    body.extend_from_slice(b"0123456789");
+    let mut steps = startup_ok();
+    steps.extend(describe_one_int4());
+    steps.extend([
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::Write(bind_complete()),
+        Step::Write(frame(b'D', &body)),
+    ]);
+    let (port, _task) = spawn_server(steps).await;
+    let mut conn = Connection::connect(&cfg(port)).await.expect("connect");
+    let err = conn
+        .query("SELECT 1", &[], false, &limits(1 << 20))
+        .await
+        .expect_err("bad row");
+    assert_same(
+        &err,
+        WireError::Protocol("data row field is longer than the message".into()),
+    );
+    assert!(conn.is_poisoned());
+}
+
+/// Startup with an MD5 challenge, then the password is accepted: AuthenticationOk and ReadyForQuery.
+fn md5_accepted_steps() -> Vec<Step> {
+    vec![
+        Step::ReadUntagged,
+        Step::Write(auth_md5([1, 2, 3, 4])),
+        Step::ReadTagged,
+        Step::Write(auth_ok()),
+        Step::Write(backend_key_data()),
+        Step::Write(ready(b'I')),
+    ]
+}
+
+/// The MD5 password is accepted, the session check is answered with an error: the auth step is over.
+fn md5_accepted_then_session_refused() -> Vec<Step> {
+    let mut steps = md5_accepted_steps();
+    steps.extend([
+        Step::ReadTagged,
+        Step::Write(error_response(
+            "0A000",
+            "fake server reached the session check",
+        )),
+        Step::Write(ready(b'I')),
+    ]);
+    steps
+}
+
+#[tokio::test]
+async fn pool_with_md5_policy_answers_md5_challenge() {
+    // Same expected hash as md5_challenge_answered_when_policy_allows_it (salt 1,2,3,4).
+    let (port, task) = spawn_server(md5_accepted_steps()).await;
+    let pool = Pool::with_auth(cfg(port), 1, pol(true, true, false, true));
+    let lease = pool
+        .checkout(TIMEOUT)
+        .await
+        .expect("pool with md5 policy must connect");
+    drop(lease);
+    let recorded = task.await.expect("server task");
+    let sent = tagged(&recorded, 1);
+    assert_eq!(sent.len(), 1, "one password message");
+    assert_eq!(sent[0].0, b'p');
+    let mut want = b"md52021dcc237c9fcc2d7eb7484af91ea4d".to_vec();
+    want.push(0);
+    assert_eq!(sent[0].1, want);
+}
+
+#[tokio::test]
+async fn default_pool_refuses_md5_challenge() {
+    let (port, _task) = spawn_server(vec![
+        Step::ReadUntagged,
+        Step::Write(auth_md5([1, 2, 3, 4])),
+    ])
+    .await;
+    let pool = Pool::new(cfg(port), 1);
+    match pool.checkout(TIMEOUT).await {
+        Err(PoolError::Connect(text)) => assert_eq!(text, "authentication failed"),
+        Err(other) => panic!("expected a connect refusal, got {other:?}"),
+        Ok(_) => panic!("the default pool answered an MD5 challenge"),
+    }
+}
+
+/// A PG_DATABASES entry on the fake server, with `require_auth` set when given.
+fn fake_entry(port: u16, require_auth: Option<&str>) -> serde_json::Value {
+    let mut entry = db_entry("fake", port);
+    if let Some(methods) = require_auth {
+        entry["require_auth"] = json!(methods);
+    }
+    entry
+}
+
+#[tokio::test]
+async fn list_databases_with_require_auth_md5_reaches_the_session_check() {
+    let (port, _task) = spawn_server(md5_accepted_then_session_refused()).await;
+    let app = app(config_with(&[fake_entry(port, Some("md5"))], &[]));
+    let response = call_tool(&app, "list_databases", json!({})).await;
+    let database = &result_of(&response)["structuredContent"]["databases"][0];
+    assert_eq!(database["reachable"], json!(false), "{database}");
+    assert_eq!(
+        database["error"],
+        json!("PostgreSQL error 0A000: fake server reached the session check"),
+        "{database}"
+    );
+}
+
+#[tokio::test]
+async fn list_databases_without_require_auth_refuses_md5() {
+    let (port, _task) = spawn_server(vec![
+        Step::ReadUntagged,
+        Step::Write(auth_md5([1, 2, 3, 4])),
+    ])
+    .await;
+    let app = app(config_with(&[fake_entry(port, None)], &[]));
+    let response = call_tool(&app, "list_databases", json!({})).await;
+    let database = &result_of(&response)["structuredContent"]["databases"][0];
+    assert_eq!(database["reachable"], json!(false), "{database}");
+    assert_eq!(
+        database["error"],
+        json!("Database \"fake\" is unavailable: authentication failed"),
+        "{database}"
+    );
+}
+
+/// The tagged frontend messages the client sent, after its untagged startup message.
+fn client_tags(recorded: &[u8]) -> Vec<u8> {
+    let mut tags = Vec::new();
+    let mut at = u32::from_be_bytes([recorded[0], recorded[1], recorded[2], recorded[3]]) as usize;
+    while at + 5 <= recorded.len() {
+        tags.push(recorded[at]);
+        let len = u32::from_be_bytes([
+            recorded[at + 1],
+            recorded[at + 2],
+            recorded[at + 3],
+            recorded[at + 4],
+        ]) as usize;
+        at += 1 + len;
+    }
+    tags
+}
+
+/// Preflight answered as one statement that returns rows: ParseComplete, RowDescription, ReadyForQuery 'T'.
+fn explain_preflight_ok() -> Vec<Step> {
+    vec![
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::Write(parse_complete()),
+        Step::Write(parameter_description(&[])),
+        Step::Write(row_description(&[("QUERY PLAN", 25)])),
+        Step::Write(ready(b'T')),
+    ]
+}
+
+#[tokio::test]
+async fn explain_preflight_error_sends_no_query_message() {
+    let mut steps = startup_ok();
+    steps.extend([
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::Write(error_response(
+            "42601",
+            "cannot insert multiple commands into a prepared statement",
+        )),
+        Step::Write(ready(b'E')),
+    ]);
+    let (port, task) = spawn_server(steps).await;
+    let mut conn = Connection::connect(&cfg(port)).await.expect("connect");
+    let err = conn
+        .explain_unbound("EXPLAIN SELECT 1; CREATE TABLE t()", 1 << 20)
+        .await
+        .expect_err("preflight refused");
+    assert!(
+        matches!(err, WireError::Db(ref db) if db.code == "42601"),
+        "{err:?}"
+    );
+    assert!(!conn.is_poisoned());
+    let recorded = task.await.expect("server task");
+    assert_eq!(client_tags(&recorded), vec![b'P', b'D', b'S']);
+    assert!(!client_tags(&recorded).contains(&b'Q'));
+}
+
+#[tokio::test]
+async fn explain_preflight_without_row_description_sends_no_query_message() {
+    let mut steps = startup_ok();
+    steps.extend([
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::ReadTagged,
+        Step::Write(parse_complete()),
+        Step::Write(parameter_description(&[])),
+        Step::Write(frame(b'n', &[])),
+        Step::Write(ready(b'T')),
+    ]);
+    let (port, task) = spawn_server(steps).await;
+    let mut conn = Connection::connect(&cfg(port)).await.expect("connect");
+    let err = conn
+        .explain_unbound("CREATE TABLE t()", 1 << 20)
+        .await
+        .expect_err("no rows");
+    assert_same(
+        &err,
+        WireError::Protocol("unexpected response to the explain preflight".into()),
+    );
+    assert!(conn.is_poisoned());
+    let recorded = task.await.expect("server task");
+    assert!(!client_tags(&recorded).contains(&b'Q'));
+}
+
+#[tokio::test]
+async fn explain_returns_the_plan_rows_after_a_clean_preflight() {
+    let mut steps = startup_ok();
+    steps.extend(explain_preflight_ok());
+    steps.extend([
+        Step::ReadTagged,
+        Step::Write(row_description(&[("QUERY PLAN", 25)])),
+        Step::Write(data_row(&[b"Result  (cost=0.00..0.01 rows=1 width=4)"])),
+        Step::Write(command_complete("EXPLAIN")),
+        Step::Write(ready(b'T')),
+    ]);
+    let (port, task) = spawn_server(steps).await;
+    let mut conn = Connection::connect(&cfg(port)).await.expect("connect");
+    let r = conn
+        .explain_unbound("EXPLAIN SELECT 1", 1 << 20)
+        .await
+        .expect("plan");
+    assert_eq!(r.rows.len(), 1);
+    let field = r.rows[0][0].as_ref().expect("line");
+    assert_eq!(
+        field.data,
+        Bytes::from_static(b"Result  (cost=0.00..0.01 rows=1 width=4)")
+    );
+    assert_eq!(r.command_tag.as_deref(), Some("EXPLAIN"));
+    assert_eq!(r.status, TxStatus::InTransaction);
+    assert!(!conn.is_poisoned());
+    let recorded = task.await.expect("server task");
+    assert_eq!(client_tags(&recorded), vec![b'P', b'D', b'S', b'Q']);
+}
+
+/// Preflight passes, then the simple query is answered with `answer`.
+async fn explain_with_answer(answer: Vec<Vec<u8>>) -> (Result<QueryResult, WireError>, bool) {
+    let mut steps = startup_ok();
+    steps.extend(explain_preflight_ok());
+    steps.push(Step::ReadTagged);
+    steps.extend(answer.into_iter().map(Step::Write));
+    let (port, _task) = spawn_server(steps).await;
+    let mut conn = Connection::connect(&cfg(port)).await.expect("connect");
+    let result = conn.explain_unbound("EXPLAIN SELECT 1", 1 << 20).await;
+    let poisoned = conn.is_poisoned();
+    (result, poisoned)
+}
+
+#[tokio::test]
+async fn explain_two_command_completes_is_protocol_error_and_poisons() {
+    let answer = vec![
+        row_description(&[("QUERY PLAN", 25)]),
+        data_row(&[b"one"]),
+        command_complete("EXPLAIN"),
+        command_complete("EXPLAIN"),
+        ready(b'T'),
+    ];
+    let (result, poisoned) = explain_with_answer(answer).await;
+    assert_same(
+        &result.expect_err("two tags"),
+        WireError::Protocol("unexpected response to the explain query".into()),
+    );
+    assert!(poisoned);
+}
+
+#[tokio::test]
+async fn explain_ready_idle_after_the_plan_is_protocol_error_and_poisons() {
+    let answer = vec![
+        row_description(&[("QUERY PLAN", 25)]),
+        command_complete("EXPLAIN"),
+        ready(b'I'),
+    ];
+    let (result, poisoned) = explain_with_answer(answer).await;
+    assert_same(
+        &result.expect_err("idle"),
+        WireError::Protocol("unexpected response to the explain query".into()),
+    );
+    assert!(poisoned);
+}
+
+#[tokio::test]
+async fn explain_other_command_tag_is_protocol_error_and_poisons() {
+    let answer = vec![
+        row_description(&[("QUERY PLAN", 25)]),
+        command_complete("SELECT 1"),
+        ready(b'T'),
+    ];
+    let (result, poisoned) = explain_with_answer(answer).await;
+    assert_same(
+        &result.expect_err("tag"),
+        WireError::Protocol("unexpected response to the explain query".into()),
+    );
+    assert!(poisoned);
+}
+
+#[tokio::test]
+async fn explain_empty_query_response_is_protocol_error_and_poisons() {
+    let answer = vec![
+        row_description(&[("QUERY PLAN", 25)]),
+        frame(b'I', &[]),
+        command_complete("EXPLAIN"),
+        ready(b'T'),
+    ];
+    let (result, poisoned) = explain_with_answer(answer).await;
+    assert_same(
+        &result.expect_err("empty"),
+        WireError::Protocol("unexpected response to the explain query".into()),
+    );
+    assert!(poisoned);
+}
+
+#[tokio::test]
+async fn explain_plan_over_the_byte_cap_is_refused_and_poisons() {
+    let big = vec![b'p'; 2048];
+    let answer = vec![
+        row_description(&[("QUERY PLAN", 25)]),
+        data_row(&[&big]),
+        data_row(&[&big]),
+        command_complete("EXPLAIN"),
+        ready(b'T'),
+    ];
+    let mut steps = startup_ok();
+    steps.extend(explain_preflight_ok());
+    steps.push(Step::ReadTagged);
+    steps.extend(answer.into_iter().map(Step::Write));
+    let (port, _task) = spawn_server(steps).await;
+    let mut conn = Connection::connect(&cfg(port)).await.expect("connect");
+    let err = conn
+        .explain_unbound("EXPLAIN SELECT 1", 3000)
+        .await
+        .expect_err("too large");
+    assert_same(&err, WireError::Refused("plan too large".into()));
+    assert!(conn.is_poisoned());
 }

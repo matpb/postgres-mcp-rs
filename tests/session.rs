@@ -6,13 +6,10 @@ use postgres_mcp::pg::pool::Pool;
 use postgres_mcp::pg::session::{RunError, RunOutput, SessionSettings, run_readonly};
 use postgres_mcp::pg::tls::SslMode;
 use postgres_mcp::pg::wire::{ConnectConfig, Connection, FetchLimits, Truncation};
-use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 const HOST: &str = "127.0.0.1";
 const VERSIONS: [(u16, u32); 3] = [(15432, 18), (15433, 19), (15434, 15)];
-
-static SESS_TEST: OnceCell<()> = OnceCell::const_new();
 
 fn startup_params() -> Vec<(String, String)> {
     [
@@ -59,7 +56,6 @@ fn tuned(statement_timeout_ms: u64, max_rows: usize, pool_wait: Duration) -> Ses
         },
         pool_wait,
         search_path_catalog_only: false,
-        unbound: false,
     }
 }
 
@@ -143,58 +139,6 @@ async fn eventually_zero(port: u16, sql: &str) {
 
 const ACTIVE_SLEEP_10: &str = "SELECT count(*) FROM pg_stat_activity \
     WHERE application_name = 'pgmcp-session-test' AND query LIKE '%pg_sleep(10)%' AND state = 'active'";
-
-fn sess_test_sql() -> String {
-    let mut sql = String::from(
-        "CREATE SCHEMA IF NOT EXISTS sess_test; \
-         CREATE EXTENSION IF NOT EXISTS hstore; \
-         CREATE EXTENSION IF NOT EXISTS citext;",
-    );
-    let mut add = |name: &str, create: &str| {
-        sql.push_str(&format!(
-            "DO $do$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type \
-             WHERE typname = '{name}' AND typnamespace = 'sess_test'::regnamespace) \
-             THEN {create}; END IF; END $do$; "
-        ));
-    };
-    add("mood", "CREATE TYPE sess_test.mood AS ENUM ('sad', 'ok')");
-    add("posint", "CREATE DOMAIN sess_test.posint AS int");
-    add("pair", "CREATE TYPE sess_test.pair AS (a int, b text)");
-    add(
-        "typed",
-        "CREATE TABLE sess_test.typed (mood sess_test.mood, dom sess_test.posint, \
-         pr sess_test.pair, moods sess_test.mood[], r int4range, mr int4multirange, \
-         iv int2vector, boxes box[], hs hstore, ct citext)",
-    );
-    add("dchain1", "CREATE DOMAIN sess_test.dchain1 AS int");
-    for i in 2..=10 {
-        add(
-            &format!("dchain{i}"),
-            &format!(
-                "CREATE DOMAIN sess_test.dchain{i} AS sess_test.dchain{}",
-                i - 1
-            ),
-        );
-    }
-    sql.push_str(
-        "GRANT USAGE ON SCHEMA sess_test TO mcp_ro; GRANT SELECT ON sess_test.typed TO mcp_ro;",
-    );
-    sql
-}
-
-/// Creates the sess_test objects once per test process, as superuser.
-async fn ensure_sess_test() {
-    SESS_TEST
-        .get_or_init(|| async {
-            let mut conn = Connection::connect(&superuser_config(15432))
-                .await
-                .expect("superuser connect");
-            conn.simple_query(&sess_test_sql())
-                .await
-                .expect("sess_test setup");
-        })
-        .await;
-}
 
 async fn oid_of(port: u16, typname: &str) -> u32 {
     scalar(
@@ -574,7 +518,6 @@ async fn runaway_recursive_cte_is_bounded() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn types_resolved_for_non_builtin() {
-    ensure_sess_test().await;
     let pool = pool(15432, 1);
     let out = run(&pool, "SELECT * FROM sess_test.typed")
         .await
@@ -626,7 +569,6 @@ async fn types_resolved_for_non_builtin() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn domain_chains_are_depth_limited() {
-    ensure_sess_test().await;
     let pool = pool(15432, 1);
     let short = oid_of(15432, "dchain3").await;
     let long = oid_of(15432, "dchain10").await;
@@ -671,7 +613,6 @@ async fn builtin_types_need_no_lookup() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn type_cache_is_reused() {
-    ensure_sess_test().await;
     let source = pool(15432, 1);
     let out = run(&source, "SELECT * FROM sess_test.typed")
         .await

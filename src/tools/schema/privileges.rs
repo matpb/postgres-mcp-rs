@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use super::{NON_SYSTEM, ToolError, finish, run_rows, section};
 use crate::server::AppState;
 use crate::tools::Call;
+use crate::tools::logs::query::log_reader_flags;
 
 /// The predefined roles reported in predefinedRoles, with their JSON keys.
 const PREDEFINED_ROLES: [(&str, &str); 7] = [
@@ -55,18 +56,20 @@ fn schemas_sql() -> String {
 }
 
 /// The monitoring and server-log features, as flags; the JSON and the GRANT texts are built from them.
-const FEATURES_SQL: &str = "SELECT pg_catalog.quote_ident(current_user) AS who, \
+fn features_sql() -> String {
+    let flags = log_reader_flags();
+    format!(
+        "SELECT pg_catalog.quote_ident(current_user) AS who, \
     CASE WHEN pg_catalog.to_regrole('pg_read_all_stats') IS NULL THEN false \
         ELSE pg_catalog.pg_has_role(current_user, 'pg_read_all_stats', 'USAGE') END AS \"queryText\", \
     EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'pg_stat_statements') AS \"pgssInstalled\", \
     COALESCE((SELECT pg_catalog.has_table_privilege(c.oid, 'SELECT') FROM pg_catalog.pg_extension e \
         JOIN pg_catalog.pg_class c ON c.relnamespace = e.extnamespace AND c.relname = 'pg_stat_statements' \
         WHERE e.extname = 'pg_stat_statements'), false) AS \"pgssSelect\", \
-    CASE WHEN pg_catalog.to_regprocedure('pgmcp.read_log_file(text,bigint,integer)') IS NULL \
-        OR pg_catalog.to_regnamespace('pgmcp') IS NULL THEN false \
-        ELSE pg_catalog.has_function_privilege(pg_catalog.to_regprocedure('pgmcp.read_log_file(text,bigint,integer)'), 'EXECUTE') \
-            AND pg_catalog.has_schema_privilege('pgmcp', 'USAGE') END AS \"logReader\", \
-    (SELECT e.extversion::text FROM pg_catalog.pg_extension e WHERE e.extname = 'timescaledb') AS \"timescaleVersion\"";
+    (SELECT f.installed AND f.allowed AND f.authentic FROM (SELECT {flags}) AS f) AS \"logReader\", \
+    (SELECT e.extversion::text FROM pg_catalog.pg_extension e WHERE e.extname = 'timescaledb') AS \"timescaleVersion\""
+    )
+}
 
 /// One predefined role's membership as a boolean; false when the role does not exist on this version.
 fn member_of(role: &str) -> String {
@@ -213,7 +216,7 @@ async fn features(
     ct: &CancellationToken,
     errors: &mut Map<String, Value>,
 ) -> Option<Value> {
-    match run_rows(state, database, FEATURES_SQL, &[], ct).await {
+    match run_rows(state, database, &features_sql(), &[], ct).await {
         Ok((_, rows)) => Some(rows.first().map_or(Value::Null, feature_values)),
         Err(error) => {
             errors.insert("featuresError".to_owned(), Value::String(error.message()));

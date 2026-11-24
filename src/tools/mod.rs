@@ -3,6 +3,7 @@
 pub mod core;
 pub mod envelope;
 pub mod logs;
+pub mod mask;
 pub mod monitor;
 pub mod schema;
 // text.rs is committed unformatted and must not be edited; rustfmt leaves it alone.
@@ -28,7 +29,9 @@ use crate::audit;
 use crate::config::{DatabaseConfig, Toolsets};
 use crate::gate::{self, Accepted, GateOptions, StatementKind};
 use crate::pg::pool::Pool;
-use crate::pg::session::{RunError, RunOutput, SessionSettings, run_readonly};
+use crate::pg::session::{
+    RunError, RunOutput, SessionSettings, run_readonly, run_readonly_explain_generic,
+};
 use crate::pg::wire::{DbError, FetchLimits};
 use crate::server::AppState;
 use envelope::QueryEnvelope;
@@ -157,8 +160,6 @@ pub struct Statement<'a> {
     pub offset: u32,
     /// True when the server's own catalog SQL runs; false for user SQL, which keeps the role's search_path.
     pub search_path_catalog_only: bool,
-    /// Runs without bind values through the simple protocol; see `SessionSettings::unbound`.
-    pub unbound: bool,
 }
 
 /// Runs SQL for the tools: user SQL through the gate, internal SQL without it.
@@ -193,7 +194,6 @@ impl<'a> Runner<'a> {
             fetch: user_fetch(limits.max_rows, self.state),
             offset: 0,
             search_path_catalog_only: false,
-            unbound: false,
         };
         let output = run(db, &pool, statement, ct).await?;
         Ok(envelope::build(
@@ -219,7 +219,6 @@ impl<'a> Runner<'a> {
             fetch: user_fetch(INTERNAL_MAX_ROWS, self.state),
             offset: 0,
             search_path_catalog_only: true,
-            unbound: false,
         };
         let (name, output) = self.internal_raw(database, statement, ct).await?;
         Ok(envelope::build(
@@ -241,6 +240,23 @@ impl<'a> Runner<'a> {
         let output = run(db, &pool, statement, ct).await?;
         Ok((db.name.clone(), output))
     }
+
+    /// Runs a generic-plan EXPLAIN text through the simple protocol behind the server-side preflight.
+    pub async fn internal_generic(
+        &self,
+        database: Option<&str>,
+        sql: &str,
+        fetch: FetchLimits,
+        offset: u32,
+        ct: &CancellationToken,
+    ) -> Result<(String, RunOutput), ToolError> {
+        let (db, pool) = self.state.pool(database)?;
+        let settings = session_settings(db, fetch, false);
+        let output = run_readonly_explain_generic(&pool, sql, &settings, ct)
+            .await
+            .map_err(|e| ToolError::from_run(e, &db.name, offset))?;
+        Ok((db.name.clone(), output))
+    }
 }
 
 fn user_fetch(max_rows: usize, state: &AppState) -> FetchLimits {
@@ -251,20 +267,27 @@ fn user_fetch(max_rows: usize, state: &AppState) -> FetchLimits {
     }
 }
 
+fn session_settings(
+    db: &DatabaseConfig,
+    fetch: FetchLimits,
+    search_path_catalog_only: bool,
+) -> SessionSettings {
+    SessionSettings {
+        statement_timeout_ms: db.statement_timeout_ms,
+        lock_timeout_ms: db.lock_timeout_ms,
+        fetch,
+        pool_wait: POOL_WAIT,
+        search_path_catalog_only,
+    }
+}
+
 async fn run(
     db: &DatabaseConfig,
     pool: &Pool,
     statement: Statement<'_>,
     ct: &CancellationToken,
 ) -> Result<RunOutput, ToolError> {
-    let settings = SessionSettings {
-        statement_timeout_ms: db.statement_timeout_ms,
-        lock_timeout_ms: db.lock_timeout_ms,
-        fetch: statement.fetch,
-        pool_wait: POOL_WAIT,
-        search_path_catalog_only: statement.search_path_catalog_only,
-        unbound: statement.unbound,
-    };
+    let settings = session_settings(db, statement.fetch, statement.search_path_catalog_only);
     run_readonly(
         pool,
         statement.sql,

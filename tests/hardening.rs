@@ -3,8 +3,8 @@
 mod common;
 
 use common::{
-    DB_NAME, HOSTILE_SETUP, PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with,
-    db_entry, post_mcp, result_of, superuser_setup,
+    PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with, db_entry, post_mcp,
+    result_of,
 };
 use postgres_mcp::config::Config;
 use serde_json::{Value, json};
@@ -77,7 +77,6 @@ async fn listed_tool_names(router: &axum::Router) -> Vec<String> {
 
 #[tokio::test]
 async fn strict_role_user_sql_keeps_the_role_search_path() {
-    superuser_setup(PORT_18, DB_NAME, HOSTILE_SETUP).await;
     let router = app(strict_config(PORT_18));
 
     let hostile = call_tool(
@@ -106,7 +105,6 @@ async fn strict_role_user_sql_keeps_the_role_search_path() {
 async fn server_sql_does_not_run_hostile_public_functions() {
     let mut reached = Vec::new();
     for (port, timescale) in [(PORT_18, true), (PORT_19, false), (PORT_15, false)] {
-        superuser_setup(port, DB_NAME, HOSTILE_SETUP).await;
         let router = app(strict_config(port));
         let names = listed_tool_names(&router).await;
         let known: Vec<&str> = calls().iter().map(|(name, _, _)| *name).collect();

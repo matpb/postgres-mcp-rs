@@ -450,22 +450,28 @@ async fn explain(
     let prefix = explain_prefix(args);
     let offset = u32::try_from(prefix.chars().count()).unwrap_or(u32::MAX);
     let sql = format!("{prefix}{}", args.sql);
-    let statement = Statement {
-        sql: &sql,
-        params: &[],
-        user_sql: false,
-        fetch: FetchLimits {
-            max_rows: INTERNAL_MAX_ROWS,
-            max_bytes: limits.max_response_bytes,
-            max_value_bytes: limits.max_response_bytes,
-        },
-        offset,
-        search_path_catalog_only: false,
-        unbound: args.generic_plan,
+    let fetch = FetchLimits {
+        max_rows: INTERNAL_MAX_ROWS,
+        max_bytes: limits.max_response_bytes,
+        max_value_bytes: limits.max_response_bytes,
     };
-    let (database, output) = runner
-        .internal_raw(args.database.as_deref(), statement, ct)
-        .await?;
+    let (database, output) = if args.generic_plan {
+        runner
+            .internal_generic(args.database.as_deref(), &sql, fetch, offset, ct)
+            .await?
+    } else {
+        let statement = Statement {
+            sql: &sql,
+            params: &[],
+            user_sql: false,
+            fetch,
+            offset,
+            search_path_catalog_only: false,
+        };
+        runner
+            .internal_raw(args.database.as_deref(), statement, ct)
+            .await?
+    };
     let RunOutput {
         result, elapsed, ..
     } = output;

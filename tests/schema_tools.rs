@@ -150,7 +150,8 @@ async fn list_schemas_hides_system_schemas_by_default() {
     sorted.sort();
     assert_eq!(names, sorted, "ordered by name");
     let shop = find(&schemas, "name", "shop");
-    assert_eq!(shop["tables"], 11, "{shop}");
+    // 11 original tables, shop.many_parts and shop."Odd.Name".
+    assert_eq!(shop["tables"], 13, "{shop}");
     assert_eq!(shop["views"], 2, "{shop}");
     assert_eq!(shop["functions"], 7, "{shop}");
     assert_eq!(shop["owner"], "postgres", "{shop}");
@@ -184,7 +185,7 @@ async fn list_schemas_as_strict_role_shows_only_usable_schemas() {
     }
     assert!(!names.contains(&"sess_test".to_owned()), "{names:?}");
     let shop = find(&schemas, "name", "shop");
-    assert_eq!(shop["tables"], 11, "counts do not depend on USAGE: {shop}");
+    assert_eq!(shop["tables"], 13, "counts do not depend on USAGE: {shop}");
 }
 
 // ---------------------------------------------------------------- list_objects
@@ -791,12 +792,19 @@ async fn describe_table_hypertable_is_a_table_on_15432() {
 #[tokio::test]
 async fn describe_table_name_resolution() {
     let router = app(one_db(PORT_18, &[]));
+    // app.orders exists too, so a bare name is ambiguous.
     let bare = call_on(&router, "describe_table", json!({"table": "orders"})).await;
-    assert_eq!(ok(&bare)["schema"], "shop");
+    assert_eq!(
+        error_text(&bare),
+        "Table \"orders\" exists in several schemas: app, shop. Pass schema."
+    );
     let qualified = call_on(&router, "describe_table", json!({"table": "shop.orders"})).await;
     assert_eq!(ok(&qualified)["name"], "orders");
     let quoted = call_on(&router, "describe_table", json!({"table": "\"orders\""})).await;
-    assert_eq!(ok(&quoted)["name"], "orders");
+    assert_eq!(
+        error_text(&quoted),
+        "Table \"\"orders\"\" exists in several schemas: app, shop. Pass schema."
+    );
     let with_schema = call_on(
         &router,
         "describe_table",
@@ -814,16 +822,19 @@ async fn describe_table_unknown_name_suggests_similar_tables() {
     let result = call_on(&router, "describe_table", json!({"table": "order"})).await;
     assert_eq!(
         error_text(&result),
-        "Table \"order\" not found. Did you mean: shop.open_orders, shop.order_items, shop.orders?"
+        "Table \"order\" not found. Did you mean: app.orders, shop.open_orders, shop.order_items, shop.orders?"
     );
     let wrong_schema = call_on(
         &router,
         "describe_table",
-        json!({"table": "orders", "schema": "app"}),
+        json!({"table": "open_orders", "schema": "app"}),
     )
     .await;
     let text = error_text(&wrong_schema);
-    assert!(text.starts_with("Table \"orders\" not found."), "{text}");
+    assert!(
+        text.starts_with("Table \"open_orders\" not found."),
+        "{text}"
+    );
     let sequence = call_on(&router, "describe_table", json!({"table": "invoice_seq"})).await;
     assert!(error_text(&sequence).starts_with("Table \"invoice_seq\" not found."));
 }
@@ -998,7 +1009,8 @@ async fn search_ranks_exact_then_prefix_then_substring_then_comment() {
     let first = &array(&ok(&exact)["matches"], "matches")[0].clone();
     assert_eq!(first["kind"], "table");
     assert_eq!(first["name"], "orders");
-    assert_eq!(first["schema"], "shop");
+    // app.orders and shop.orders are both exact matches; ties sort by schema name.
+    assert_eq!(first["schema"], "app");
 
     let prefix = call_on(&router, "search_schema", json!({"query": "order"})).await;
     let matches = array(&ok(&prefix)["matches"], "matches").clone();
@@ -1189,7 +1201,7 @@ async fn privileges_read_only_role_on_15432() {
     assert_eq!(body["beyondReadOnly"], json!([]));
     let schemas = array(&body["schemas"], "schemas").clone();
     let shop = find(&schemas, "name", "shop");
-    assert_eq!(shop["selectableTables"], 11);
+    assert_eq!(shop["selectableTables"], 13);
     assert_eq!(shop["unselectableTables"], 0);
 }
 
@@ -1205,6 +1217,22 @@ async fn privileges_without_pg_stat_statements_say_how_to_enable_it() {
     );
     assert_eq!(features["timescaledb"]["installed"], false);
     assert_eq!(features["timescaledb"]["version"], Value::Null);
+}
+
+/// The decoy log reader on database postgres (PostgreSQL 19) is owned by mcp_strict and is not SECURITY DEFINER.
+#[tokio::test]
+async fn privileges_decoy_log_reader_is_not_available() {
+    let mut entry = login(PORT_19, "mcp_ro", "test-only-ro");
+    entry["database"] = json!("postgres");
+    let router = app(config_with(&[entry], &[]));
+    let result = call_on(&router, "get_privileges", json!({})).await;
+    assert_eq!(
+        ok(&result)["features"]["serverLog"],
+        json!({
+            "available": false,
+            "missing": "Run sql/log_reader.sql as a superuser, then GRANT USAGE ON SCHEMA pgmcp TO mcp_ro; GRANT EXECUTE ON FUNCTION pgmcp.read_log_file(text, bigint, integer), pgmcp.list_log_files() TO mcp_ro;"
+        }),
+    );
 }
 
 #[tokio::test]
@@ -1330,7 +1358,7 @@ async fn list_schemas_across_all_three_servers() {
         let result = call(one_db(port, &[]), "list_schemas", json!({})).await;
         let schemas = array(&ok(&result)["schemas"], "schemas").clone();
         let shop = find(&schemas, "name", "shop");
-        assert_eq!(shop["tables"], 11, "port {port}");
+        assert_eq!(shop["tables"], 13, "port {port}");
         assert_eq!(shop["views"], 2, "port {port}");
     }
 }
@@ -1479,4 +1507,110 @@ async fn privileges_report_session_user() {
     assert_eq!(ok(&result)["role"]["sessionUser"], "mcp_ro");
     assert_eq!(ok(&result)["role"]["inherit"], true);
     assert_eq!(ok(&result)["role"]["connectionLimit"], 20);
+}
+
+/// The role with CONNECT, USAGE on app and SELECT on app.items only (docker/initdb/56_test_objects.sql).
+fn min_config(port: u16) -> Config {
+    config_as(port, "mcp_min", "test-only-min")
+}
+
+#[tokio::test]
+async fn privileges_min_role_reports_missing_grants() {
+    let router = app(min_config(PORT_18));
+    let result = call_on(&router, "get_privileges", json!({})).await;
+    let body = ok(&result).clone();
+    assert_eq!(body["role"]["name"], "mcp_min");
+    assert_eq!(body["predefinedRoles"]["pgReadAllStats"], false);
+    let features = &body["features"];
+    assert_eq!(
+        features["otherSessionsQueryText"],
+        json!({"available": false, "missing": "GRANT pg_read_all_stats TO mcp_min;"})
+    );
+    assert_eq!(
+        features["serverLog"],
+        json!({
+            "available": false,
+            "missing": "Run sql/log_reader.sql as a superuser, then GRANT USAGE ON SCHEMA pgmcp TO mcp_min; GRANT EXECUTE ON FUNCTION pgmcp.read_log_file(text, bigint, integer), pgmcp.list_log_files() TO mcp_min;"
+        })
+    );
+    // pg_stat_statements grants SELECT to PUBLIC, so the role can read the view.
+    assert_eq!(features["pgStatStatements"], json!({"available": true}));
+    assert_eq!(features["timescaledb"]["installed"], true);
+}
+
+#[tokio::test]
+async fn list_schemas_min_role_shows_only_usable_schemas() {
+    let router = app(min_config(PORT_18));
+    let result = call_on(&router, "list_schemas", json!({})).await;
+    let schemas = array(&ok(&result)["schemas"], "schemas").clone();
+    assert_eq!(names_of(&schemas), vec!["app", "public"], "{schemas:?}");
+}
+
+#[tokio::test]
+async fn describe_table_min_role_reads_its_own_table() {
+    let router = app(min_config(PORT_18));
+    let result = call_on(&router, "describe_table", json!({"table": "app.items"})).await;
+    let body = ok(&result).clone();
+    assert_eq!(body["schema"], "app");
+    assert_eq!(body["name"], "items");
+    assert_eq!(body["warnings"], json!([]), "{body}");
+}
+
+#[tokio::test]
+async fn describe_table_min_role_warns_it_cannot_select_other_schemas() {
+    let router = app(min_config(PORT_18));
+    let result = call_on(&router, "describe_table", json!({"table": "shop.orders"})).await;
+    let body = ok(&result).clone();
+    assert_eq!(body["name"], "orders");
+    assert_eq!(
+        body["warnings"],
+        json!(["The connected role cannot SELECT from this table."]),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn describe_table_lists_at_most_200_partitions() {
+    let router = app(one_db(PORT_18, &[]));
+    let result = call_on(
+        &router,
+        "describe_table",
+        json!({"table": "shop.many_parts"}),
+    )
+    .await;
+    let partitioning = &ok(&result)["partitioning"];
+    assert_eq!(
+        array(&partitioning["partitions"], "partitions").len(),
+        200,
+        "{partitioning}"
+    );
+    assert_eq!(partitioning["partitionsTruncated"], true, "{partitioning}");
+}
+
+#[tokio::test]
+async fn describe_table_quoted_name_with_dot_and_uppercase() {
+    let router = app(one_db(PORT_18, &[]));
+    let bare = call_on(
+        &router,
+        "describe_table",
+        json!({"table": "Odd.Name", "schema": "shop"}),
+    )
+    .await;
+    assert_eq!(ok(&bare)["name"], "Odd.Name");
+    assert_eq!(ok(&bare)["schema"], "shop");
+    let qualified = call_on(
+        &router,
+        "describe_table",
+        json!({"table": "shop.\"Odd.Name\""}),
+    )
+    .await;
+    assert_eq!(ok(&qualified)["name"], "Odd.Name");
+    let rows = call_on(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT \"Select\" FROM shop.\"Odd.Name\""}),
+    )
+    .await;
+    assert_eq!(ok(&rows)["columns"][0]["name"], "Select", "{rows}");
+    assert_eq!(ok(&rows)["rows"], json!([{"Select": 1}]), "{rows}");
 }

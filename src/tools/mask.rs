@@ -44,11 +44,7 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
         return match text.get(k) {
             Some(b'=') => {
                 let v = skip_spaces(text, k + 1);
-                let value_end = if text.get(v) == Some(&b'\'') {
-                    quoted_end(text, v)
-                } else {
-                    token_end(text, v)
-                };
+                let value_end = keyed_value_end(text, v);
                 out.extend_from_slice(&text[start..end]);
                 out.push(b'=');
                 out.extend_from_slice(MASK.as_bytes());
@@ -172,6 +168,16 @@ fn find_bytes(text: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|p| from + p)
 }
 
+/// Index just past the value of `key=value` that starts at `v`: a quoted, escape or unicode literal, or a bare token.
+fn keyed_value_end(text: &[u8], v: usize) -> usize {
+    match text.get(v..) {
+        Some([b'\'', ..]) => quoted_end(text, v),
+        Some([b'E' | b'e', b'\'', ..]) => escape_end(text, v + 1),
+        Some([b'U' | b'u', b'&', b'\'', ..]) => quoted_end(text, v + 2),
+        _ => token_end(text, v),
+    }
+}
+
 /// Index of the first byte that ends an unquoted value starting at `from`.
 fn token_end(text: &[u8], from: usize) -> usize {
     match text.get(from..) {
@@ -185,8 +191,9 @@ fn token_end(text: &[u8], from: usize) -> usize {
     }
 }
 
+/// Index of the first byte at or after `i` that is not whitespace, newlines included.
 fn skip_spaces(text: &[u8], mut i: usize) -> usize {
-    while matches!(text.get(i), Some(b' ' | b'\t')) {
+    while text.get(i).is_some_and(u8::is_ascii_whitespace) {
         i += 1;
     }
     i
@@ -258,6 +265,30 @@ mod tests {
         assert_eq!(
             mask("ALTER ROLE x PASSWORD 'p''w'"),
             "ALTER ROLE x PASSWORD '***'"
+        );
+    }
+
+    #[test]
+    fn escape_string_connection_value_with_spaces_is_masked() {
+        assert_eq!(
+            mask("host=h password=E'my secret' dbname=d"),
+            "host=h password=*** dbname=d"
+        );
+    }
+
+    #[test]
+    fn quoted_connection_value_with_spaces_around_equals_is_masked() {
+        assert_eq!(
+            mask("host=h password = 'my secret' dbname=d"),
+            "host=h password=*** dbname=d"
+        );
+    }
+
+    #[test]
+    fn password_keyword_then_newline_before_literal_is_masked() {
+        assert_eq!(
+            mask("ALTER ROLE x PASSWORD\n'hunter2'"),
+            "ALTER ROLE x PASSWORD\n'***'"
         );
     }
 

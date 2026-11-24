@@ -1,8 +1,7 @@
 //! read_server_log: entries from the PostgreSQL server log, or the log files and logging settings.
 
-mod mask;
 mod parse;
-mod query;
+pub(crate) mod query;
 mod scan;
 
 use rmcp::ErrorData as McpError;
@@ -13,6 +12,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::core::tool;
+use super::mask;
 use super::{Call, ToolError, Toolset, parse_args, text, value_of};
 use crate::server::AppState;
 use parse::{Entry, Format, rank};
@@ -273,26 +273,12 @@ async fn read(
     let db = args.database.as_deref();
     let database = state.pool(db)?.0.name.clone();
     let setup = query::setup(state, db, ct).await?;
-    if !setup.installed {
-        return Ok(unavailable(
-            database,
-            NOT_INSTALLED,
-            grant_text(&setup.role),
-        ));
-    }
-    if !setup.authentic {
-        return Ok(unavailable(
-            database,
-            NOT_AUTHENTIC,
-            grant_text(&setup.role),
-        ));
-    }
-    if !setup.allowed {
-        return Ok(unavailable(database, NO_PRIVILEGE, grant_text(&setup.role)));
+    if let Some(reason) = setup_reason(&setup) {
+        return Ok(unavailable(database, reason, grant_text(&setup.role)));
     }
     let listing = query::files(state, db, ct).await?;
-    if listing.is_empty() {
-        return Ok(unavailable(database, NO_FILES, ENABLE_LOGGING.to_owned()));
+    if let Some(reason) = listing_reason(listing.len()) {
+        return Ok(unavailable(database, reason, ENABLE_LOGGING.to_owned()));
     }
     if args.list_files.unwrap_or(false) {
         let settings = query::settings(state, db, ct).await?;
@@ -323,6 +309,24 @@ async fn read(
         output: scanned.into_result(&database, plan.format),
         entries: Some(count),
     })
+}
+
+/// The reason the log reader cannot be used, checked in order; None when the setup allows it.
+fn setup_reason(setup: &query::Setup) -> Option<&'static str> {
+    if !setup.installed {
+        Some(NOT_INSTALLED)
+    } else if !setup.authentic {
+        Some(NOT_AUTHENTIC)
+    } else if !setup.allowed {
+        Some(NO_PRIVILEGE)
+    } else {
+        None
+    }
+}
+
+/// The reason there is nothing to read when the log directory lists `files` files; None when it has some.
+fn listing_reason(files: usize) -> Option<&'static str> {
+    if files == 0 { Some(NO_FILES) } else { None }
 }
 
 /// The setup steps for the connected role.
@@ -667,8 +671,38 @@ fn to_output(entry: Entry, file: &str, max_value_bytes: usize, truncated: &mut u
 
 #[cfg(test)]
 mod tests {
-    use super::query::{LogFile, decode_bytea};
+    use super::query::{LogFile, Setup, decode_bytea};
     use super::*;
+
+    fn setup(installed: bool, authentic: bool, allowed: bool) -> Setup {
+        Setup {
+            installed,
+            authentic,
+            allowed,
+            role: "mcp_min".to_owned(),
+        }
+    }
+
+    #[test]
+    fn setup_reason_checks_installed_then_authentic_then_allowed() {
+        assert_eq!(
+            setup_reason(&setup(false, false, false)),
+            Some(NOT_INSTALLED)
+        );
+        assert_eq!(
+            setup_reason(&setup(true, false, false)),
+            Some(NOT_AUTHENTIC)
+        );
+        assert_eq!(setup_reason(&setup(true, true, false)), Some(NO_PRIVILEGE));
+        assert_eq!(setup_reason(&setup(true, true, true)), None);
+    }
+
+    #[test]
+    fn empty_log_directory_is_no_files_and_any_file_is_readable() {
+        assert_eq!(listing_reason(0), Some(NO_FILES));
+        assert_eq!(listing_reason(1), None);
+        assert_eq!(listing_reason(3), None);
+    }
 
     fn listed(name: &str, size: u64, format: Format) -> LogFile {
         LogFile {
