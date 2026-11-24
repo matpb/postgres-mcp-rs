@@ -1,0 +1,31 @@
+# Example deployment: builds the image from this repo and serves MCP on loopback only.
+services:
+  postgres-mcp:
+    build: .
+    image: postgres-mcp:local
+    environment:
+      # Example: postgres://reader:<password>@db.example.com:5432/app?sslmode=require
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      # Optional bearer key, at least 16 characters; empty leaves the endpoint open.
+      API_KEY: ${API_KEY:-}
+      # Optional limits, uncomment to pass them through from the host environment.
+      # MAX_ROWS: ${MAX_ROWS:-}
+      # MAX_VALUE_BYTES: ${MAX_VALUE_BYTES:-}
+      # MAX_RESPONSE_BYTES: ${MAX_RESPONSE_BYTES:-}
+      # MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-}
+      # MAX_SQL_BYTES: ${MAX_SQL_BYTES:-}
+      # MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-}
+      # STATEMENT_TIMEOUT_MS: ${STATEMENT_TIMEOUT_MS:-}
+    ports:
+      - "127.0.0.1:8432:8432"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "65532:65532"
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    pids_limit: 256
+    mem_limit: 512m
