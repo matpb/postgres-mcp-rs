@@ -12,12 +12,3 @@ tests/config.rs:generic-api-key:478
 tests/config.rs:generic-api-key:506
 tests/config.rs:generic-api-key:755
 tests/config.rs:private-key:1093
-# Not secrets: SIMD intrinsic names in the vendored xxhash of the ignored target/ build tree.
-target/debug/build/pg_query-134c96ce4e432f96/out/vendor/xxhash/xxhash.h:generic-api-key:3706
-target/debug/build/pg_query-134c96ce4e432f96/out/vendor/xxhash/xxhash.h:generic-api-key:3755
-target/debug/build/pg_query-134c96ce4e432f96/out/vendor/xxhash/xxhash.h:generic-api-key:3819
-target/debug/build/pg_query-134c96ce4e432f96/out/vendor/xxhash/xxhash.h:generic-api-key:3851
-target/release/build/pg_query-31c845f5fcf0370b/out/vendor/xxhash/xxhash.h:generic-api-key:3706
-target/release/build/pg_query-31c845f5fcf0370b/out/vendor/xxhash/xxhash.h:generic-api-key:3755
-target/release/build/pg_query-31c845f5fcf0370b/out/vendor/xxhash/xxhash.h:generic-api-key:3819
-target/release/build/pg_query-31c845f5fcf0370b/out/vendor/xxhash/xxhash.h:generic-api-key:3851
