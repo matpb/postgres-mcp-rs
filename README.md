@@ -23,7 +23,7 @@ There are three ways to run the server. Each one needs a PostgreSQL role for the
 Images for `linux/amd64` are published as `ghcr.io/matpb/postgres-mcp-rs` and `matpb/postgres-mcp-rs` on Docker Hub, tagged with the version and `latest`. Pull one and use its name in place of `postgres-mcp:local` below, or build the image from this repository. Then run it with the database URL and an API key:
 
 ```bash
-docker build -t postgres-mcp:local .   # or: docker pull ghcr.io/matpb/postgres-mcp-rs:0.1.6
+docker build -t postgres-mcp:local .   # or: docker pull ghcr.io/matpb/postgres-mcp-rs:0.1.7
 docker run -d --name postgres-mcp \
   -p 127.0.0.1:8432:8432 \
   -e 'DATABASE_URL=postgres://mcp_reader:change-me-reader-password@db.example.com:5432/appdb?sslmode=verify-full' \
@@ -46,6 +46,8 @@ The port is published on `127.0.0.1` only. Inside the container the server liste
 ### b) From source
 
 Building needs Rust 1.88 or newer and libclang (the SQL parser is built with bindgen). [CONTRIBUTING.md](CONTRIBUTING.md) lists the prerequisites.
+
+The crate is published on crates.io as `postgres-mcp-readonly`. `cargo install postgres-mcp-readonly --locked` installs the `postgres-mcp` binary and needs the same prerequisites. To build from a checkout instead:
 
 ```bash
 cargo build --release

@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.7]
+
+### Changed
+
+- The crate is named `postgres-mcp-readonly` on crates.io. The binary is still `postgres-mcp` and the library is still `postgres_mcp`.
+- Container images are published as `ghcr.io/matpb/postgres-mcp-rs` and `matpb/postgres-mcp-rs` on Docker Hub.
+
 ## [0.1.6]
 
 ### Fixed

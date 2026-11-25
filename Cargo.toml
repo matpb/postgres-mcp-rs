@@ -1,6 +1,6 @@
 [package]
-name = "postgres-mcp"
-version = "0.1.6"
+name = "postgres-mcp-readonly"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"

@@ -1277,8 +1277,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
 
 [[package]]
-name = "postgres-mcp"
-version = "0.1.6"
+name = "postgres-mcp-readonly"
+version = "0.1.7"
 dependencies = [
  "axum",
  "bytes",

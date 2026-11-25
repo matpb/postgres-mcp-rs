@@ -124,7 +124,7 @@ fn version_flag_prints_version() {
     assert!(output.status.success(), "{:?}", output.status);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "postgres-mcp 0.1.6\n"
+        "postgres-mcp 0.1.7\n"
     );
 }
 
