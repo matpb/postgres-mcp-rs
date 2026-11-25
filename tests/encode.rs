@@ -1,5 +1,6 @@
 use postgres_mcp::encode::{
-    EncodeLimits, EncodeStats, TypeInfo, TypeKind, builtin_type, dedup_columns, encode_value,
+    EncodeLimits, EncodeStats, TRUNCATION_MARK, TypeInfo, TypeKind, builtin_type, dedup_columns,
+    encode_value,
 };
 use proptest::collection::vec;
 use proptest::option;
@@ -825,4 +826,16 @@ fn an_md5_hash_straddling_the_wire_cut_of_a_bytea_cell_is_replaced_in_its_bytes(
     assert_eq!(decode_hex(shown), "xxxx [redacted password hash]");
     assert!(!decode_hex(shown).contains("md5"), "{text}");
     assert_eq!(st.truncated_values, 1);
+}
+
+/// A cut text value ends with the marker that the masks strip by the same constant.
+#[test]
+fn a_cut_text_value_ends_with_the_shared_truncation_marker() {
+    let (value, stats) = enc(25, &"x".repeat(2000));
+    let text = value.as_str().expect("text value");
+    assert!(
+        text.ends_with(&format!("{TRUNCATION_MARK}1024 of 2000 bytes]")),
+        "{text}"
+    );
+    assert_eq!(stats.truncated_values, 1);
 }

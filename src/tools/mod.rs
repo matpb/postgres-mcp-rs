@@ -371,9 +371,13 @@ pub fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, McpError> {
 /// The final pass over a tool result: hashes are replaced, string values are masked, and `redactedHashes` is the
 /// number of markers in the result, which the call's counter takes too.
 fn scrubbed(mut value: Value, tool: &str) -> Value {
-    // The envelope masks column names once; a second pass could change them away from the row keys.
+    // The columns get the hash scrubber only: the envelope masked their names once, and a second PASSWORD pass
+    // could move a name away from its row key.
     let names = if tool == "execute_query" {
-        value.get_mut("columns").map(std::mem::take)
+        value.get_mut("columns").map(|columns| {
+            scrub::scrub_value(columns);
+            std::mem::take(columns)
+        })
     } else {
         None
     };

@@ -29,6 +29,8 @@ pub struct EncodeStats {
     pub raw_fallbacks: u64,
 }
 
+/// The text that starts the marker after a cut value; the masks strip it by this same constant.
+pub const TRUNCATION_MARK: &str = "…[truncated: ";
 const MAX_SAFE_INTEGER: u128 = 9_007_199_254_740_991;
 
 /// Encodes one non-NULL value. `raw` may be a prefix of the value; `full_len` is its real length.
@@ -129,7 +131,7 @@ fn wire_truncated_bytea(
     stats.truncated_values += 1;
     let decoded_len = full_len.saturating_sub(2) / 2;
     Value::String(format!(
-        "\\x{}…[truncated: {keep} of {decoded_len} bytes]",
+        "\\x{}{TRUNCATION_MARK}{keep} of {decoded_len} bytes]",
         hex(&tail[..keep])
     ))
 }
@@ -189,7 +191,7 @@ fn bytea(text: &str, limits: &EncodeLimits, stats: &mut EncodeStats) -> Option<V
     let keep = scrub::cut_index(&decoded, cap);
     stats.truncated_values += 1;
     Some(Value::String(format!(
-        "\\x{}…[truncated: {keep} of {decoded_len} bytes]",
+        "\\x{}{TRUNCATION_MARK}{keep} of {decoded_len} bytes]",
         self::hex(&decoded[..keep])
     )))
 }
@@ -206,7 +208,7 @@ pub(super) fn text_value(s: &str, limits: &EncodeLimits, stats: &mut EncodeStats
     }
     stats.truncated_values += 1;
     Value::String(format!(
-        "{}…[truncated: {cut} of {} bytes]",
+        "{}{TRUNCATION_MARK}{cut} of {} bytes]",
         &s[..cut],
         s.len()
     ))
@@ -228,7 +230,7 @@ fn wire_truncated(raw: &[u8], full_len: usize, stats: &mut EncodeStats) -> Value
     let cut = scrub::cut_index(raw, valid);
     stats.truncated_values += 1;
     Value::String(format!(
-        "{}…[truncated: {cut} of {full_len} bytes]",
+        "{}{TRUNCATION_MARK}{cut} of {full_len} bytes]",
         String::from_utf8_lossy(&raw[..cut])
     ))
 }
@@ -242,7 +244,7 @@ fn hex_capped(raw: &[u8], limits: &EncodeLimits, stats: &mut EncodeStats) -> Val
     let keep = scrub::cut_index(raw, cap);
     stats.truncated_values += 1;
     Value::String(format!(
-        "\\x{}…[truncated: {keep} of {} bytes]",
+        "\\x{}{TRUNCATION_MARK}{keep} of {} bytes]",
         hex(&raw[..keep]),
         raw.len()
     ))

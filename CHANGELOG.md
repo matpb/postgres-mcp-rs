@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.6]
+
+### Fixed
+
+- An empty PASSWORD literal no longer hides the text after it or exposes a later password.
+- A nested empty PASSWORD literal no longer exposes the password that follows it.
+- A nested PASSWORD literal cut by the value limit one byte before its end is masked.
+- Type names in execute_query columns pass the hash scrubber again.
+- A comment between the word password and an equals sign is kept.
+
 ## [0.1.5]
 
 ### Fixed
@@ -12,6 +22,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Any amount of whitespace between PASSWORD and its literal is accepted; only comments count against the 256-byte limit.
 - Column names and row keys are the same string in every case.
 - The statement text of list_activity and query_stats and the entries of read_server_log mask a literal that follows PASSWORD and a comment.
+- A nested E''...'' PASSWORD literal is masked as E''***''.
 
 ## [0.1.4]
 

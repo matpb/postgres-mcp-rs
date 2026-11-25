@@ -2007,3 +2007,63 @@ async fn a_literal_after_a_comment_is_masked_in_list_activity() {
     assert!(query.contains("PASSWORD /* c */ '***'"), "{query}");
     assert!(!query.contains("hunter2"), "{query}");
 }
+
+/// A column type named like a password hash is scrubbed in columns[].type, and redactedHashes counts it.
+#[tokio::test]
+async fn a_type_name_shaped_like_a_hash_is_scrubbed_and_counted() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let response = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT t FROM hashes.\"SCRAM-SHA-256$4096:c2FsdA==$a2V5:a2V5\" AS t"}),
+    )
+    .await;
+    let content = &result_of(&response)["structuredContent"];
+    assert_eq!(
+        content["columns"][0]["type"],
+        json!(format!("hashes.{REDACTED}")),
+        "{response}"
+    );
+    assert_eq!(content["redactedHashes"], json!(1), "{response}");
+}
+
+/// A statement-level empty literal hides no later password, and the text after it is kept.
+#[tokio::test]
+async fn an_empty_literal_keeps_the_text_after_it_and_masks_the_next_password() {
+    let value =
+        returned_text("ALTER ROLE a PASSWORD ''; SELECT ''''; ALTER ROLE b PASSWORD 'hunter2'")
+            .await;
+    assert_eq!(
+        value,
+        "ALTER ROLE a PASSWORD '***'; SELECT ''''; ALTER ROLE b PASSWORD '***'"
+    );
+}
+
+/// No password survives a value cut at any offset near the limit, the nested literal included.
+#[tokio::test]
+async fn no_password_survives_a_value_cut_at_offsets_near_the_limit() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    for n in 4050..4060 {
+        let sql = format!(
+            "SELECT repeat('x', {n}) || $q$EXECUTE 'ALTER ROLE a PASSWORD ''hunter2'''; END$q$ AS v"
+        );
+        let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+        let value = result_of(&response)["structuredContent"]["rows"][0]["v"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(!value.contains("hunter2"), "cut at {n}: {value}");
+    }
+}
+
+/// A nested literal held in a comment of a running statement is masked in list_activity.
+#[tokio::test]
+async fn a_nested_literal_in_a_comment_is_masked_in_list_activity() {
+    let query = activity_query(
+        "comment_nested_probe",
+        "SELECT pg_sleep(4) /* EXECUTE 'ALTER ROLE app PASSWORD '')hunter2''' */",
+    )
+    .await;
+    assert!(query.contains("''***'''"), "{query}");
+    assert!(!query.contains("hunter2"), "{query}");
+}

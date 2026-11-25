@@ -77,7 +77,7 @@ fn the_security_docs_carry_the_layer_texts_exactly() {
     assert!(security.contains("- **TimescaleDB job configuration.** `list_jobs` returns each job's `config` as it is stored; only the hash scrubber and the PASSWORD literal mask run on its string values, so a secret under a key such as password is returned. Keep secrets out of job configuration."));
     assert!(security.contains("This holds for every role, superusers included."));
     assert!(security.contains("**19. Password hash scrubber.** Every tool result, resource body, completion and error text, and every log field that can carry text from the database, is scanned before it leaves the server, and text shaped like a PostgreSQL password hash in its stored form (SCRAM-SHA-256 verifier or md5 hash) is replaced with [redacted password hash]. It is always on and cannot be configured off. Each successful tool result carries the number of markers it returns as `redactedHashes`; the audit line and a warning line carry the same count for tools, resources and completions. A quoted literal that follows the keyword PASSWORD after whitespace or at most 256 bytes of comments, as in CREATE ROLE or ALTER ROLE, is replaced with '***' (''***'' when nested in a quoted statement) in every string value and column name on a best-effort basis; keys of JSON objects inside values are not masked, and that mask is not counted. Error texts and log lines get the hash replacement only."));
-    assert!(security.contains("- **PASSWORD mask limits.** PASSWORD'x' with no whitespace is not masked in results. A literal after more than 256 bytes of comments is not masked. Text after the word password inside a literal, as in 'reset password ' || name, can be rewritten. A nested PASSWORD literal whose value starts with a quote is not masked in full. A password built by concatenation, as in PASSWORD ' || quote_literal('x'), is masked only up to its first quote."));
+    assert!(security.contains("- **PASSWORD mask limits.** PASSWORD'x' with nothing between the keyword and the literal is not masked in results. A literal after more than 256 bytes of comments is not masked. Text after the word password inside a literal, as in 'reset password ' || name, can be rewritten. A nested PASSWORD literal whose value starts with a quote is not masked in full. A password built by concatenation, as in PASSWORD ' || quote_literal('x'), is masked only up to its first quote. Only one level of nesting is handled: a literal nested two levels deep is not masked in full. A nested E''...'' literal that holds a backslash-escaped quote is not masked in full. A statement fragment with no outer quote, such as PASSWORD '')x, is read as an empty literal. Masking a text a second time can mask more than the first time; it never shows more."));
     assert!(security.contains("The TOAST tables of all catalogs are refused by name, and so are the foreign server and foreign-data wrapper catalogs."));
     assert!(security.contains("The gate also refuses TOAST tables and the functions that return raw page or write-ahead log data. Statement text of other sessions, visible to a role with pg_monitor, can hold a password hash that someone typed in a CREATE ROLE or ALTER ROLE statement; it is redacted in its stored form only."));
     assert!(!security.contains("Statistics and role settings"));
@@ -92,4 +92,20 @@ fn the_tool_description_carries_both_sentences() {
     assert!(text.contains(
         "A quoted literal after the keyword PASSWORD is replaced with '***' in every string value and column name, on a best-effort basis."
     ));
+}
+
+#[test]
+fn the_changelog_carries_the_0_1_6_fixes_exactly() {
+    let changelog = include_str!("../CHANGELOG.md");
+    for line in [
+        "- An empty PASSWORD literal no longer hides the text after it or exposes a later password.",
+        "- A nested empty PASSWORD literal no longer exposes the password that follows it.",
+        "- A nested PASSWORD literal cut by the value limit one byte before its end is masked.",
+        "- Type names in execute_query columns pass the hash scrubber again.",
+        "- A comment between the word password and an equals sign is kept.",
+        "- A nested E''...'' PASSWORD literal is masked as E''***''.",
+    ] {
+        assert!(changelog.contains(line), "{line}");
+    }
+    assert!(changelog.contains("## [0.1.6]"));
 }
