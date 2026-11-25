@@ -554,8 +554,7 @@ async fn the_audit_line_and_the_warn_line_count_the_replacements() {
         "{lines}"
     );
     assert!(
-        lines.contains("password hash text was redacted from a result")
-            && lines.contains("count=2"),
+        lines.contains("redaction markers are present in a result") && lines.contains("count=2"),
         "{lines}"
     );
     assert_clean(&lines, "log text", needles);
@@ -1051,7 +1050,8 @@ fn check_call(
         );
     }
     if let Some(structured) = response["result"].get("structuredContent") {
-        let markers = structured.to_string().matches(REDACTED).count() as u64;
+        let text = structured.to_string();
+        let markers = (text.matches(REDACTED).count() + text.matches(&marker_hex()).count()) as u64;
         assert_eq!(
             markers, audited,
             "{tool}: markers returned vs redactedHashes\n{response}"
@@ -1060,7 +1060,7 @@ fn check_call(
     if audited > 0 {
         assert!(
             lines.lines().any(|line| {
-                line.contains("password hash text was redacted")
+                line.contains("redaction markers are present in a result")
                     && line.contains(tool)
                     && line.contains(&format!("count={audited}"))
             }),
@@ -1068,6 +1068,11 @@ fn check_call(
         );
     }
     audited
+}
+
+/// The marker's bytes in hex, as a bytea value shows them.
+fn marker_hex() -> String {
+    REDACTED.bytes().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Holds one idle superuser session whose application_name and last query carry the planted hash.
@@ -1303,12 +1308,13 @@ async fn a_hash_at_the_log_message_cut_is_not_returned_whole_or_in_part() {
     let needles = needles().await;
     let router = router_for(PORT_18, "postgres", "test-only-superuser");
     for (count, label) in [(4080, "past the cut"), (4050, "across the cut")] {
-        let failing = format!("SELECT '{}{PLANTED}'::int", "x".repeat(count));
+        let token = format!("uniq{count}");
+        let failing = format!("SELECT '{token}{}{PLANTED}'::int", "x".repeat(count));
         let _ = call_tool(&router, "execute_query", json!({ "sql": failing })).await;
         let shown = call_tool(
             &router,
             "read_server_log",
-            json!({"contains": "xxxxxxxxxxxxxxxx", "limit": 5}),
+            json!({"contains": token, "limit": 5}),
         )
         .await;
         let text = shown.to_string();
@@ -1322,12 +1328,16 @@ async fn a_hash_at_the_log_message_cut_is_not_returned_whole_or_in_part() {
                 "{label}: a partial marker in {entry}"
             );
         }
-        let truncated = entries.iter().any(|entry| {
-            entry["message"].as_str().is_some_and(|message| {
-                message.contains("[truncated") && !message.contains("[redacted")
-            })
+        let ours = entries.iter().find(|entry| {
+            entry["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(&token))
         });
-        assert!(truncated, "{label}: {shown}");
+        let message = ours
+            .and_then(|entry| entry["message"].as_str())
+            .unwrap_or_default();
+        assert!(message.contains("[truncated"), "{label}: {shown}");
+        assert!(!message.contains("[redacted"), "{label}: {message}");
     }
 }
 
@@ -1519,6 +1529,15 @@ async fn a_statement_cut_by_postgres_keeps_no_digits_of_an_md5_hash() {
     }
     let query = row["query"].as_str().expect("probe row").to_owned();
     assert!(query.ends_with(REDACTED), "{row}");
+    let kept = superuser_rows(
+        PORT_18,
+        "SELECT query FROM pg_catalog.pg_stat_activity WHERE application_name = 'tail_probe'",
+    )
+    .await;
+    assert!(
+        kept.iter().any(|row| row[0].ends_with("md5fedcba9")),
+        "{kept:?}"
+    );
     assert!(!query.contains("fedcba98"), "{row}");
     sleeper
         .await
@@ -1566,9 +1585,9 @@ async fn a_resource_error_that_names_a_hash_is_scrubbed() {
     assert!(response.to_string().contains(REDACTED), "{response}");
 }
 
-/// A completion prefix that holds a hash is never returned: no completion value carries it.
+/// Table completion returns a hash-shaped table name as the marker, and no completion value holds the hash.
 #[tokio::test]
-async fn a_completion_for_a_hash_returns_no_needle() {
+async fn a_completion_returns_a_hash_shaped_table_name_as_the_marker() {
     let needles = needles().await;
     let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
     let completion = json!({
@@ -1576,8 +1595,9 @@ async fn a_completion_for_a_hash_returns_no_needle() {
         "id": 1,
         "method": "completion/complete",
         "params": {
-            "ref": {"type": "ref/resource", "uri": "postgres://{database}/{schema}"},
-            "argument": {"name": "schema", "value": PLANTED},
+            "ref": {"type": "ref/resource", "uri": "postgres://{database}/{schema}/{table}"},
+            "argument": {"name": "table", "value": "SCRAM"},
+            "context": {"arguments": {"database": "appdb", "schema": "hashes"}},
         },
     });
     let response = post_mcp(
@@ -1587,6 +1607,8 @@ async fn a_completion_for_a_hash_returns_no_needle() {
     )
     .await
     .json();
+    let values = response["result"]["completion"]["values"].to_string();
+    assert!(values.contains(REDACTED), "{response}");
     assert_clean(&response.to_string(), "completion", needles);
 }
 
@@ -1613,4 +1635,92 @@ async fn a_large_bytea_array_holds_no_hash_hex() {
         ),
         "{response}"
     );
+}
+
+/// Ordinary SQL text that holds the word password comes back byte for byte through execute_query.
+#[tokio::test]
+async fn the_password_mask_leaves_ordinary_sql_text_byte_for_byte() {
+    for text in [
+        "ARRAY['password'::text, 'token'::text]",
+        "IF NOT ok THEN RAISE EXCEPTION 'wrong password'; END IF; RETURN 1; END",
+        "SELECT * FROM creds WHERE kind = 'password' AND v = 'x'",
+        "CHECK (kind IN ('password', 'token', 'key'))",
+    ] {
+        assert_eq!(returned_text(text).await, text);
+    }
+}
+
+/// The seeded function, table and view describe with their ordinary password text, and no mask.
+#[tokio::test]
+async fn describe_keeps_ordinary_sql_text_that_holds_the_word_password() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let function = call_tool(
+        &router,
+        "describe_function",
+        json!({"function": "check_password", "schema": "masks"}),
+    )
+    .await;
+    assert!(
+        function
+            .to_string()
+            .contains("RAISE EXCEPTION 'wrong password'"),
+        "{function}"
+    );
+    let table = call_tool(
+        &router,
+        "describe_table",
+        json!({"table": "kinds", "schema": "masks"}),
+    )
+    .await;
+    assert!(table.to_string().contains("'password'::text"), "{table}");
+    let view = call_tool(
+        &router,
+        "describe_table",
+        json!({"table": "password_rows", "schema": "masks"}),
+    )
+    .await;
+    assert!(
+        view.to_string().contains("kind = 'password'::text"),
+        "{view}"
+    );
+    for response in [&function, &table, &view] {
+        assert!(!response.to_string().contains("***"), "{response}");
+    }
+}
+
+/// A column name with a password literal is masked the same way as its row key.
+#[tokio::test]
+async fn a_column_name_with_a_password_literal_is_masked_like_its_row_key() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let response = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT 1 AS \"password 'hunter2'\""}),
+    )
+    .await;
+    let content = &result_of(&response)["structuredContent"];
+    assert_eq!(
+        content["columns"][0]["name"],
+        json!("password '***'"),
+        "{response}"
+    );
+    assert_eq!(content["rows"][0]["password '***'"], json!(1), "{response}");
+    assert!(!response.to_string().contains("hunter2"), "{response}");
+}
+
+/// A record whose bytea text the value cut splits inside an md5 hash keeps none of the hash's digits.
+#[tokio::test]
+async fn a_hex_form_md5_split_by_the_value_cut_keeps_no_digits() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let md5 = "md50123456789abcdef0123456789abcdef";
+    let sql =
+        format!("SELECT ROW(convert_to(repeat('x', 2010) || ' {md5} tail', 'UTF8'))::text AS v");
+    let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+    let value = result_of(&response)["structuredContent"]["rows"][0]["v"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let digits_in_hex: String = "0123456789".bytes().map(|b| format!("{b:02x}")).collect();
+    assert!(!value.contains(&digits_in_hex), "{value}");
+    assert!(!value.contains("6d6435"), "{value}");
 }

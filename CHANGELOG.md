@@ -3,16 +3,25 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.3]
+
+### Fixed
+
+- The scrubber is linear again on values that hold many adjacent hashes.
+- The PASSWORD mask in results no longer changes SQL text such as 'password'::text or a message that ends in the word password.
+- An md5 hash in hex form that the value cut splits keeps none of its digits.
+- Column names are masked the same way as row keys.
+
 ## [0.1.2]
 
 ### Fixed
 
 - The `execute_query` output schema listed `redactedHashes` twice in `required`, which JSON Schema forbids, so clients that validate schemas could not call the tool.
-- The PASSWORD mask in results covers only the quoted literal after the keyword PASSWORD. Other text in rows, such as `Forgot your password = reset it via the portal`, is returned unchanged.
-- `redactedHashes` counts only the markers in the text that is returned: a replacement in text that a cut removed is not counted, and a marker is never cut in half.
+- The PASSWORD mask in results covers only a quoted literal after the keyword PASSWORD and writes it as `'***'`. `password=`, `sslpassword=` and `passfile=` settings and URL passwords are no longer masked in results; server log entries and the statement text of `list_activity` and `query_stats` still mask them.
+- `redactedHashes` counts only the markers in the text that is returned: a replacement in text that a cut removed is not counted, and a marker is never cut in half. It counts marker occurrences, not hashes: a hash-shaped column name counts once in `columns` and once per row, text that already holds the marker counts, and a hash inside a PASSWORD literal shows as `'***'` and does not.
 - Hash-shaped column names are replaced before duplicate names are numbered, so `columns[].name`, `originalName` and the row keys agree.
-- Adjacent password hashes with no separator are each replaced: an md5 hash directly before or after a SCRAM verifier, or two md5 hashes.
-- An md5 hash that PostgreSQL cut short in statement text, such as `pg_stat_activity.query`, keeps none of its digits.
+- An md5 hash directly before a SCRAM verifier, or two md5 hashes with no separator, are each replaced; an md5 hash directly after a SCRAM verifier is replaced together with it.
+- An md5 hash that PostgreSQL cut short keeps none of its digits in the query field of `list_activity` and `query_stats`.
 - A hash inside a record's text, where a bytea value is written in hex, is replaced in its hex form.
 
 ## [0.1.1]

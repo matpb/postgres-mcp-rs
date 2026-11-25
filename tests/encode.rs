@@ -37,7 +37,6 @@ fn stats(truncated_values: u64, raw_fallbacks: u64) -> EncodeStats {
     EncodeStats {
         truncated_values,
         raw_fallbacks,
-        redacted_hashes: 0,
     }
 }
 
@@ -809,7 +808,6 @@ fn a_complete_bytea_cell_holding_a_hash_shows_the_marker_as_hex() {
         decode_hex(v.as_str().expect("text")),
         "[redacted password hash]"
     );
-    assert_eq!(st.redacted_hashes, 1);
 }
 
 #[test]
@@ -826,6 +824,5 @@ fn an_md5_hash_straddling_the_wire_cut_of_a_bytea_cell_is_replaced_in_its_bytes(
     assert_eq!(marker, "[truncated: 29 of 40 bytes]");
     assert_eq!(decode_hex(shown), "xxxx [redacted password hash]");
     assert!(!decode_hex(shown).contains("md5"), "{text}");
-    assert_eq!(st.redacted_hashes, 1);
     assert_eq!(st.truncated_values, 1);
 }

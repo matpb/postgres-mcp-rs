@@ -1739,9 +1739,10 @@ async fn every_tool_schema_lists_each_required_name_once() {
     for tool in &tools {
         let name = tool["name"].as_str().expect("tool name");
         for key in ["inputSchema", "outputSchema"] {
-            if let Some(schema) = tool.get(key) {
-                check_required_names(schema, &format!("{name}.{key}"));
-            }
+            let schema = tool
+                .get(key)
+                .unwrap_or_else(|| panic!("{name} has no {key}"));
+            check_required_names(schema, &format!("{name}.{key}"));
         }
     }
 }

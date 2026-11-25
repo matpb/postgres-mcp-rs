@@ -11,6 +11,7 @@ use crate::encode::{EncodeLimits, EncodeStats, dedup_columns, encode_value};
 use crate::gate::SECRET_SETTINGS;
 use crate::pg::session::RunOutput;
 use crate::pg::wire::{Field, Truncation};
+use crate::tools::mask::mask_password_literals;
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -24,8 +25,6 @@ pub struct QueryEnvelope {
     pub truncated_reason: Option<&'static str>,
     pub truncated_values: u64,
     pub raw_fallbacks: u64,
-    /// Password hash texts replaced in the values of this result.
-    pub redacted_hashes: u64,
     pub execution_time_ms: u64,
 }
 
@@ -56,7 +55,7 @@ pub fn build(
     let raw_names: Vec<String> = result
         .columns
         .iter()
-        .map(|c| crate::scrub::scrub(&c.name).into_owned())
+        .map(|c| mask_password_literals(&crate::scrub::scrub(&c.name)).into_owned())
         .collect();
     let deduped = dedup_columns(&raw_names);
     let columns = result
@@ -113,7 +112,6 @@ pub fn build(
         truncated_reason,
         truncated_values: stats.truncated_values,
         raw_fallbacks: stats.raw_fallbacks,
-        redacted_hashes: stats.redacted_hashes,
         execution_time_ms: elapsed_ms(elapsed),
     }
 }

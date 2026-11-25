@@ -27,8 +27,6 @@ pub struct EncodeLimits {
 pub struct EncodeStats {
     pub truncated_values: u64,
     pub raw_fallbacks: u64,
-    /// Password hashes replaced in the values, before they were decoded or cut.
-    pub redacted_hashes: u64,
 }
 
 const MAX_SAFE_INTEGER: u128 = 9_007_199_254_740_991;
@@ -47,12 +45,11 @@ pub fn encode_value(
     {
         return wire_truncated_bytea(hex_text, full_len, limits, stats);
     }
-    let (raw, found) = scrub_raw(raw, ty);
-    redacted(stats, found);
+    let (raw, _) = scrub_raw(raw, ty);
     if !complete {
-        // The cut may split an md5 hash; its fragment is replaced here, and a split SCRAM hash already is.
-        let (tail, cut_found) = scrub::scrub_cut_tail(&raw);
-        redacted(stats, cut_found);
+        // The cut may split an md5 hash, in text or inside a hex run; the fragment is replaced here.
+        let (hex_tail, _) = scrub::scrub_hex_tail(&raw);
+        let (tail, _) = scrub::scrub_cut_tail(&hex_tail);
         let keep = scrub::cut_index(&tail, limits.max_value_bytes);
         return wire_truncated(&tail[..keep], full_len, stats);
     }
@@ -117,11 +114,6 @@ fn float(text: &str, limits: &EncodeLimits, stats: &mut EncodeStats) -> Option<V
     }
 }
 
-/// Counts replacements in the stats of the value.
-fn redacted(stats: &mut EncodeStats, count: usize) {
-    stats.redacted_hashes += count as u64;
-}
-
 /// A bytea value cut by the wire. Its kept bytes are scrubbed and cut again, so an md5 hash that straddles
 /// the cut is replaced in the bytes it is made of. The result stays hex, so the marker reads as hex bytes.
 fn wire_truncated_bytea(
@@ -131,9 +123,8 @@ fn wire_truncated_bytea(
     stats: &mut EncodeStats,
 ) -> Value {
     let bytes = unhex_pairs(hex_text);
-    let (scrubbed, found) = scrub::scrub_bytes(&bytes);
-    let (tail, cut_found) = scrub::scrub_cut_tail(&scrubbed);
-    redacted(stats, found + cut_found);
+    let (scrubbed, _) = scrub::scrub_bytes(&bytes);
+    let (tail, _) = scrub::scrub_cut_tail(&scrubbed);
     let keep = scrub::cut_index(&tail, limits.max_value_bytes);
     stats.truncated_values += 1;
     let decoded_len = full_len.saturating_sub(2) / 2;
@@ -186,7 +177,6 @@ fn bytea(text: &str, limits: &EncodeLimits, stats: &mut EncodeStats) -> Option<V
     }
     let (scrubbed, found) = scrub_bytea_text(text.as_bytes());
     if found > 0 {
-        redacted(stats, found);
         let replaced = String::from_utf8_lossy(&scrubbed).into_owned();
         return bytea(&replaced, limits, stats);
     }
@@ -226,7 +216,6 @@ pub(super) fn text_value(s: &str, limits: &EncodeLimits, stats: &mut EncodeStats
 pub(super) fn absorb(stats: &mut EncodeStats, other: &EncodeStats) {
     stats.truncated_values += other.truncated_values;
     stats.raw_fallbacks += other.raw_fallbacks;
-    stats.redacted_hashes += other.redacted_hashes;
 }
 
 /// The wire cut the value: keep the valid prefix, lossy-decoded, with the marker.

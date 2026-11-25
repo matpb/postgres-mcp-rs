@@ -70,12 +70,17 @@ pub fn mask(text: &str) -> String {
     String::from_utf8_lossy(&masked).into_owned()
 }
 
-/// Masks every keyed secret. With `literal_only`, only the PASSWORD literal forms are masked.
+/// Masks every keyed secret. With `literal_only`, only a PASSWORD literal is masked.
 fn mask_keyed(text: &[u8], literal_only: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
-        match keyed_secret(text, i, &mut out, literal_only) {
+        let masked = if literal_only {
+            password_literal(text, i, &mut out)
+        } else {
+            keyed_secret(text, i, &mut out)
+        };
+        match masked {
             Some(next) => i = next,
             None => {
                 out.push(text[i]);
@@ -86,15 +91,63 @@ fn mask_keyed(text: &[u8], literal_only: bool) -> Vec<u8> {
     out
 }
 
+/// Masks the literal after the keyword PASSWORD at `start` as `'***'`, keeping the text before it. The keyword
+/// must start a word outside quotes, and whitespace or a comment must separate it from the literal.
+fn password_literal(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
+    if start > 0 && (is_word(text[start - 1]) || matches!(text[start - 1], b'\'' | b'"')) {
+        return None;
+    }
+    let end = start + b"password".len();
+    if !text.get(start..end)?.eq_ignore_ascii_case(b"password")
+        || text.get(end).is_some_and(|&b| is_word(b))
+    {
+        return None;
+    }
+    let k = skip_blanks(text, end);
+    if k == end {
+        return None;
+    }
+    let literal_end = match text.get(k)? {
+        b'\'' => quoted_end(text, k),
+        b'E' | b'e' if text.get(k + 1) == Some(&b'\'') => escape_end(text, k + 1),
+        b'U' | b'u' if text.get(k + 1..k + 3) == Some(b"&'".as_slice()) => quoted_end(text, k + 2),
+        b'$' => {
+            let open = dollar_open(text, k)?;
+            let tag = &text[k..open];
+            match find_bytes(text, open, tag) {
+                Some(close) => close + tag.len(),
+                None => text.len(),
+            }
+        }
+        _ => return None,
+    };
+    out.extend_from_slice(&text[start..k]);
+    out.extend_from_slice(b"'***'");
+    Some(literal_end)
+}
+
+/// Index past the whitespace and comments at `i`.
+fn skip_blanks(text: &[u8], mut i: usize) -> usize {
+    loop {
+        match text.get(i) {
+            Some(b) if b.is_ascii_whitespace() => i += 1,
+            Some(b'/') if text.get(i + 1) == Some(&b'*') => {
+                i = find_bytes(text, i + 2, b"*/").map_or(text.len(), |close| close + 2);
+            }
+            Some(b'-') if text.get(i + 1) == Some(&b'-') => {
+                i = find_bytes(text, i, b"\n").map_or(text.len(), |newline| newline + 1);
+            }
+            _ => return i,
+        }
+    }
+}
+
 /// Masks the secret of the keyword at `start`, appends the result to `out` and returns the index after it.
-fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>, literal_only: bool) -> Option<usize> {
+fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
     if start > 0 && is_word(text[start - 1]) {
         return None;
     }
     for key in KEYS {
-        if literal_only && *key != b"password" {
-            continue;
-        }
         let end = start + key.len();
         let Some(word) = text.get(start..end) else {
             continue;
@@ -104,7 +157,7 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>, literal_only: bool
         }
         let k = skip_spaces(text, end);
         return match text.get(k) {
-            Some(b'=') if !literal_only => {
+            Some(b'=') => {
                 let v = skip_spaces(text, k + 1);
                 let value_end = keyed_value_end(text, v);
                 out.extend_from_slice(&text[start..end]);
@@ -124,11 +177,7 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>, literal_only: bool
             }
             // Escape string E'...': backslash escapes and doubled quotes.
             Some(b'E' | b'e') if *key == b"password" && text.get(k + 1) == Some(&b'\'') => {
-                if literal_only {
-                    out.extend_from_slice(&text[start..k]);
-                } else {
-                    out.extend_from_slice(&text[start..=k]);
-                }
+                out.extend_from_slice(&text[start..=k]);
                 out.extend_from_slice(b"'***'");
                 Some(escape_end(text, k + 1))
             }
@@ -149,13 +198,9 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>, literal_only: bool
                     None => text.len(),
                 };
                 out.extend_from_slice(&text[start..k]);
-                if literal_only {
-                    out.extend_from_slice(b"'***'");
-                } else {
-                    out.extend_from_slice(tag);
-                    out.extend_from_slice(MASK.as_bytes());
-                    out.extend_from_slice(tag);
-                }
+                out.extend_from_slice(tag);
+                out.extend_from_slice(MASK.as_bytes());
+                out.extend_from_slice(tag);
                 Some(end)
             }
             _ => None,
@@ -215,14 +260,14 @@ fn dollar_open(text: &[u8], start: usize) -> Option<usize> {
     let mut i = start + 1;
     match text.get(i) {
         Some(b'$') => return Some(i + 1),
-        Some(&b) if b.is_ascii_alphabetic() || b == b'_' => {}
+        Some(&b) if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {}
         _ => return None,
     }
     while let Some(&b) = text.get(i) {
         if b == b'$' {
             return Some(i + 1);
         }
-        if !(b.is_ascii_alphanumeric() || b == b'_') {
+        if !(b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80) {
             return None;
         }
         i += 1;
@@ -327,8 +372,99 @@ fn url_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::mask;
+    use super::{mask, mask_password_literals};
     use proptest::prelude::*;
+
+    #[test]
+    fn ordinary_sql_text_with_the_word_password_is_unchanged() {
+        for text in [
+            "ARRAY['password'::text, 'token'::text]",
+            "IF NOT ok THEN RAISE EXCEPTION 'wrong password'; END IF; RETURN 1; END",
+            "SELECT * FROM creds WHERE kind = 'password' AND v = 'x'",
+            "CHECK (kind IN ('password', 'token', 'key'))",
+            "host=h password=secret",
+            "Forgot your password = reset it via the portal",
+            "a message that ends in the word password",
+        ] {
+            assert_eq!(mask_password_literals(text), text, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_literal_after_the_keyword_is_masked_in_every_quoting_form() {
+        for (text, expected) in [
+            (
+                "ALTER ROLE x PASSWORD 'secret'",
+                "ALTER ROLE x PASSWORD '***'",
+            ),
+            (
+                "CREATE ROLE x ENCRYPTED PASSWORD 'secret'",
+                "CREATE ROLE x ENCRYPTED PASSWORD '***'",
+            ),
+            (
+                "ALTER ROLE x PASSWORD 'p''w'",
+                "ALTER ROLE x PASSWORD '***'",
+            ),
+            (
+                "CREATE ROLE x PASSWORD $$secret$$",
+                "CREATE ROLE x PASSWORD '***'",
+            ),
+            (
+                "CREATE ROLE x PASSWORD $tag$se'cret$tag$",
+                "CREATE ROLE x PASSWORD '***'",
+            ),
+            (
+                "CREATE ROLE x PASSWORD E'se\\'cret'",
+                "CREATE ROLE x PASSWORD '***'",
+            ),
+            ("ALTER ROLE x PASSWORD U&'x'", "ALTER ROLE x PASSWORD '***'"),
+        ] {
+            assert_eq!(mask_password_literals(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_literal_that_starts_with_a_doubled_quote_leaves_nothing_of_the_password() {
+        assert_eq!(
+            mask_password_literals("ALTER ROLE x PASSWORD '''abc'"),
+            "ALTER ROLE x PASSWORD '***'"
+        );
+    }
+
+    #[test]
+    fn an_empty_literal_is_masked_and_the_rest_of_the_statement_kept() {
+        assert_eq!(
+            mask_password_literals("ALTER ROLE x PASSWORD '' VALID UNTIL 'infinity'"),
+            "ALTER ROLE x PASSWORD '***' VALID UNTIL 'infinity'"
+        );
+    }
+
+    #[test]
+    fn a_comment_between_the_keyword_and_the_literal_is_masked() {
+        assert_eq!(
+            mask_password_literals("ALTER ROLE x PASSWORD /* c */ 'x'"),
+            "ALTER ROLE x PASSWORD /* c */ '***'"
+        );
+    }
+
+    #[test]
+    fn a_dollar_tag_with_a_non_ascii_letter_is_masked() {
+        assert_eq!(
+            mask_password_literals("CREATE ROLE x PASSWORD $é$secret$é$"),
+            "CREATE ROLE x PASSWORD '***'"
+        );
+    }
+
+    #[test]
+    fn the_keyword_inside_an_identifier_or_a_quote_is_not_a_match() {
+        for text in [
+            "SELECT \"password\" FROM t",
+            "SELECT 'x' || 'password' FROM t",
+            "SELECT mypassword 'x'",
+        ] {
+            assert_eq!(mask_password_literals(text), text, "{text}");
+        }
+    }
 
     #[test]
     fn alter_role_password_literal_is_masked() {

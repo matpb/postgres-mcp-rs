@@ -1,0 +1,3 @@
+# The integration targets share one test stack; more threads exceed the test roles' connection limits.
+[env]
+RUST_TEST_THREADS = "4"

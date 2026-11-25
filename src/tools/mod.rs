@@ -506,7 +506,7 @@ impl ServerHandler for PgMcp {
             tracing::warn!(
                 tool = "completion",
                 count = redacted_hashes,
-                "password hash text was redacted from a result"
+                "redaction markers are present in a result"
             );
         }
         Ok(result)
@@ -555,7 +555,7 @@ impl ServerHandler for PgMcp {
                 tool = %name,
                 database = run.database.as_deref(),
                 count = redacted_hashes,
-                "password hash text was redacted from a result"
+                "redaction markers are present in a result"
             );
         }
         Ok(CallToolResponse::from(run.result))

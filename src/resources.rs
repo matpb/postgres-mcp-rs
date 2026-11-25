@@ -197,7 +197,7 @@ pub async fn read(
             tool,
             database = database.as_deref(),
             count = redacted_hashes,
-            "password hash text was redacted from a result"
+            "redaction markers are present in a result"
         );
     }
     match outcome {

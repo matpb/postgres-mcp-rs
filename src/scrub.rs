@@ -21,12 +21,18 @@ fn scram_char(byte: u8) -> bool {
 }
 
 /// The end of the hash that starts at `at`, when one starts there.
-fn hash_end(bytes: &[u8], at: usize) -> Option<usize> {
+fn hash_end(bytes: &[u8], at: usize, after_marker: bool) -> Option<usize> {
     let rest = bytes.get(at..)?;
     if rest.starts_with(SCRAM_PREFIX) {
         let mut end = at + SCRAM_PREFIX.len();
-        while end < bytes.len() && scram_char(bytes[end]) {
-            end += 1;
+        loop {
+            if bytes[end..].starts_with(SCRAM_PREFIX) {
+                end += SCRAM_PREFIX.len();
+            } else if end < bytes.len() && scram_char(bytes[end]) {
+                end += 1;
+            } else {
+                break;
+            }
         }
         return Some(end);
     }
@@ -37,7 +43,7 @@ fn hash_end(bytes: &[u8], at: usize) -> Option<usize> {
         if !digits.iter().all(u8::is_ascii_hexdigit) {
             return None;
         }
-        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+        let before_ok = after_marker || at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
         let rest_after = bytes.get(digits_end..).unwrap_or_default();
         let after_ok = !rest_after.first().is_some_and(u8::is_ascii_alphanumeric)
             || rest_after.starts_with(SCRAM_PREFIX)
@@ -47,8 +53,8 @@ fn hash_end(bytes: &[u8], at: usize) -> Option<usize> {
     None
 }
 
-/// Replaces every password hash in the bytes until none is left. Borrows the input when there is none; returns
-/// the count. A pass can expose a hash it could not see before, so the pass repeats; each pass removes one.
+/// Replaces every password hash in the bytes and returns the count. Borrows the input when there is none.
+/// The loop repeats only as a backstop; one pass normally leaves nothing.
 pub fn scrub_bytes(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
     let mut count = 0;
     let mut owned: Option<Vec<u8>> = None;
@@ -69,8 +75,8 @@ pub fn scrub_bytes(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
     }
 }
 
-/// Replaces hashes that sit in `\x` hex escapes, as a bytea value inside a record's text does. The hex of each
-/// escape is decoded, scrubbed, and written back in hex.
+/// Replaces hashes that sit in `\x` hex escapes, as a bytea value inside a record's text does. Each escape is
+/// decoded and matched; the digits around a replacement are written back as they were.
 fn hex_stage(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
     let mut out: Option<Vec<u8>> = None;
     let mut copied = 0;
@@ -87,16 +93,16 @@ fn hex_stage(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
             .take_while(|byte| byte.is_ascii_hexdigit())
             .count();
         let even = run & !1;
-        let decoded = unhex_hex(&bytes[start..start + even]);
-        let (scrubbed, found) = scrub_pass(&decoded);
-        if found == 0 {
+        let digits = &bytes[start..start + even];
+        let spans = hash_spans(&unhex_hex(digits));
+        if spans.is_empty() {
             at = start + even;
             continue;
         }
         let buffer = out.get_or_insert_with(|| Vec::with_capacity(bytes.len()));
         buffer.extend_from_slice(&bytes[copied..start]);
-        buffer.extend_from_slice(hex_text(&scrubbed).as_bytes());
-        count += found;
+        buffer.extend_from_slice(&hex_keeping_case(digits, &spans));
+        count += spans.len();
         copied = start + even;
         at = copied;
     }
@@ -107,6 +113,52 @@ fn hex_stage(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
             (Cow::Owned(buffer), count)
         }
     }
+}
+
+/// The hex digits of `digits` with each span (in decoded byte positions) written as the marker's hex; the other
+/// digits keep their letter case.
+fn hex_keeping_case(digits: &[u8], spans: &[(usize, usize)]) -> Vec<u8> {
+    let marker = hex_text(REDACTED.as_bytes());
+    let mut out = Vec::with_capacity(digits.len());
+    let mut byte = 0;
+    let mut spans = spans.iter().peekable();
+    while byte < digits.len() / 2 {
+        match spans.peek() {
+            Some(&&(start, end)) if start == byte => {
+                out.extend_from_slice(marker.as_bytes());
+                byte = end;
+                spans.next();
+            }
+            _ => {
+                out.extend_from_slice(&digits[2 * byte..2 * byte + 2]);
+                byte += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Replaces an md5 hash that a value cut short inside a `\x` hex run. When the run reaches the end, its even
+/// prefix is decoded, the tail rule is applied to the bytes, and the run is written back in hex.
+pub fn scrub_hex_tail(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
+    let mut run_start = bytes.len();
+    while run_start > 0 && bytes[run_start - 1].is_ascii_hexdigit() {
+        run_start -= 1;
+    }
+    if run_start < 2 || bytes[run_start - 1] != b'x' || bytes[run_start - 2] != b'\\' {
+        return (Cow::Borrowed(bytes), 0);
+    }
+    let run = &bytes[run_start..];
+    let even = run.len() & !1;
+    let decoded = unhex_hex(&run[..even]);
+    let (tail, found) = scrub_cut_tail(&decoded);
+    if found == 0 {
+        return (Cow::Borrowed(bytes), 0);
+    }
+    let mut out = bytes[..run_start].to_vec();
+    out.extend_from_slice(hex_text(&tail).as_bytes());
+    out.extend_from_slice(&run[even..]);
+    (Cow::Owned(out), found)
 }
 
 /// The bytes of hex digit pairs; the caller passes an even number of hex digits.
@@ -128,30 +180,38 @@ fn hex_text(bytes: &[u8]) -> String {
 
 /// One left-to-right pass of `scrub_bytes`.
 fn scrub_pass(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
-    let mut out: Option<Vec<u8>> = None;
+    let spans = hash_spans(bytes);
+    if spans.is_empty() {
+        return (Cow::Borrowed(bytes), 0);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
     let mut copied = 0;
-    let mut count = 0;
+    for &(start, end) in &spans {
+        out.extend_from_slice(&bytes[copied..start]);
+        out.extend_from_slice(REDACTED.as_bytes());
+        copied = end;
+    }
+    out.extend_from_slice(&bytes[copied..]);
+    (Cow::Owned(out), spans.len())
+}
+
+/// The spans of the hashes, left to right. A hash that starts where the previous one ended may follow it with
+/// no separator, so a run of packed hashes is one pass.
+fn hash_spans(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
     let mut at = 0;
+    let mut last_end = None;
     while at < bytes.len() {
-        match hash_end(bytes, at) {
+        match hash_end(bytes, at, last_end == Some(at)) {
             Some(end) => {
-                let buffer = out.get_or_insert_with(|| Vec::with_capacity(bytes.len()));
-                buffer.extend_from_slice(&bytes[copied..at]);
-                buffer.extend_from_slice(REDACTED.as_bytes());
-                count += 1;
-                copied = end;
+                spans.push((at, end));
+                last_end = Some(end);
                 at = end;
             }
             None => at += 1,
         }
     }
-    match out {
-        None => (Cow::Borrowed(bytes), 0),
-        Some(mut buffer) => {
-            buffer.extend_from_slice(&bytes[copied..]);
-            (Cow::Owned(buffer), count)
-        }
-    }
+    spans
 }
 
 /// Replaces an md5 hash that a value cut short: `md5` and one to 31 hex digits run to the end of the bytes.
