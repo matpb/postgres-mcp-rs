@@ -20,10 +20,10 @@ There are three ways to run the server. Each one needs a PostgreSQL role for the
 
 ### a) Docker
 
-Build the image from this repository (no image is published), then run it with the database URL and an API key:
+Images for `linux/amd64` are published as `ghcr.io/matpb/postgres-mcp-rs` and `matpb/postgres-mcp-rs` on Docker Hub, tagged with the version and `latest`. Pull one and use its name in place of `postgres-mcp:local` below, or build the image from this repository. Then run it with the database URL and an API key:
 
 ```bash
-docker build -t postgres-mcp:local .
+docker build -t postgres-mcp:local .   # or: docker pull ghcr.io/matpb/postgres-mcp-rs:0.1.6
 docker run -d --name postgres-mcp \
   -p 127.0.0.1:8432:8432 \
   -e 'DATABASE_URL=postgres://mcp_reader:change-me-reader-password@db.example.com:5432/appdb?sslmode=verify-full' \
