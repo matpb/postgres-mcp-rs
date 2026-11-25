@@ -3,12 +3,25 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.4]
+
+### Fixed
+
+- The PASSWORD mask is linear again on text with many comments after the keyword.
+- A password literal nested in a quoted statement, as in EXECUTE 'ALTER ROLE ... PASSWORD ''...''', is masked again.
+- An md5 hash is replaced when the value cut lands inside the token that follows it.
+- A hex-form marker is never cut in half.
+
 ## [0.1.3]
 
 ### Fixed
 
 - The scrubber is linear again on values that hold many adjacent hashes.
-- The PASSWORD mask in results no longer changes SQL text such as 'password'::text or a message that ends in the word password.
+- The PASSWORD mask in results no longer changes SQL text such as 'password'::text or a message that ends in the word password. A literal that ends in the word password and a space can still be rewritten.
+- Two SCRAM verifiers with no separator are replaced as one marker; 0.1.2 returned the second one without its leading SCRAM.
+- The PASSWORD mask in results needs whitespace or a comment between the keyword and the literal: PASSWORD'x' is not masked in results.
+- Dollar-quote tags with non-ASCII letters are recognised after PASSWORD.
+- Hex digits around a replaced hash keep their case, and the warning text is now "redaction markers are present in a result".
 - An md5 hash in hex form that the value cut splits keeps none of its digits.
 - Column names are masked the same way as row keys.
 

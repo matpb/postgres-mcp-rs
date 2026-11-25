@@ -1121,7 +1121,7 @@ async fn list_activity_masks_password_in_statement_text() {
         .unwrap_or(Value::Null);
     let query = row["query"].as_str().unwrap_or_default().to_owned();
     assert!(query.contains("pg_sleep(5)"), "{last}");
-    assert!(query.contains("PASSWORD '***'"), "{query}");
+    assert!(query.contains("PASSWORD ''***''"), "{query}");
     assert!(!query.contains("hunter2"), "{query}");
     assert!(!last.to_string().contains("hunter2"), "{last}");
     let finished = sleeper.await.expect("holder task");

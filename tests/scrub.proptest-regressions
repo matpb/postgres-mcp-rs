@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 97a2b4d41db6408193d250b653a4e60bd02b357354d48111ae0914fa1db07c36 # shrinks to pieces = [1, 0], hex = "0a0aa0000a0a00000000aa00000000a0"
 cc db9cb03beae5653fbd0caaa1782f464a6b0418cc4205b3bc2068fef706aa40cf # shrinks to pieces = [0, 0], hex = "a00aa00a0a00aaaaa0aaaa0aa0000a00"
+cc d58c7db264448ed4ad9fcd88c505b74affd73308bd8cc191af2773d7441860c5 # shrinks to pieces = [1, 0], hexes = ["aaaa0a0000a00000000aaa00a000a000", "00a0aaa000aaaa0a00aa0a000aa0000a", "000aa0000aaa00a00a00000a00000a00", "0a0aa00000a000a000a000a0000000a0", "0a000aaa00a000a0a00aaaa0a0aa00aa", "0a0000aa00a00a000a00a00a00000a0a", "aaaa0aaa0000a0a0a0a0aa0aa0a0aa0a", "0aaa000aaa00aaa0a00a00000a00a00a"], cut = 36

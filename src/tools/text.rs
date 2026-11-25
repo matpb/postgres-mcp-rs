@@ -27,7 +27,7 @@ pub const EXECUTE_QUERY: &str = "Run ONE read-only SQL statement and return its 
      \"truncated\": true means more rows existed or the response size budget was reached; add a LIMIT, \
      aggregate, or select fewer columns. Use ORDER BY for a stable page.\n\
      RESULT: {database, columns, rows, rowCount, truncated, truncatedReason?, truncatedValues, \
-     rawFallbacks, redactedHashes, executionTimeMs}.\n\
+     rawFallbacks, executionTimeMs, redactedHashes}.\n\
      - columns: [{name, type, typeOid, originalName?}] in SELECT order, present even with zero rows. \
      rows: one {column: value} object per row. Duplicate column names become \"id__2\", \"id__3\" with \
      originalName set.\n\

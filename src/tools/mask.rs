@@ -91,53 +91,97 @@ fn mask_keyed(text: &[u8], literal_only: bool) -> Vec<u8> {
     out
 }
 
-/// Masks the literal after the keyword PASSWORD at `start` as `'***'`, keeping the text before it. The keyword
-/// must start a word outside quotes, and whitespace or a comment must separate it from the literal.
+/// Masks the literal after the keyword PASSWORD at `start`, keeping the text before it. The keyword must start a
+/// word, and whitespace or a comment must separate it from the literal. A nested literal keeps its quotes.
 fn password_literal(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
-    if start > 0 && (is_word(text[start - 1]) || matches!(text[start - 1], b'\'' | b'"')) {
+    if start > 0 && is_word(text[start - 1]) {
         return None;
     }
+    let after_quote = start > 0 && matches!(text[start - 1], b'\'' | b'"');
     let end = start + b"password".len();
     if !text.get(start..end)?.eq_ignore_ascii_case(b"password")
         || text.get(end).is_some_and(|&b| is_word(b))
     {
         return None;
     }
-    let k = skip_blanks(text, end);
+    let k = skip_blanks(text, end)?;
     if k == end {
         return None;
     }
-    let literal_end = match text.get(k)? {
-        b'\'' => quoted_end(text, k),
-        b'E' | b'e' if text.get(k + 1) == Some(&b'\'') => escape_end(text, k + 1),
-        b'U' | b'u' if text.get(k + 1..k + 3) == Some(b"&'".as_slice()) => quoted_end(text, k + 2),
+    let (replacement, literal_end): (&[u8], usize) = match text.get(k)? {
+        b'\'' if nested_open(text, k) => (b"''***''", nested_close(text, k + 2)),
+        _ if after_quote => return None,
+        b'\'' => (b"'***'", quoted_end(text, k)),
+        b'E' | b'e' if text.get(k + 1) == Some(&b'\'') => (b"'***'", escape_end(text, k + 1)),
+        b'U' | b'u' if text.get(k + 1..k + 3) == Some(b"&'".as_slice()) => {
+            (b"'***'", quoted_end(text, k + 2))
+        }
         b'$' => {
             let open = dollar_open(text, k)?;
             let tag = &text[k..open];
-            match find_bytes(text, open, tag) {
-                Some(close) => close + tag.len(),
-                None => text.len(),
-            }
+            let close = find_bytes(text, open, tag).map_or(text.len(), |at| at + tag.len());
+            // A quote after the literal would pair with the mask quotes on a second pass.
+            let stray = if text.get(close) == Some(&b'\'') {
+                quoted_end(text, close)
+            } else {
+                close
+            };
+            (b"'***'", stray)
         }
         _ => return None,
     };
     out.extend_from_slice(&text[start..k]);
-    out.extend_from_slice(b"'***'");
+    out.extend_from_slice(replacement);
     Some(literal_end)
 }
 
-/// Index past the whitespace and comments at `i`.
-fn skip_blanks(text: &[u8], mut i: usize) -> usize {
+/// The most bytes of whitespace and comments read after the keyword before its literal.
+const BLANK_WINDOW: usize = 256;
+
+/// Index past the whitespace and comments at `i`. None when a comment does not close within `BLANK_WINDOW` bytes.
+fn skip_blanks(text: &[u8], mut i: usize) -> Option<usize> {
+    let window = &text[..text.len().min(i + BLANK_WINDOW)];
     loop {
-        match text.get(i) {
+        match window.get(i) {
             Some(b) if b.is_ascii_whitespace() => i += 1,
-            Some(b'/') if text.get(i + 1) == Some(&b'*') => {
-                i = find_bytes(text, i + 2, b"*/").map_or(text.len(), |close| close + 2);
+            Some(b'/') if window.get(i + 1) == Some(&b'*') => {
+                i = find_bytes(window, i + 2, b"*/")? + 2;
             }
-            Some(b'-') if text.get(i + 1) == Some(&b'-') => {
-                i = find_bytes(text, i, b"\n").map_or(text.len(), |newline| newline + 1);
+            Some(b'-') if window.get(i + 1) == Some(&b'-') => {
+                i = find_bytes(window, i, b"\n")? + 1;
             }
-            _ => return i,
+            _ => return Some(i),
+        }
+    }
+}
+
+/// True when the quote pair at `k` opens a literal nested in a quoted one, rather than an empty literal.
+fn nested_open(text: &[u8], k: usize) -> bool {
+    text.get(k + 1) == Some(&b'\'')
+        && text.get(k + 2).is_some_and(|&b| {
+            b != b'\'' && !b.is_ascii_whitespace() && !matches!(b, b';' | b',' | b')')
+        })
+}
+
+/// Index after the quotes that close a literal nested in a quoted one, whose content starts at `from`.
+/// An odd count of inner quotes in a run closes the literal, and an odd run ends with the outer quote.
+fn nested_close(text: &[u8], from: usize) -> usize {
+    let mut i = from;
+    loop {
+        let Some(offset) = text
+            .get(i..)
+            .and_then(|rest| rest.iter().position(|&b| b == b'\''))
+        else {
+            return text.len();
+        };
+        let at = i + offset;
+        let run = text[at..].iter().take_while(|&&b| b == b'\'').count();
+        let inner = run / 2;
+        match (run % 2, inner % 2) {
+            (1, 1) => return at + run - 1,
+            (1, _) => return at + run,
+            (_, 1) => return at + run,
+            _ => i = at + run,
         }
     }
 }
@@ -167,9 +211,9 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
             }
             Some(b'\'') if *key == b"password" => {
                 out.extend_from_slice(&text[start..k]);
-                if text.get(k + 1) == Some(&b'\'') {
-                    // A doubled quote opens a literal nested in an outer one; its content ends at the next quote pair.
-                    Some(nested_end(text, k + 2, out))
+                if nested_open(text, k) {
+                    out.extend_from_slice(b"''***''");
+                    Some(nested_close(text, k + 2))
                 } else {
                     out.extend_from_slice(b"'***'");
                     Some(quoted_end(text, k))
@@ -207,19 +251,6 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
         };
     }
     None
-}
-
-/// Writes `'***'` for a nested literal whose content starts at `from`; returns the index after its closing quotes.
-fn nested_end(text: &[u8], from: usize, out: &mut Vec<u8>) -> usize {
-    out.extend_from_slice(b"'***'");
-    match text
-        .get(from..)
-        .and_then(|rest| rest.iter().position(|&b| b == b'\''))
-    {
-        None => text.len(),
-        Some(p) if text.get(from + p + 1) == Some(&b'\'') => from + p + 2,
-        Some(p) => from + p + 1,
-    }
 }
 
 /// Index just past the closing quote of the literal opened at `open`, or the end of the text when unterminated.
@@ -374,6 +405,89 @@ fn url_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
 mod tests {
     use super::{mask, mask_password_literals};
     use proptest::prelude::*;
+
+    #[test]
+    fn a_nested_literal_after_password_is_masked_without_any_password_character() {
+        for (text, expected) in [
+            (
+                "DO $$ BEGIN EXECUTE 'ALTER ROLE app PASSWORD ''hunter2'''; END $$",
+                "DO $$ BEGIN EXECUTE 'ALTER ROLE app PASSWORD ''***'''; END $$",
+            ),
+            (
+                "SELECT 1 AS a, 'ALTER ROLE app PASSWORD ''hunter2'''",
+                "SELECT 1 AS a, 'ALTER ROLE app PASSWORD ''***'''",
+            ),
+            ("'PASSWORD ''hunter2-m'''", "'PASSWORD ''***'''"),
+            (
+                "'ALTER ROLE app PASSWORD ''it''''s'''",
+                "'ALTER ROLE app PASSWORD ''***'''",
+            ),
+        ] {
+            let masked = mask_password_literals(text);
+            assert_eq!(masked, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_keyword_inside_quoted_text_before_a_closing_quote_is_rewritten_as_documented() {
+        assert_eq!(
+            mask_password_literals("'reset password ' || name || ' now'"),
+            "'reset password '***' now'"
+        );
+    }
+
+    #[test]
+    fn a_literal_after_a_comment_longer_than_the_window_is_left_unmasked() {
+        let text = format!("ALTER ROLE x PASSWORD /*{}*/ 'secret'", "c".repeat(300));
+        assert_eq!(mask_password_literals(&text), text);
+    }
+
+    #[test]
+    fn a_literal_after_a_100_byte_comment_is_masked() {
+        let comment = "c".repeat(100);
+        assert_eq!(
+            mask_password_literals(&format!("ALTER ROLE x PASSWORD /*{comment}*/ 'secret'")),
+            format!("ALTER ROLE x PASSWORD /*{comment}*/ '***'")
+        );
+    }
+
+    #[test]
+    fn long_comment_heavy_text_after_the_keyword_is_scanned_in_linear_time() {
+        let cases = [
+            "password /*".repeat(95_000),
+            "password --".repeat(95_000),
+            "password /**/ /* ".repeat(60_000),
+            ("password /* ".repeat(300) + "*/ /* ").repeat(280),
+        ];
+        for text in cases {
+            let started = std::time::Instant::now();
+            let masked = mask_password_literals(&text).into_owned();
+            let elapsed = started.elapsed();
+            assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+            assert_eq!(masked, text);
+        }
+    }
+
+    proptest! {
+        /// Masking a masked text changes nothing.
+        #[test]
+        fn masking_twice_changes_nothing(
+            parts in proptest::collection::vec(
+                prop_oneof![
+                    Just("PASSWORD"), Just("password"), Just(" "), Just("'"), Just("''"),
+                    Just("$$"), Just("$a$"), Just("x"), Just("/*"), Just("*/"), Just("--"),
+                    Just("\n"), Just("E'"), Just("U&"), Just("\\"), Just("("), Just(")"),
+                    Just(";"), Just("'ab'"), Just("''cd''"), Just("\""), Just("_"), Just("é"),
+                ],
+                0..40,
+            ),
+        ) {
+            let text: String = parts.concat();
+            let once = mask_password_literals(&text).into_owned();
+            let twice = mask_password_literals(&once).into_owned();
+            prop_assert_eq!(twice, once, "{}", text);
+        }
+    }
 
     #[test]
     fn ordinary_sql_text_with_the_word_password_is_unchanged() {
@@ -553,7 +667,7 @@ mod tests {
     fn nested_password_literal_is_masked() {
         assert_eq!(
             mask("SELECT 'x' AS a WHERE 'PASSWORD ''hunter2-m'''"),
-            "SELECT 'x' AS a WHERE 'PASSWORD '***''"
+            "SELECT 'x' AS a WHERE 'PASSWORD ''***'''"
         );
     }
 
@@ -611,6 +725,13 @@ mod tests {
             mask("ALTER ROLE x PASSWORD U&'abc"),
             "ALTER ROLE x PASSWORD U&'***'"
         );
+    }
+
+    #[test]
+    fn a_quote_after_a_dollar_literal_is_masked_so_a_second_pass_changes_nothing() {
+        let once = mask_password_literals("password $$a$$'");
+        assert_eq!(once, "password '***'");
+        assert_eq!(mask_password_literals(&once), once);
     }
 
     #[test]

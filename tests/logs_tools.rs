@@ -361,7 +361,7 @@ async fn masking_is_applied_end_to_end() {
         })
         .next()
         .unwrap_or_else(|| panic!("no statement entry in {found}"));
-    assert!(text.contains("PASSWORD '***'"), "{text}");
+    assert!(text.contains("PASSWORD ''***''"), "{text}");
     assert!(!text.contains("hunter2"), "{text}");
 }
 

@@ -381,16 +381,16 @@ fn an_md5_token_at_the_end_of_a_cut_hex_run_is_replaced() {
     );
 }
 
-/// An odd trailing hex digit stays where the cut left it.
+/// An odd trailing hex digit after a replaced hash is dropped with the hash.
 #[test]
-fn an_odd_digit_after_a_cut_md5_token_is_kept() {
+fn an_odd_digit_after_a_cut_md5_token_is_dropped() {
     let kept = format!("xx md5{}", &MD5[3..34]);
     let value = format!("\\x{}a", hex_of(&kept));
     let (out, found) = scrub_hex_tail(value.as_bytes());
     assert_eq!(found, 1);
     assert_eq!(
         String::from_utf8_lossy(&out),
-        format!("\\x{}a", hex_of(&format!("xx {REDACTED}")))
+        format!("\\x{}", hex_of(&format!("xx {REDACTED}")))
     );
 }
 
@@ -401,4 +401,79 @@ fn a_cut_hex_run_without_an_md5_token_is_unchanged() {
     let (out, found) = scrub_hex_tail(value.as_bytes());
     assert_eq!(found, 0);
     assert_eq!(out.as_ref(), value.as_bytes());
+}
+
+/// An md5 hash at the end of the text is replaced before any proper prefix of the next token.
+#[test]
+fn an_md5_hash_before_any_prefix_of_the_next_token_is_replaced() {
+    for len in 1..=3 {
+        let prefix = &"md5"[..len];
+        assert_eq!(
+            scrub(&format!("{MD5}{prefix}")),
+            format!("{REDACTED}{prefix}")
+        );
+    }
+    for len in 1..=13 {
+        let prefix = &"SCRAM-SHA-256$"[..len];
+        assert_eq!(
+            scrub(&format!("{MD5}{prefix}")),
+            format!("{REDACTED}{prefix}")
+        );
+    }
+}
+
+proptest! {
+    /// A cut anywhere in packed hashes leaves no whole md5 hash that the full text replaces.
+    #[test]
+    fn a_cut_leaves_no_whole_md5_hash_that_the_full_text_replaces(
+        pieces in proptest::collection::vec(0_u8..4, 1..8),
+        hexes in proptest::collection::vec("[0-9a-f]{32}", 8),
+        cut in 0_usize..400,
+    ) {
+        let mut text = String::new();
+        let mut hashes = Vec::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            match piece {
+                0 => text.push_str(SCRAM),
+                1 => {
+                    let hash = format!("md5{}", hexes[i]);
+                    text.push_str(&hash);
+                    hashes.push(hash);
+                }
+                2 => text.push('-'),
+                _ => text.push(' '),
+            }
+        }
+        let cut = cut.min(text.len());
+        let out = scrub(&text[..cut]).into_owned();
+        for hash in &hashes {
+            prop_assert!(!out.contains(hash.as_str()), "{out}");
+        }
+    }
+}
+
+/// A hex-form marker is never cut in half: the cut moves to the marker's first byte.
+#[test]
+fn a_cut_never_leaves_part_of_a_hex_form_marker_behind() {
+    let text = format!("\\x{}", hex_of(REDACTED));
+    for max in 0..=text.len() {
+        let expected = if (3..text.len()).contains(&max) {
+            2
+        } else {
+            max
+        };
+        assert_eq!(cut_index(text.as_bytes(), max), expected, "max {max}");
+    }
+}
+
+/// The digits a hex tail keeps keep their letter case; the replaced hash is written in lower-case hex.
+#[test]
+fn scrub_hex_tail_keeps_the_case_of_the_digits_it_keeps() {
+    let text = format!("\\xDEADbeef{}a", &hex_of(MD5)[..68]);
+    let (out, found) = scrub_hex_tail(text.as_bytes());
+    assert_eq!(found, 1);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        format!("\\xDEADbeef{}", hex_of(REDACTED))
+    );
 }

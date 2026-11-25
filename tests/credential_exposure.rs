@@ -1723,4 +1723,161 @@ async fn a_hex_form_md5_split_by_the_value_cut_keeps_no_digits() {
     let digits_in_hex: String = "0123456789".bytes().map(|b| format!("{b:02x}")).collect();
     assert!(!value.contains(&digits_in_hex), "{value}");
     assert!(!value.contains("6d6435"), "{value}");
+    let marker_hex: String = REDACTED.bytes().map(|b| format!("{b:02x}")).collect();
+    assert!(value.contains(&marker_hex), "{value}");
+}
+
+/// A password literal nested in a DO block comes back with no password character.
+#[tokio::test]
+async fn a_nested_password_literal_in_a_do_block_is_masked_in_results() {
+    let value =
+        returned_text("DO $$ BEGIN EXECUTE 'ALTER ROLE app PASSWORD ''hunter2'''; END $$").await;
+    assert_eq!(
+        value,
+        "DO $$ BEGIN EXECUTE 'ALTER ROLE app PASSWORD ''***'''; END $$"
+    );
+}
+
+/// A password literal nested in a dblink call comes back with no password character.
+#[tokio::test]
+async fn a_nested_password_literal_in_a_dblink_call_is_masked_in_results() {
+    let value = returned_text("SELECT dblink_exec('ALTER ROLE app PASSWORD ''hunter2''')").await;
+    assert_eq!(
+        value,
+        "SELECT dblink_exec('ALTER ROLE app PASSWORD ''***''')"
+    );
+}
+
+/// A nested password literal that starts with a quote pair comes back with no password character.
+#[tokio::test]
+async fn a_nested_password_literal_after_a_quoted_keyword_is_masked_in_results() {
+    let value = returned_text("'PASSWORD ''hunter2-m'''").await;
+    assert_eq!(value, "'PASSWORD ''***'''");
+}
+
+/// A column name and its row key carry the same masked text.
+#[tokio::test]
+async fn a_column_name_and_its_row_key_are_masked_the_same_way() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let response = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT 1 AS \"password $$a$$'\""}),
+    )
+    .await;
+    let content = &result_of(&response)["structuredContent"];
+    let name = content["columns"][0]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(name, "password '***'", "{response}");
+    assert_eq!(content["rows"][0][name.as_str()], json!(1), "{response}");
+}
+
+/// A cut anywhere between two packed hashes returns no whole md5 hash.
+#[tokio::test]
+async fn a_cut_between_packed_hashes_returns_no_whole_md5_hash() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let md5 = "md5d41d8cd98f00b204e9800998ecf8427e";
+    let scram = "SCRAM-SHA-256$4096:c2FsdA==$a2V5:a2V5";
+    for pad in 4050..4070 {
+        for tail in [md5, scram] {
+            let sql = format!("SELECT repeat('x', {pad}) || ' {md5}{tail}' AS v");
+            let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+            let value = result_of(&response)["structuredContent"]["rows"][0]["v"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            assert!(!value.contains(md5), "pad {pad} tail {tail}: {value}");
+        }
+    }
+}
+
+/// A hex-form marker at the value cut is not left cut in half in a record's text.
+#[tokio::test]
+async fn a_hex_form_marker_is_not_cut_in_half_in_a_record() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let md5 = "md5d41d8cd98f00b204e9800998ecf8427e";
+    let sql =
+        format!("SELECT ROW(convert_to(repeat('x', 2030) || ' {md5} tail', 'UTF8'))::text AS v");
+    let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+    let content = &result_of(&response)["structuredContent"];
+    let value = content["rows"][0]["v"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let marker_hex: String = REDACTED.bytes().map(|b| format!("{b:02x}")).collect();
+    let kept = value.split('…').next().unwrap_or_default();
+    for len in 8..marker_hex.len() {
+        assert!(!kept.ends_with(&marker_hex[..len]), "{len}: {value}");
+    }
+    let shown = value.matches(&marker_hex).count() + value.matches(REDACTED).count();
+    assert_eq!(content["redactedHashes"], json!(shown), "{response}");
+}
+
+/// A non-ASCII dollar tag after PASSWORD in a running statement is masked in list_activity.
+#[tokio::test]
+async fn a_non_ascii_dollar_tag_after_password_is_masked_in_list_activity() {
+    let router = router_for(PORT_18, "postgres", "test-only-superuser");
+    let mut config = superuser_config(PORT_18);
+    config.startup_params = vec![("application_name".to_owned(), "dollar_probe".to_owned())];
+    let mut conn = Connection::connect(&config).await.expect("probe connect");
+    let sql = "SELECT pg_sleep(3) /* PASSWORD $é$hunter2$é$ */";
+    let sleeper = tokio::spawn(async move { conn.simple_query(sql).await.map(|_| ()) });
+    let mut query = String::new();
+    for _ in 0..50 {
+        let listed = call_tool(&router, "list_activity", json!({"all_databases": true})).await;
+        query = result_of(&listed)["structuredContent"]["sessions"]
+            .as_array()
+            .and_then(|sessions| {
+                sessions.iter().find(|s| {
+                    s["application"] == json!("dollar_probe") && s["state"] == json!("active")
+                })
+            })
+            .and_then(|s| s["query"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !query.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    sleeper.await.expect("probe task").expect("probe query");
+    assert!(query.contains("$é$***$é$"), "{query}");
+    assert!(!query.contains("hunter2"), "{query}");
+}
+
+/// A bytea value shows its preview, and a value the wire cut short shows the bytes the wire kept.
+#[tokio::test]
+async fn a_bytea_value_shows_the_preview_or_the_bytes_the_wire_kept() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let small = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT decode(repeat('78', 2047), 'hex') AS v"}),
+    )
+    .await;
+    let value = result_of(&small)["structuredContent"]["rows"][0]["v"].clone();
+    assert_eq!(
+        value,
+        json!(format!(
+            "\\x{}…[truncated: 256 of 2047 bytes]",
+            "78".repeat(256)
+        ))
+    );
+    let large = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT decode(repeat('78', 5000), 'hex') AS v"}),
+    )
+    .await;
+    let value = result_of(&large)["structuredContent"]["rows"][0]["v"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        value.ends_with("…[truncated: 2047 of 5000 bytes]"),
+        "{value}"
+    );
+    assert_eq!(value.matches("78").count(), 2047, "{value}");
 }

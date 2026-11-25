@@ -528,12 +528,12 @@ For this option only, the statement is sent with the simple query protocol, and 
   "truncated": false,
   "truncatedValues": 0,
   "rawFallbacks": 0,
-  "redactedHashes": 0,
-  "executionTimeMs": 2
+  "executionTimeMs": 2,
+  "redactedHashes": 0
 }
 ```
 
-`redactedHashes` is the number of `[redacted password hash]` markers in the result, in column names, row keys and values, and as hex inside bytea values.
+`redactedHashes` is the number of `[redacted password hash]` markers in the result, as text and as the hex of their bytes, in column names, row keys and values.
 
 `columns` lists every result column in SELECT order, even when there are no rows. Each column's `type` is the PostgreSQL type name, such as `int4` or `text`. An array column is named `<element>[]`, such as `int4[]` or `text[]`, for built-in and custom element types alike. A custom type outside the `public` and `pg_catalog` schemas is schema-qualified, such as `types.mood`. A domain column reports its base type. A column has `originalName` only when its name was changed. Duplicate names become `id__2`, `id__3` and so on, with `originalName` set to the name the query used. `rows` holds one object per row, keyed by column name. `truncatedReason` appears only when `truncated` is true. `truncatedValues` counts values that were cut, and `rawFallbacks` counts values that were returned as PostgreSQL text because they did not parse as their type.
 
@@ -552,7 +552,7 @@ The server sets the session's DateStyle to ISO, MDY, IntervalStyle to `iso_8601`
 | arrays | nested JSON arrays, with elements encoded by the same rules and SQL NULL as `null`. An array with non-default lower bounds is `{"lowerBounds": [...], "elements": [...]}`. |
 | ranges | `{"lower": ..., "upper": ..., "lowerInc": true, "upperInc": false}`, where an unbounded bound is `null`, or `{"empty": true}` |
 | multiranges | an array of range objects |
-| `bytea` | `"\x"` followed by hex. Longer values show `MAX_BINARY_PREVIEW_BYTES` bytes, then `…[truncated: X of Y bytes]`. A value that the wire cut short shows up to `MAX_VALUE_BYTES` decoded bytes instead. |
+| `bytea` | `"\x"` followed by hex. A value of up to `(MAX_VALUE_BYTES - 2) / 2` bytes shows its first `MAX_BINARY_PREVIEW_BYTES` bytes when it is longer than that, then `…[truncated: X of Y bytes]`. A longer value shows the `(MAX_VALUE_BYTES - 2) / 2` bytes the wire kept, then `…[truncated: X of Y bytes]`. |
 | `text`, `varchar`, `char`, `name`, `uuid`, `inet`, `cidr`, `macaddr`, `money`, `bit`, `xml`, geometric types, `tsvector`, `tsquery` | PostgreSQL's own text |
 | enum, composite and extension types (`hstore`, `vector`, PostGIS geometry and so on) | PostgreSQL's own text. Use `to_jsonb(col)`, `ST_AsGeoJSON(col)` or `col::text` for another shape. |
 | domain | the encoding of its base type, so a domain over `integer` is a number |
@@ -564,7 +564,7 @@ Size caps apply in this order:
 
 - **Rows.** At most `MAX_ROWS` rows (default 1000) are returned. If another row exists, `truncated` is true and `truncatedReason` is `row_limit`.
 - **Response budget.** The raw bytes of the kept values are summed. When the next row would take the total past `MAX_RESPONSE_BYTES` (default 48000), the result stops there with `truncatedReason` set to `response_size`. The first row is always returned, even when it alone exceeds the budget. The JSON text can be somewhat larger than the raw byte count.
-- **Values.** Each text or JSON value is cut at `MAX_VALUE_BYTES`. An array is decoded in full unless its text is more than 16 times that size, and then it is cut as text at `MAX_VALUE_BYTES`. Each `bytea` value is cut at `MAX_BINARY_PREVIEW_BYTES`, or at `MAX_VALUE_BYTES` when the wire cut it short.
+- **Values.** Each text or JSON value is cut at `MAX_VALUE_BYTES`. An array is decoded in full unless its text is more than 16 times that size, and then it is cut as text at `MAX_VALUE_BYTES`. Each `bytea` value is cut at `MAX_BINARY_PREVIEW_BYTES`. The wire keeps `MAX_VALUE_BYTES` characters of a longer value's hex text, so that value shows `(MAX_VALUE_BYTES - 2) / 2` bytes.
 
 `truncated: true` always means the result is partial, and it is never silent. Add a `LIMIT`, an aggregate or fewer columns, and use `ORDER BY` for a stable page.
 
@@ -613,7 +613,7 @@ The threat model and every layer are described in [SECURITY.md](SECURITY.md). In
 
 - **Database role.** The role is the real boundary. Use the read-only role above, with `default_transaction_read_only` set, and never share it with an application.
 - **Gate.** Each statement is parsed and checked against an allow-list of node types, a deny-list of functions, and lists of credential catalogs and secret settings. The statistics views `pg_stats`, `pg_stats_ext` and `pg_stats_ext_exprs` are read through a filter that drops the rows of pg_authid, pg_user_mapping, pg_subscription, pg_db_role_setting, pg_statistic, pg_statistic_ext_data and pg_largeobject, with a planner fence so that a caller's predicate cannot run on a hidden row. This holds for every role, superusers included. The TOAST tables of all catalogs are refused by name, and so are the foreign server and foreign-data wrapper catalogs.
-- **Password hash scrubber.** Every tool result, resource body, completion and error text, and every log field that can carry text from the database, is scanned before it leaves the server, and text shaped like a PostgreSQL password hash in its stored form (SCRAM-SHA-256 verifier or md5 hash) is replaced with [redacted password hash]. It is always on and cannot be configured off. Each successful tool result carries the number of markers it returns as `redactedHashes`; the audit line and a warning line carry the same count for tools, resources and completions. A quoted literal after the keyword PASSWORD, as in CREATE ROLE or ALTER ROLE, is replaced with '***' in every string value on a best-effort basis; that mask is not counted. Error texts and log lines get the hash replacement only.
+- **Password hash scrubber.** Every tool result, resource body, completion and error text, and every log field that can carry text from the database, is scanned before it leaves the server, and text shaped like a PostgreSQL password hash in its stored form (SCRAM-SHA-256 verifier or md5 hash) is replaced with [redacted password hash]. It is always on and cannot be configured off. Each successful tool result carries the number of markers it returns as `redactedHashes`; the audit line and a warning line carry the same count for tools, resources and completions. A quoted literal that follows the keyword PASSWORD after whitespace or a comment, as in CREATE ROLE or ALTER ROLE, is replaced with '***' in every string value and column name on a best-effort basis; that mask is not counted. Error texts and log lines get the hash replacement only.
 - **Transaction.** Every call runs in `BEGIN READ ONLY` with statement, lock and idle timeouts, and is rolled back. A query that outlives its time limit is cancelled on the server.
 - **Session.** Each connection is checked before use and reset with `ROLLBACK` and `DISCARD ALL` after it, so no session state reaches the next caller.
 - **Caps.** Rows, values, response bytes, request bytes and SQL text are all capped.

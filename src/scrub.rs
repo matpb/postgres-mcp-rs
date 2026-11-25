@@ -45,9 +45,12 @@ fn hash_end(bytes: &[u8], at: usize, after_marker: bool) -> Option<usize> {
         }
         let before_ok = after_marker || at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
         let rest_after = bytes.get(digits_end..).unwrap_or_default();
+        let cut_prefix = !rest_after.is_empty()
+            && (SCRAM_PREFIX.starts_with(rest_after) || MD5_PREFIX.starts_with(rest_after));
         let after_ok = !rest_after.first().is_some_and(u8::is_ascii_alphanumeric)
             || rest_after.starts_with(SCRAM_PREFIX)
-            || rest_after.starts_with(MD5_PREFIX);
+            || rest_after.starts_with(MD5_PREFIX)
+            || cut_prefix;
         return (before_ok && after_ok).then_some(digits_end);
     }
     None
@@ -155,9 +158,9 @@ pub fn scrub_hex_tail(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
     if found == 0 {
         return (Cow::Borrowed(bytes), 0);
     }
-    let mut out = bytes[..run_start].to_vec();
-    out.extend_from_slice(hex_text(&tail).as_bytes());
-    out.extend_from_slice(&run[even..]);
+    let kept = tail.len() - REDACTED.len();
+    let mut out = bytes[..run_start + 2 * kept].to_vec();
+    out.extend_from_slice(hex_text(REDACTED.as_bytes()).as_bytes());
     (Cow::Owned(out), found)
 }
 
@@ -245,12 +248,29 @@ pub fn cut_index(text: &[u8], max: usize) -> usize {
         return text.len();
     }
     let from = (max + 1).saturating_sub(REDACTED.len());
-    for start in from..max {
-        if text[start..].starts_with(REDACTED.as_bytes()) {
-            return start;
-        }
+    let text_start = (from..max).find(|&start| text[start..].starts_with(REDACTED.as_bytes()));
+    text_start
+        .into_iter()
+        .chain(hex_marker_start(text, max))
+        .min()
+        .unwrap_or(max)
+}
+
+/// The start of a hex-form marker that a cut at `max` splits inside a `\x` run, when there is one.
+fn hex_marker_start(text: &[u8], max: usize) -> Option<usize> {
+    let mut run_start = max;
+    while run_start > 0 && text[run_start - 1].is_ascii_hexdigit() {
+        run_start -= 1;
     }
-    max
+    if run_start < 2 || text[run_start - 1] != b'x' || text[run_start - 2] != b'\\' {
+        return None;
+    }
+    let run = &text[run_start..max];
+    let marker = hex_text(REDACTED.as_bytes());
+    let first = run.len().saturating_sub(marker.len() - 1);
+    (first..run.len())
+        .find(|&s| s % 2 == 0 && run[s..].eq_ignore_ascii_case(&marker.as_bytes()[..run.len() - s]))
+        .map(|s| run_start + s)
 }
 
 /// `text` with a hash cut at its end replaced, when one is there.
