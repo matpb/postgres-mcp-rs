@@ -477,3 +477,10 @@ fn scrub_hex_tail_keeps_the_case_of_the_digits_it_keeps() {
         format!("\\xDEADbeef{}", hex_of(REDACTED))
     );
 }
+
+/// Ordinary hex that ends in the start of a marker's hex is not a marker: the cut stays where it was asked.
+#[test]
+fn an_ordinary_hex_run_ending_in_marker_hex_is_cut_where_asked() {
+    assert_eq!(cut_index(b"\\xaabb5b", 7), 7);
+    assert_eq!(cut_index(b"\\xaabb5b72", 9), 9);
+}

@@ -1881,3 +1881,129 @@ async fn a_bytea_value_shows_the_preview_or_the_bytes_the_wire_kept() {
     );
     assert_eq!(value.matches("78").count(), 2047, "{value}");
 }
+
+/// The `query` that list_activity shows for a superuser statement that sleeps, run under `app`.
+async fn activity_query(app: &str, sql: &str) -> String {
+    let router = router_for(PORT_18, "postgres", "test-only-superuser");
+    let mut config = superuser_config(PORT_18);
+    config.startup_params = vec![("application_name".to_owned(), app.to_owned())];
+    let mut conn = Connection::connect(&config).await.expect("probe connect");
+    let statement = sql.to_owned();
+    let sleeper = tokio::spawn(async move { conn.simple_query(&statement).await.map(|_| ()) });
+    let mut query = String::new();
+    for _ in 0..50 {
+        let listed = call_tool(&router, "list_activity", json!({"all_databases": true})).await;
+        query = result_of(&listed)["structuredContent"]["sessions"]
+            .as_array()
+            .and_then(|sessions| {
+                sessions
+                    .iter()
+                    .find(|s| s["application"] == json!(app) && s["state"] == json!("active"))
+            })
+            .and_then(|s| s["query"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !query.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    sleeper.await.expect("probe task").expect("probe query");
+    query
+}
+
+/// A quote after a dollar-quoted PASSWORD literal deletes no text, and the later password is masked.
+#[tokio::test]
+async fn a_quote_after_a_dollar_literal_in_a_do_block_deletes_no_text() {
+    let value = returned_text(
+        "DO $do$ BEGIN EXECUTE 'ALTER ROLE a PASSWORD $$x1$$'; ALTER ROLE b PASSWORD 'hunter2'; END $do$",
+    )
+    .await;
+    assert_eq!(
+        value,
+        "DO $do$ BEGIN EXECUTE 'ALTER ROLE a PASSWORD '***'; ALTER ROLE b PASSWORD '***'; END $do$"
+    );
+}
+
+/// A nested literal that starts with a parenthesis is masked, with its nesting quotes kept.
+#[tokio::test]
+async fn a_nested_literal_starting_with_a_parenthesis_is_masked_in_results() {
+    let value = returned_text("EXECUTE 'ALTER ROLE app PASSWORD '')hunter2'''").await;
+    assert_eq!(value, "EXECUTE 'ALTER ROLE app PASSWORD ''***'''");
+}
+
+/// An empty literal before a comment does not turn the next password into a nested literal.
+#[tokio::test]
+async fn an_empty_literal_before_a_comment_leaves_the_next_password_masked_once() {
+    let value =
+        returned_text("ALTER ROLE a PASSWORD ''/* none */; ALTER ROLE b PASSWORD 'hunter2';").await;
+    assert_eq!(
+        value,
+        "ALTER ROLE a PASSWORD '***'/* none */; ALTER ROLE b PASSWORD '***';"
+    );
+}
+
+/// Whitespace of any length between PASSWORD and its literal is free: the literal is masked.
+#[tokio::test]
+async fn a_literal_after_three_hundred_spaces_is_masked_in_execute_query() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let response = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT 'ALTER ROLE a PASSWORD' || repeat(' ', 300) || '''hunter2''' AS v"}),
+    )
+    .await;
+    let value = result_of(&response)["structuredContent"]["rows"][0]["v"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(value.ends_with("'***'"), "{response}");
+    assert!(!response.to_string().contains("hunter2"), "{response}");
+}
+
+/// A column name and its row key are the same string, whatever the alias holds.
+#[tokio::test]
+async fn column_names_and_row_keys_are_the_same_string_in_every_case() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    for alias in [
+        "password /* password ' */ x' */ 'secret'",
+        "password $$a$$'",
+    ] {
+        let sql = format!("SELECT 1 AS \"{alias}\", 2 AS \"password 'b'\"");
+        let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+        let content = &result_of(&response)["structuredContent"];
+        let columns = content["columns"].as_array().expect("columns");
+        assert_eq!(columns.len(), 2, "{response}");
+        for column in columns {
+            let name = column["name"].as_str().unwrap_or_default();
+            assert!(
+                content["rows"][0].get(name).is_some(),
+                "{name:?} is not a row key in {response}"
+            );
+        }
+    }
+}
+
+/// A nested literal in a running statement, after a comment, is masked in list_activity.
+#[tokio::test]
+async fn a_nested_literal_starting_with_a_parenthesis_is_masked_in_list_activity() {
+    let query = activity_query(
+        "nested_paren_probe",
+        "SELECT pg_sleep(4), $q$EXECUTE 'ALTER ROLE app PASSWORD '')hunter2'''$q$",
+    )
+    .await;
+    assert!(query.contains("''***'''"), "{query}");
+    assert!(!query.contains("hunter2"), "{query}");
+}
+
+/// A literal after a comment is masked in list_activity.
+#[tokio::test]
+async fn a_literal_after_a_comment_is_masked_in_list_activity() {
+    let query = activity_query(
+        "comment_probe",
+        "SELECT pg_sleep(4), $q$ALTER ROLE x PASSWORD /* c */ 'hunter2'$q$",
+    )
+    .await;
+    assert!(query.contains("PASSWORD /* c */ '***'"), "{query}");
+    assert!(!query.contains("hunter2"), "{query}");
+}

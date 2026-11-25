@@ -265,12 +265,16 @@ fn hex_marker_start(text: &[u8], max: usize) -> Option<usize> {
     if run_start < 2 || text[run_start - 1] != b'x' || text[run_start - 2] != b'\\' {
         return None;
     }
-    let run = &text[run_start..max];
     let marker = hex_text(REDACTED.as_bytes());
-    let first = run.len().saturating_sub(marker.len() - 1);
-    (first..run.len())
-        .find(|&s| s % 2 == 0 && run[s..].eq_ignore_ascii_case(&marker.as_bytes()[..run.len() - s]))
-        .map(|s| run_start + s)
+    let marker = marker.as_bytes();
+    // Only a whole marker in the text that straddles the cut moves it; a partial prefix does not.
+    let first = max.saturating_sub(marker.len() - 1).max(run_start);
+    (first..max).find(|&p| {
+        (p - run_start).is_multiple_of(2)
+            && text
+                .get(p..p + marker.len())
+                .is_some_and(|hex| hex.eq_ignore_ascii_case(marker))
+    })
 }
 
 /// `text` with a hash cut at its end replaced, when one is there.

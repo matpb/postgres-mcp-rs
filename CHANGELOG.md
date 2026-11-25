@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.5]
+
+### Fixed
+
+- A quote that follows a dollar-quoted PASSWORD literal no longer swallows the text after it, which could expose a later password.
+- A nested PASSWORD literal that starts with a space, a comma, a semicolon or a parenthesis is masked.
+- Any amount of whitespace between PASSWORD and its literal is accepted; only comments count against the 256-byte limit.
+- Column names and row keys are the same string in every case.
+- The statement text of list_activity and query_stats and the entries of read_server_log mask a literal that follows PASSWORD and a comment.
+
 ## [0.1.4]
 
 ### Fixed
@@ -11,6 +21,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A password literal nested in a quoted statement, as in EXECUTE 'ALTER ROLE ... PASSWORD ''...''', is masked again.
 - An md5 hash is replaced when the value cut lands inside the token that follows it.
 - A hex-form marker is never cut in half.
+- A nested PASSWORD literal is written as ''***'' in results and in list_activity, query_stats and read_server_log; 0.1.3 wrote '***'.
+- An md5 hash at the end of a value is replaced when only the first letters of md5 or SCRAM-SHA-256$ follow it.
+- An odd hex digit after an md5 hash cut at the end of a hex run is dropped with the hash.
 
 ## [0.1.3]
 
