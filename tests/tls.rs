@@ -363,6 +363,51 @@ async fn verify_full_accepts_dns_name_and_rejects_ip_when_only_dns_name_is_certi
     assert!(matches!(err, WireError::Tls(_)), "{err:?}");
 }
 
+/// A leaf signed by the root whose only name is its common name: libpq accepts it, the server does not.
+#[tokio::test]
+async fn common_name_only_certificate_is_refused_by_verify_full_and_accepted_by_verify_ca() {
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "pgmcp test ca");
+    let ca_pem = ca_params.self_signed(&ca_key).expect("ca cert").pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "localhost");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("leaf cert");
+    let chain = vec![leaf.der().clone()];
+    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+    let port = spawn_server_for_all(chain, key).await;
+    let ca = TempPem::write("cn-only", &ca_pem);
+
+    let err = Connection::connect(&cfg(
+        port,
+        "localhost",
+        SslMode::VerifyFull,
+        Some(ca.path()),
+    ))
+    .await
+    .expect_err_with("a common name is not a host name for verify-full");
+    match err {
+        WireError::Tls(message) => assert_eq!(
+            message,
+            "invalid peer certificate: certificate not valid for name \"localhost\"; certificate is not valid for any names (according to its subjectAltName extension)"
+        ),
+        other => panic!("expected a TLS error, got {other:?}"),
+    }
+    let accepted =
+        Connection::connect(&cfg(port, "localhost", SslMode::VerifyCa, Some(ca.path()))).await;
+    assert!(accepted.is_ok(), "{:?}", accepted.err());
+}
+
 #[tokio::test]
 async fn verify_ca_without_root_cert_is_refused_before_connecting() {
     let certs = make_certs();

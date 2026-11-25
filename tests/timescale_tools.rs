@@ -207,6 +207,34 @@ async fn describe_hypertable_reports_dimensions_columnstore_and_policies() {
 }
 
 #[tokio::test]
+async fn describe_hypertable_sizes_add_up_and_match_hypertable_size() {
+    let router = ro();
+    let described = call(
+        &router,
+        "describe_hypertable",
+        json!({"hypertable": "metrics.readings"}),
+    )
+    .await;
+    let sizes = ok(&described)["sizes"].clone();
+    let reference = call(
+        &router,
+        "execute_query",
+        json!({"sql": "SELECT hypertable_size('metrics.readings') AS total, \
+            d.table_bytes + d.toast_bytes AS table, d.index_bytes AS index, d.toast_bytes AS toast \
+            FROM hypertable_detailed_size('metrics.readings') d"}),
+    )
+    .await;
+    let row = &ok(&reference)["rows"][0];
+    assert_eq!(sizes["totalBytes"], row["total"], "{sizes}");
+    assert_eq!(sizes["tableBytes"], row["table"], "{sizes}");
+    assert_eq!(sizes["indexBytes"], row["index"], "{sizes}");
+    assert_eq!(sizes["toastBytes"], row["toast"], "{sizes}");
+    let table = sizes["tableBytes"].as_i64().expect("table bytes");
+    let index = sizes["indexBytes"].as_i64().expect("index bytes");
+    assert_eq!(table + index, sizes["totalBytes"].as_i64().expect("total"));
+}
+
+#[tokio::test]
 async fn describe_hypertable_chunk_paging_walks_every_chunk_once() {
     let router = ro();
     let total = live_chunk_count(&router).await;

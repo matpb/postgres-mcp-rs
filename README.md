@@ -162,7 +162,7 @@ For local development only, a broader profile is simpler:
 GRANT pg_read_all_data, pg_monitor TO mcp_reader;
 ```
 
-It is broader because `pg_read_all_data` reads every table in every schema, present and future, so the role can read data no application would expose.
+It is broader because `pg_read_all_data` reads every table in every schema, present and future, so the role can read data no application would expose. With it the role can also read sampled catalog values through pg_stats, which can include password hashes.
 
 The server works with any role and never needs write privileges. `get_privileges` reports what the connected role can do and flags anything beyond read access, such as the ability to write, create or act as superuser.
 
@@ -256,6 +256,8 @@ The `*_FILE` variants keep secrets out of the environment. `API_KEY_FILE` reads 
 
 The trusted roots are the PEM file named by `sslrootcert` (or `PGSSLROOTCERT`), or the inline PEM named by `sslrootcert_pem` (or `PGSSLROOTCERT_PEM`), when one is set, and otherwise the bundled Mozilla root set (webpki-roots), not the operating system store. A private certificate authority therefore needs `sslrootcert` or its inline form. `verify-ca` needs one of them: without it the configuration fails with an error that ends `sslmode=verify-ca needs sslrootcert`. `verify-full` without a root checks against the bundled roots. Files and inline PEM are read once, when the server starts. A file that cannot be read, or PEM that holds no certificate, stops startup with a configuration error. Use `verify-full` for any database that is reached over a network.
 
+Unlike libpq, the server does not turn sslmode=require into certificate verification when a root certificate is given: it refuses that combination, so a configuration never looks verified when it is not.
+
 ### TLS with a private certificate authority
 
 A server whose certificate is signed by your own CA is verified with that CA certificate, given as `sslrootcert`, with `sslmode=verify-full`:
@@ -265,6 +267,7 @@ export DATABASE_URL='postgres://mcp_reader:change-me-reader-password@db.example.
 ```
 
 - The host name in the URL must be one of the names in the server certificate. An IP address fails unless the certificate lists that address. `verify-ca` checks the chain without the name, and only where that is acceptable.
+- The server certificate must carry the host name in its subject alternative names. A certificate that has the name only in its common name (CN) is refused, even though libpq accepts it.
 - The inline alternative avoids a mounted file. In a JSON entry use `sslrootcert_pem`. For the `DATABASE_URL` and `PG*` forms use `PGSSLROOTCERT_PEM`, where a literal `\n` is read as a newline. Give one form of an item, never both.
 - A server that requires a client certificate, with `hostssl ... clientcert=verify-full` in `pg_hba.conf` or with `cert` authentication, needs `sslcert` and `sslkey`, or `PGSSLCERT` and `PGSSLKEY`, or the `_PEM` forms. The key must be an unencrypted PEM key: PKCS#8, PKCS#1 (RSA) or SEC1 (EC). An encrypted key stops startup. The certificate file holds the leaf certificate first, and may be followed by intermediate certificates. It must match the key. The certificate is offered whenever the server asks for one. Client certificates need a `sslmode` other than `disable`. With `sslmode=prefer`, a server that refuses TLS gets a plain connection, and no certificate is sent.
 - All these settings are read once at startup. Keys are never written to the log or to an error text.
@@ -279,6 +282,8 @@ docker run -d --name postgres-mcp \
   -e 'API_KEY=change-me-to-a-random-key-of-16-plus-chars' \
   postgres-mcp:local
 ```
+
+The container runs as user 65532, so a mounted certificate or key file must be readable by that user.
 
 The same with a Compose `secrets:` entry, which mounts the file at `/run/secrets/db_ca`:
 
@@ -305,7 +310,7 @@ The client also refuses a SCRAM server that ends authentication without proving 
 
 ### Connection errors
 
-A failed connection reaches the client as one short text that names the database, for example `Database "appdb" is unavailable: authentication failed`. The text is one of `authentication failed`, `the database does not exist`, `too many connections`, `the server refused the connection (SQLSTATE code)`, `cannot connect to the server`, `TLS negotiation failed`, `connection timed out` or `unexpected reply from the server`. When every pooled connection of a database is in use, the text is `all connections are busy, retry shortly`. The PostgreSQL message and its detail are written to the server log only.
+A failed connection reaches the client as one short text that names the database, for example `Database "appdb" is unavailable: authentication failed`. The text is one of `authentication failed`, `the database does not exist`, `too many connections`, `the server refused the connection (SQLSTATE code)`, `cannot connect to the server`, `TLS negotiation failed`, `connection timed out` or `unexpected reply from the server`. When every pooled connection of a database is in use, the text is `all connections are busy, retry shortly`. The PostgreSQL message and its SQLSTATE, or the TLS or socket error, are written to the server log only, with the role name in the message replaced by `<user>`.
 
 ### HTTP and authentication
 
@@ -346,6 +351,8 @@ A database configured through the `DATABASE_URL` or `PG*` forms holds at most 4 
 | `LOG_FORMAT` | `text` | Format of log lines on stderr: `text` or `json`. |
 | `LOG_LEVEL` | `info` | Log level, used when `RUST_LOG` is unset. The filter is `info,rmcp=warn`: `LOG_LEVEL=x` gives `x,rmcp=warn`, except `debug` and `trace`, which apply to `rmcp` too. |
 | `RUST_LOG` | unset | Log filter in `tracing` syntax, used verbatim. Takes precedence over `LOG_LEVEL`. |
+
+At debug and trace level the MCP library logs whole requests and responses, which include SQL text and result rows: use those levels only for troubleshooting.
 
 ## Tools
 
@@ -392,7 +399,7 @@ The server exposes 20 tools in five toolsets. `core` is always on. Every tool ex
 | Tool | What it does |
 |------|--------------|
 | `list_hypertables` | Hypertables with time dimension, chunk interval, chunk count, columnstore state, size and approximate row count. |
-| `describe_hypertable` | One hypertable in detail: dimensions, columnstore settings, attached policies and its chunks, newest first. |
+| `describe_hypertable` | One hypertable in detail: dimensions, columnstore settings, attached policies and its chunks, newest first. Its `tableBytes` is the heap and TOAST, `indexBytes` the indexes and `totalBytes` everything. |
 | `list_continuous_aggregates` | Continuous aggregates with their source hypertable, defining query, real-time setting, refresh policy and watermark. |
 | `list_jobs` | TimescaleDB jobs and policies with schedule and last run, and optionally recent runs and failures. |
 
@@ -645,6 +652,7 @@ Tests that need a database connect only to the test stack on loopback ports 1543
 | `Database "appdb" is unavailable: authentication failed` | The password or user is wrong, or the server asks for MD5 or cleartext and `require_auth` does not allow that method. | Check the credentials. If the server uses MD5 or cleartext, list the method in `require_auth`; cleartext also needs TLS. See [Authentication to PostgreSQL](#authentication-to-postgresql). |
 | `Database "appdb" is unavailable: TLS negotiation failed` | The TLS handshake failed: the server does not offer TLS, or its certificate did not verify. | Use an `sslmode` the server supports. For `verify-ca` or `verify-full`, set `sslrootcert` to the CA that signed the server certificate; a private CA needs it. See [TLS](#tls). |
 | `Database "appdb" is unavailable: TLS negotiation failed` with `sslmode=verify-full`, and the URL names an IP address or a host that the certificate does not list | Certificate name mismatch: the host name is not one of the names in the server certificate. | Connect with a name the certificate lists, or reissue the certificate with that name. `verify-ca` checks the chain without the name. See [TLS with a private certificate authority](#tls-with-a-private-certificate-authority). |
+| `Database "appdb" is unavailable: TLS negotiation failed` with `sslmode=verify-full` and a private CA whose certificate has no subject alternative name | The certificate names the host only in its common name. The server does not accept a common name as the host name, although libpq does. | Reissue the certificate with `subjectAltName=DNS:<host>`. The server log line for the connection names the cause. |
 | `Database "appdb" is unavailable: TLS negotiation failed` with a server certificate from a private CA | Unknown issuer: `sslrootcert` is missing, or names a CA other than the one that signed the server certificate. | Set `sslrootcert`, or `sslrootcert_pem` in JSON, to the CA certificate that signed the server certificate. |
 | `Database "appdb" is unavailable: authentication failed`, when the server requires a client certificate | The client sent no certificate, or none that the server trusts. The server's reply is `connection requires a valid client certificate` and is written to the server log only. | Set `sslcert` and `sslkey` (or `PGSSLCERT` and `PGSSLKEY`, or the `_PEM` forms) to a certificate that the server's CA signed. With `clientcert=verify-full` its CN must equal the role name. A certificate from an untrusted CA gives `TLS negotiation failed` instead. |
 | Startup stops with `sslmode=verify-ca needs sslrootcert` | `verify-ca` checks the chain against a root certificate, and none was given. | Set `sslrootcert` to the CA file. |
@@ -672,6 +680,7 @@ Tests that need a database connect only to the test stack on loopback ports 1543
 - **HTTP keeps no session state.** Each POST to `/mcp` is answered independently with a JSON body.
 - **Log tool needs file access.** Managed PostgreSQL services without access to log files cannot use `read_server_log`, and the tool reports that.
 - **Shared key.** The API key is one secret for every caller. Rotate it by restarting the server with a new value.
+- **Several round trips per call.** Each tool call opens a read-only transaction, checks the session, runs the statement and resets the session, which is five or six round trips. Place the server close to the database.
 
 ## License
 

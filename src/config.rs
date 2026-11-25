@@ -435,6 +435,20 @@ fn resolve_tls(
         )));
     }
     let has_root = inputs.root_file.is_some() || inputs.root_pem.is_some();
+    // A root that the mode never checks would look verified in the logs, so the combination is refused.
+    if has_root && matches!(mode, SslMode::Prefer | SslMode::Require) {
+        return Err(ConfigError(format!(
+            "{}: sslrootcert is set but sslmode={} does not verify the server; use sslmode=verify-ca or sslmode=verify-full",
+            names.sslmode,
+            mode.as_str()
+        )));
+    }
+    if has_root && mode == SslMode::Disable {
+        return Err(ConfigError(format!(
+            "{}: sslrootcert is set but sslmode=disable does not use TLS; use sslmode=verify-ca or sslmode=verify-full",
+            names.sslmode
+        )));
+    }
     // verify-ca checks the chain only, so it needs a root certificate to check against.
     if mode == SslMode::VerifyCa && !has_root {
         return Err(ConfigError(format!(

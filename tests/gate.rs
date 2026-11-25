@@ -353,11 +353,37 @@ fn relation_denied_message_is_exact() {
     assert_eq!(rejection.code, "relation_denied");
     assert_eq!(
         rejection.message,
-        "pg_shadow can expose credentials and is not readable through this server. Use the server_info tool for settings."
+        "Relation pg_shadow is not readable through this server. It can expose credentials."
     );
     assert_eq!(
         gate("SELECT * FROM pg_roles").map(|a| a.kind),
         Ok(StatementKind::Select)
+    );
+}
+
+#[test]
+fn settings_relations_keep_the_server_info_message() {
+    for name in ["pg_settings", "pg_file_settings"] {
+        let rejection = gate(&format!("SELECT * FROM pg_catalog.{name}")).expect_err(name);
+        assert_eq!(rejection.code, "relation_denied", "{name}");
+        assert_eq!(
+            rejection.message,
+            format!(
+                "{name} can expose credentials and is not readable through this server. Use the server_info tool for settings."
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn user_mappings_underscore_view_is_denied_with_exact_message() {
+    let rejection = gate("SELECT umoptions FROM information_schema._pg_user_mappings")
+        .expect_err("user mapping view with passwords");
+    assert_eq!(rejection.code, "relation_denied");
+    assert_eq!(
+        rejection.message,
+        "Relation _pg_user_mappings is not readable through this server. It can expose credentials."
     );
 }
 
@@ -516,7 +542,7 @@ fn catalog_config_relation_is_denied_with_exact_message() {
     assert_eq!(rejection.code, "relation_denied");
     assert_eq!(
         rejection.message,
-        "pg_config can expose credentials and is not readable through this server. Use the server_info tool for settings."
+        "Relation pg_config is not readable through this server. It can expose credentials."
     );
 }
 
@@ -975,7 +1001,7 @@ fn dotted_current_setting_is_rejected_with_the_computed_name_message() {
         assert_eq!(rejection.code, "setting_denied", "{sql}");
         assert_eq!(
             rejection.message,
-            "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name.",
+            "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name. If it is a column of yours, give it another name with AS in a subquery.",
             "{sql}"
         );
     }
@@ -1060,13 +1086,13 @@ fn internal_schema_and_pgmcp_qualified_relations_use_exact_messages() {
     assert_eq!(rejection.code, "relation_denied");
     assert_eq!(
         rejection.message,
-        "user_mapping_options can expose credentials and is not readable through this server. Use the server_info tool for settings."
+        "Relation user_mapping_options is not readable through this server. It can expose credentials."
     );
     let rejection = gate("SELECT * FROM pg_catalog.pg_statistic").expect_err("statistics");
     assert_eq!(rejection.code, "relation_denied");
     assert_eq!(
         rejection.message,
-        "pg_statistic can expose credentials and is not readable through this server. Use the server_info tool for settings."
+        "Relation pg_statistic is not readable through this server. It can expose credentials."
     );
 }
 

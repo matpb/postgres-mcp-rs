@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 15ac48ae756bfbb46d53a7a40601d01fc994c2109ac8fead517d8389850f8486 # shrinks to idx = Index(14259446339186524563), seed = 0, flags = 0
+cc 5ee23acee1cb04c0f467224699390f345814685af3c6135ea96b082cc5db5376 # shrinks to idx = Index(12439183743191115266), seed = 0, flags = 0

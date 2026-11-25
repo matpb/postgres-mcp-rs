@@ -269,7 +269,7 @@ fn libpq_vars() {
         ("PGDATABASE", "pdb"),
         ("PGUSER", "pu"),
         ("PGPASSWORD", "ppw"),
-        ("PGSSLMODE", "require"),
+        ("PGSSLMODE", "verify-full"),
         ("PGSSLROOTCERT", "/etc/root.pem"),
         ("PG_NAME", "main"),
     ]);
@@ -280,7 +280,7 @@ fn libpq_vars() {
     assert_eq!(db.connect.database, "pdb");
     assert_eq!(db.connect.user, "pu");
     assert_eq!(db.connect.password.as_deref(), Some("ppw"));
-    assert_eq!(db.connect.ssl_mode, SslMode::Require);
+    assert_eq!(db.connect.ssl_mode, SslMode::VerifyFull);
     assert_eq!(
         db.connect.ssl_root_cert,
         Some(PathBuf::from("/etc/root.pem"))
@@ -950,6 +950,129 @@ fn verify_ca_needs_sslrootcert_in_each_source() {
     assert_eq!(full.databases[0].connect.ssl_mode, SslMode::VerifyFull);
 }
 
+/// A root certificate with a mode that does not verify the server is refused in every database form.
+#[test]
+fn root_certificate_with_a_non_verifying_mode_is_refused_in_each_form() {
+    let file = TempFile::new("unused");
+    let root = file.path();
+    let refused = [
+        (
+            "prefer",
+            "sslrootcert is set but sslmode=prefer does not verify the server; use sslmode=verify-ca or sslmode=verify-full",
+        ),
+        (
+            "require",
+            "sslrootcert is set but sslmode=require does not verify the server; use sslmode=verify-ca or sslmode=verify-full",
+        ),
+        (
+            "disable",
+            "sslrootcert is set but sslmode=disable does not use TLS; use sslmode=verify-ca or sslmode=verify-full",
+        ),
+    ];
+    for (mode, text) in refused {
+        assert_eq!(
+            load_err(&[
+                ("PGDATABASE", "pdb"),
+                ("PGUSER", "pu"),
+                ("PGSSLMODE", mode),
+                ("PGSSLROOTCERT", root.as_str()),
+            ]),
+            format!("PGSSLMODE: {text}"),
+            "libpq file, {mode}"
+        );
+        assert_eq!(
+            load_err(&[
+                ("PGDATABASE", "pdb"),
+                ("PGUSER", "pu"),
+                ("PGSSLMODE", mode),
+                ("PGSSLROOTCERT_PEM", "x"),
+            ]),
+            format!("PGSSLMODE: {text}"),
+            "libpq inline, {mode}"
+        );
+        let url =
+            format!("postgres://app:pw@db.example.com/appdb?sslmode={mode}&sslrootcert={root}");
+        assert_eq!(
+            load_err(&[("DATABASE_URL", url.as_str())]),
+            format!("DATABASE_URL: {text}"),
+            "URL file, {mode}"
+        );
+        let url = format!("postgres://app:pw@db.example.com/appdb?sslmode={mode}");
+        assert_eq!(
+            load_err(&[("DATABASE_URL", url.as_str()), ("PGSSLROOTCERT_PEM", "x")]),
+            format!("DATABASE_URL: {text}"),
+            "URL inline, {mode}"
+        );
+        let entry = format!(
+            r#"[{{"name":"a","database":"db","user":"u","sslmode":"{mode}","sslrootcert":"{root}"}}]"#
+        );
+        assert_eq!(
+            load_err(&[("PG_DATABASES", entry.as_str())]),
+            format!("PG_DATABASES[0] (\"a\"): {text}"),
+            "JSON file, {mode}"
+        );
+        let entry = format!(
+            r#"[{{"name":"a","database":"db","user":"u","sslmode":"{mode}","sslrootcert_pem":"x"}}]"#
+        );
+        assert_eq!(
+            load_err(&[("PG_DATABASES", entry.as_str())]),
+            format!("PG_DATABASES[0] (\"a\"): {text}"),
+            "JSON inline, {mode}"
+        );
+        let entry = format!(
+            r#"[{{"name":"a","url":"postgres://u@h/db?sslmode={mode}","sslrootcert_pem":"x"}}]"#
+        );
+        assert_eq!(
+            load_err(&[("PG_DATABASES", entry.as_str())]),
+            format!("PG_DATABASES[0] (\"a\"): {text}"),
+            "JSON url with inline root, {mode}"
+        );
+    }
+}
+
+/// The default mode is prefer, so a root certificate without an sslmode is refused too.
+#[test]
+fn root_certificate_without_sslmode_is_refused_as_prefer() {
+    let file = TempFile::new("unused");
+    let url = format!(
+        "postgres://app:pw@db.example.com/appdb?sslrootcert={}",
+        file.path()
+    );
+    assert_eq!(
+        load_err(&[("DATABASE_URL", url.as_str())]),
+        "DATABASE_URL: sslrootcert is set but sslmode=prefer does not verify the server; use sslmode=verify-ca or sslmode=verify-full"
+    );
+}
+
+/// The verifying modes take a root certificate, and require without one stays allowed.
+#[test]
+fn root_certificate_with_a_verifying_mode_and_plain_require_are_accepted() {
+    let file = TempFile::new("unused");
+    let root = file.path();
+    for mode in ["verify-ca", "verify-full"] {
+        let url =
+            format!("postgres://app:pw@db.example.com/appdb?sslmode={mode}&sslrootcert={root}");
+        let config = cfg(&[("DATABASE_URL", url.as_str())]);
+        assert_eq!(config.databases[0].connect.ssl_mode.as_str(), mode);
+        let config = cfg(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLMODE", mode),
+            ("PGSSLROOTCERT_PEM", "x"),
+        ]);
+        assert_eq!(config.databases[0].connect.ssl_mode.as_str(), mode);
+    }
+    let config = cfg(&[
+        ("PGDATABASE", "pdb"),
+        ("PGUSER", "pu"),
+        ("PGSSLMODE", "require"),
+    ]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::Require);
+    let entry = r#"[{"name":"a","database":"db","user":"u","sslmode":"require"}]"#;
+    let config = cfg(&[("PG_DATABASES", entry)]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::Require);
+}
+
 // ---- Client certificates and inline PEM ----
 
 /// A self-signed certificate and its PKCS#8 key as PEM text, made at test time.
@@ -1119,14 +1242,16 @@ fn client_certificate_is_refused_with_sslmode_disable() {
         )]),
         "PG_DATABASES[0] (\"a\"): sslcert needs TLS: sslmode must not be disable"
     );
-    // A root certificate alone is not a client certificate: disable keeps working.
-    let config = cfg(&[
-        ("PGDATABASE", "pdb"),
-        ("PGUSER", "pu"),
-        ("PGSSLMODE", "disable"),
-        ("PGSSLROOTCERT_PEM", "x"),
-    ]);
-    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::Disable);
+    // A root certificate with disable is refused: no TLS is used, so the root would never be checked.
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLMODE", "disable"),
+            ("PGSSLROOTCERT_PEM", "x"),
+        ]),
+        "PGSSLMODE: sslrootcert is set but sslmode=disable does not use TLS; use sslmode=verify-ca or sslmode=verify-full"
+    );
 }
 
 #[test]
@@ -1306,6 +1431,7 @@ fn startup_checks_inline_pem_the_same_way() {
         prepare_err(&[
             ("PGDATABASE", "pdb"),
             ("PGUSER", "pu"),
+            ("PGSSLMODE", "verify-full"),
             ("PGSSLROOTCERT_PEM", "not a certificate"),
         ]),
         "pdb: sslrootcert_pem holds no certificate"

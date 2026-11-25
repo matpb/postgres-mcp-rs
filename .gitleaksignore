@@ -1,0 +1,23 @@
+# Dummy keys used only by tests and the local smoke script.
+9bdfe640fd20921aecc11eda9e185c102da6acf2:tests/config.rs:generic-api-key:503
+24fe55d0d5548c5b472be4cc0c42ca34612eefc3:tests/config.rs:private-key:970
+5ddc793e6c38c488fb814629833a93ea94f2e09f:tests/mcp_stdio.rs:generic-api-key:833
+fc72cc66fc828bd7af64cd525d29e02d20386f4a:scripts/docker-smoke.sh:generic-api-key:11
+9a76eae6f5654bababcaf857a4d15bdd3f7415fb:tests/config.rs:generic-api-key:474
+9a76eae6f5654bababcaf857a4d15bdd3f7415fb:tests/config.rs:generic-api-key:727
+# Dummy keys used only by tests and the local smoke script.
+scripts/docker-smoke.sh:generic-api-key:12
+tests/mcp_stdio.rs:generic-api-key:962
+tests/config.rs:generic-api-key:478
+tests/config.rs:generic-api-key:506
+tests/config.rs:generic-api-key:755
+tests/config.rs:private-key:1093
+# Not secrets: SIMD intrinsic names in the vendored xxhash of the ignored target/ build tree.
+target/debug/build/pg_query-134c96ce4e432f96/out/vendor/xxhash/xxhash.h:generic-api-key:3706
+target/debug/build/pg_query-134c96ce4e432f96/out/vendor/xxhash/xxhash.h:generic-api-key:3755
+target/debug/build/pg_query-134c96ce4e432f96/out/vendor/xxhash/xxhash.h:generic-api-key:3819
+target/debug/build/pg_query-134c96ce4e432f96/out/vendor/xxhash/xxhash.h:generic-api-key:3851
+target/release/build/pg_query-31c845f5fcf0370b/out/vendor/xxhash/xxhash.h:generic-api-key:3706
+target/release/build/pg_query-31c845f5fcf0370b/out/vendor/xxhash/xxhash.h:generic-api-key:3755
+target/release/build/pg_query-31c845f5fcf0370b/out/vendor/xxhash/xxhash.h:generic-api-key:3819
+target/release/build/pg_query-31c845f5fcf0370b/out/vendor/xxhash/xxhash.h:generic-api-key:3851

@@ -401,11 +401,12 @@ async fn describe_of(
         }
         None => None,
     };
+    // TimescaleDB's table_bytes is the heap alone; tableBytes adds TOAST, as pg_table_size does.
     let sizes = match features.extension_function("hypertable_detailed_size") {
         Some(function) => {
             let sql = format!(
                 "WITH ht AS ({RELATION_OID_SQL}) SELECT s.total_bytes AS \"totalBytes\", \
-                 s.table_bytes AS \"tableBytes\", s.index_bytes AS \"indexBytes\", s.toast_bytes AS \"toastBytes\" \
+                 s.table_bytes + s.toast_bytes AS \"tableBytes\", s.index_bytes AS \"indexBytes\", s.toast_bytes AS \"toastBytes\" \
                  FROM ht, {function}(ht.oid) s"
             );
             first_row(section(state, target, &sql, &params, "sizes", ct, &mut warnings).await?)

@@ -53,12 +53,15 @@ pub const SECRET_SETTINGS: &[&str] = &[
     "krb_server_keyfile",
 ];
 
-/// Relations that expose credentials, matched by lowercased name when unqualified or in pg_catalog.
+/// Relations that expose credentials, matched by lowercased name when unqualified or in pg_catalog or
+/// information_schema. pg_roles and pg_user show `********` for passwords and stay readable.
 const CREDENTIAL_RELATIONS: &[&str] = &[
     "pg_authid",
     "pg_shadow",
     "pg_user_mapping",
     "pg_user_mappings",
+    "_pg_user_mappings",
+    "user_mapping_options",
     "pg_subscription",
     "pg_settings",
     "pg_file_settings",
@@ -66,10 +69,12 @@ const CREDENTIAL_RELATIONS: &[&str] = &[
     "pg_ident_file_mappings",
     "pg_config",
     "pg_db_role_setting",
-    "user_mapping_options",
     "pg_statistic",
     "pg_statistic_ext_data",
 ];
+
+/// The relations of CREDENTIAL_RELATIONS that hold server settings; their message names server_info.
+const SETTINGS_RELATIONS: &[&str] = &["pg_settings", "pg_file_settings"];
 
 /// Schemas whose functions are TimescaleDB internals; a call qualified with one is denied.
 const INTERNAL_SCHEMAS: &[&str] = &[
@@ -205,6 +210,8 @@ const DENIED_FUNCTIONS: &[(&str, &str)] = &[
     ("pg_cancel_backend", R_CONTROL),
     ("pg_reload_conf", R_CONTROL),
     ("pg_rotate_logfile", R_CONTROL),
+    // adminpack's pre-9.1 alias, still installed on PostgreSQL 15.
+    ("pg_rotate_logfile_old", R_CONTROL),
     ("pg_switch_wal", R_CONTROL),
     ("pg_create_restore_point", R_CONTROL),
     ("pg_promote", R_CONTROL),
@@ -263,6 +270,8 @@ const DENIED_FUNCTIONS: &[(&str, &str)] = &[
     ("pg_replication_origin_*", R_WAL),
     ("pg_sync_replication_slots", R_WAL),
     ("pg_read_file", R_FILES),
+    // adminpack's pre-9.1 aliases, still installed on PostgreSQL 15.
+    ("pg_read_file_old", R_FILES),
     ("pg_read_binary_file", R_FILES),
     // pg_ls_dir takes any path; the fixed-directory pg_ls_*dir listings stay with PostgreSQL privileges.
     ("pg_ls_dir", R_FILES),
@@ -627,7 +636,7 @@ fn check_dotted_name(part: &Value) -> Result<(), Rejection> {
         return Err(dotted_denied(name, reason));
     }
     if lowered == "current_setting" {
-        let message = "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name.";
+        let message = "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name. If it is a column of yours, give it another name with AS in a subquery.";
         return Err(reject("setting_denied", message));
     }
     Ok(())
@@ -657,9 +666,15 @@ fn check_relation(body: &Value) -> Result<(), Rejection> {
     if CREDENTIAL_RELATIONS.contains(&relname.as_str())
         && matches!(schema.as_str(), "" | "pg_catalog" | "information_schema")
     {
-        let message = format!(
-            "{relname} can expose credentials and is not readable through this server. Use the server_info tool for settings."
-        );
+        let message = if SETTINGS_RELATIONS.contains(&relname.as_str()) {
+            format!(
+                "{relname} can expose credentials and is not readable through this server. Use the server_info tool for settings."
+            )
+        } else {
+            format!(
+                "Relation {relname} is not readable through this server. It can expose credentials."
+            )
+        };
         return Err(reject("relation_denied", message));
     }
     Ok(())

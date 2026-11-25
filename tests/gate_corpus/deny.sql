@@ -527,6 +527,18 @@ SELECT pg_rotate_logfile();
 SELECT pg_catalog.pg_rotate_logfile();
 --;;
 -- code: function_denied
+SELECT pg_rotate_logfile_old();
+--;;
+-- code: function_denied
+SELECT pg_read_file_old('PG_VERSION', 0, 10);
+--;;
+-- code: function_denied
+SELECT pg_catalog.pg_read_file_old('PG_VERSION', 0, 10);
+--;;
+-- code: relation_denied
+SELECT umoptions FROM information_schema._pg_user_mappings;
+--;;
+-- code: function_denied
 SELECT pg_switch_wal();
 --;;
 -- code: function_denied

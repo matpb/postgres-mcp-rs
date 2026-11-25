@@ -718,3 +718,93 @@ async fn binary_pg_form_with_escaped_inline_root_reaches_the_server() {
     ]);
     assert_reachable_and_counted(&server);
 }
+
+/// Runs `stdio` with JSON logs and the given variables, asks `appdb` one question, and returns the reply
+/// and the stderr text.
+fn stdio_query(vars: &[(&str, String)]) -> (Value, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_postgres-mcp"));
+    cmd.arg("stdio")
+        .env_clear()
+        .env("LOG_FORMAT", "json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in vars {
+        cmd.env(name, value);
+    }
+    let mut child = cmd.spawn().expect("the binary starts");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let messages = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": {"name": "test-client", "version": "0.0.0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"sql": "SELECT 1 AS one"}}}),
+    ];
+    for message in messages {
+        writeln!(stdin, "{message}").expect("request is written");
+    }
+    drop(stdin);
+    let output = child.wait_with_output().expect("the binary exits");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reply = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["id"] == 2)
+        .unwrap_or_else(|| panic!("no reply to the query in {stdout}"));
+    (reply, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// The connection failure line of a stderr that holds JSON log lines.
+fn connection_failure(stderr: &str) -> Value {
+    stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line["fields"]["message"] == "connection failed")
+        .unwrap_or_else(|| panic!("no connection failure line in {stderr}"))
+}
+
+#[tokio::test]
+async fn verify_full_name_mismatch_logs_the_cause_and_reports_only_the_short_text() {
+    let m = Material::fetch().await;
+    let url = format!(
+        "postgres://{RO_USER}:{RO_PASSWORD}@{IP_HOST}:{PORT_TLS}/{DB}?sslmode=verify-full&sslrootcert={}",
+        m.path("ca.crt").display()
+    );
+    let (reply, stderr) = stdio_query(&[("DATABASE_URL", url)]);
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "Database \"appdb\" is unavailable: TLS negotiation failed",
+        "{reply}"
+    );
+    let failure = connection_failure(&stderr);
+    assert_eq!(
+        failure["fields"]["reason"], "TLS negotiation failed",
+        "{failure}"
+    );
+    assert_eq!(
+        failure["fields"]["error"],
+        "TLS error: invalid peer certificate: certificate not valid for name \"127.0.0.1\"; certificate is only valid for DnsName(\"localhost\") or DnsName(\"pgtls.test.example\")",
+        "{failure}"
+    );
+    assert!(!stderr.contains(RO_PASSWORD), "{stderr}");
+}
+
+#[tokio::test]
+async fn verify_full_with_an_unrelated_root_logs_the_unknown_issuer() {
+    let m = Material::fetch().await;
+    let url = format!(
+        "postgres://{RO_USER}:{RO_PASSWORD}@{HOST}:{PORT_TLS}/{DB}?sslmode=verify-full&sslrootcert={}",
+        m.path("bad_ca.crt").display()
+    );
+    let (reply, stderr) = stdio_query(&[("DATABASE_URL", url)]);
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "Database \"appdb\" is unavailable: TLS negotiation failed",
+        "{reply}"
+    );
+    let failure = connection_failure(&stderr);
+    assert_eq!(
+        failure["fields"]["error"], "TLS error: invalid peer certificate: UnknownIssuer",
+        "{failure}"
+    );
+    assert!(!stderr.contains(RO_PASSWORD), "{stderr}");
+}

@@ -199,6 +199,12 @@ fn startup_with_root_cert(root_cert: &str) -> (Option<i32>, String) {
     let url = format!(
         "postgres://{DB_USER}:{DB_PASSWORD}@127.0.0.1:{PORT_19}/{DB_NAME}?sslmode=verify-full&sslrootcert={root_cert}"
     );
+    startup_with_url(&url)
+}
+
+/// Runs `http` with the given DATABASE_URL and returns its exit code and stderr.
+/// A server that starts instead of failing is killed and reported.
+fn startup_with_url(url: &str) -> (Option<i32>, String) {
     let mut child = command(&["http"])
         .env("DATABASE_URL", url)
         .stdin(Stdio::null())
@@ -209,7 +215,7 @@ fn startup_with_root_cert(root_cert: &str) -> (Option<i32>, String) {
     let Some(status) = wait_with_timeout(&mut child, Duration::from_secs(10)) else {
         let _ = child.kill();
         let _ = child.wait();
-        panic!("the server started instead of failing on sslrootcert {root_cert}");
+        panic!("the server started instead of failing its configuration check");
     };
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
@@ -239,6 +245,34 @@ fn sslrootcert_without_certificates_fails_startup_with_exit_2() {
     assert_eq!(
         stderr,
         "configuration error: appdb: sslrootcert holds no certificate"
+    );
+}
+
+#[test]
+fn sslrootcert_with_sslmode_require_fails_startup_with_exit_2() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let url = format!(
+        "postgres://{DB_USER}:{DB_PASSWORD}@127.0.0.1:{PORT_19}/{DB_NAME}?sslmode=require&sslrootcert={root}"
+    );
+    let (code, stderr) = startup_with_url(&url);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr,
+        "configuration error: DATABASE_URL: sslrootcert is set but sslmode=require does not verify the server; use sslmode=verify-ca or sslmode=verify-full"
+    );
+}
+
+#[test]
+fn sslrootcert_with_sslmode_disable_fails_startup_with_exit_2() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let url = format!(
+        "postgres://{DB_USER}:{DB_PASSWORD}@127.0.0.1:{PORT_19}/{DB_NAME}?sslmode=disable&sslrootcert={root}"
+    );
+    let (code, stderr) = startup_with_url(&url);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr,
+        "configuration error: DATABASE_URL: sslrootcert is set but sslmode=disable does not use TLS; use sslmode=verify-ca or sslmode=verify-full"
     );
 }
 
@@ -760,6 +794,101 @@ fn connection_failure_log_names_the_connection_not_the_user_or_password() {
     );
     for secret in [DB_USER, DB_PASSWORD, "not-the-password-zz"] {
         assert!(!stderr.contains(secret), "{secret} was logged: {stderr}");
+    }
+}
+
+#[test]
+fn connection_failure_log_carries_the_postgresql_message_with_sqlstate() {
+    let databases = json!([{
+        "name": "bad_conn",
+        "host": "127.0.0.1",
+        "port": PORT_19,
+        "database": DB_NAME,
+        "user": DB_USER,
+        "password": "not-the-password-zz",
+        "sslmode": "disable",
+        "max_connections": 1,
+    }]);
+    let mut messages = init_messages();
+    messages.push(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"database": "bad_conn", "sql": "SELECT 1"}}}));
+    let stderr = stdio_stderr(&[("PG_DATABASES", &databases.to_string())], &messages);
+    let failure = json_lines(&stderr)
+        .into_iter()
+        .find(|l| l["fields"]["message"] == "connection failed")
+        .unwrap_or_else(|| panic!("no connection failure line in {stderr}"));
+    assert_eq!(
+        failure["fields"]["error"],
+        "password authentication failed for user \"<user>\" (SQLSTATE 28P01)",
+        "{failure}"
+    );
+    assert!(!stderr.contains("not-the-password-zz"), "{stderr}");
+}
+
+const SUPERUSER_WARNING: &str = "database \"appdb\": the role is a superuser; the read-only transaction is then the only barrier against the functions it may call. Use a least-privilege role.";
+
+const DEBUG_WARNING: &str = "debug logging is on: requests and responses, including SQL text and rows, are written to the log";
+
+/// The init handshake and one query on the default database.
+fn query_messages() -> Vec<Value> {
+    let mut messages = init_messages();
+    messages.push(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "execute_query", "arguments": {"sql": "SELECT 1 AS one"}}}));
+    messages
+}
+
+fn has_warning(stderr: &str, text: &str) -> bool {
+    json_lines(stderr)
+        .iter()
+        .any(|l| l["level"] == "WARN" && l["fields"]["message"] == text)
+}
+
+#[test]
+fn superuser_role_logs_one_warning_on_its_first_connection() {
+    let url = format!(
+        "postgres://postgres:test-only-superuser@127.0.0.1:{PORT_19}/{DB_NAME}?sslmode=disable"
+    );
+    let stderr = stdio_stderr(&[("DATABASE_URL", &url)], &query_messages());
+    let count = json_lines(&stderr)
+        .iter()
+        .filter(|l| l["fields"]["message"] == SUPERUSER_WARNING)
+        .count();
+    assert_eq!(count, 1, "{stderr}");
+}
+
+#[test]
+fn least_privilege_role_logs_no_superuser_warning() {
+    let url = database_url(PORT_19);
+    let stderr = stdio_stderr(&[("DATABASE_URL", &url)], &query_messages());
+    assert!(!stderr.contains("the role is a superuser"), "{stderr}");
+}
+
+#[test]
+fn debug_log_level_warns_that_requests_and_rows_are_logged() {
+    let url = database_url(PORT_19);
+    let stderr = stdio_stderr(
+        &[("DATABASE_URL", &url), ("LOG_LEVEL", "debug")],
+        &init_messages(),
+    );
+    assert!(has_warning(&stderr, DEBUG_WARNING), "{stderr}");
+    let stderr = stdio_stderr(
+        &[("DATABASE_URL", &url), ("RUST_LOG", "info,rmcp=trace")],
+        &init_messages(),
+    );
+    assert!(has_warning(&stderr, DEBUG_WARNING), "{stderr}");
+}
+
+#[test]
+fn info_level_and_rmcp_held_at_warn_log_no_debug_warning() {
+    let url = database_url(PORT_19);
+    for env in [
+        vec![("DATABASE_URL", url.as_str()), ("LOG_LEVEL", "info")],
+        vec![
+            ("DATABASE_URL", url.as_str()),
+            ("LOG_LEVEL", "debug"),
+            ("RUST_LOG", "debug,rmcp=warn"),
+        ],
+    ] {
+        let stderr = stdio_stderr(&env, &init_messages());
+        assert!(!has_warning(&stderr, DEBUG_WARNING), "{env:?}: {stderr}");
     }
 }
 

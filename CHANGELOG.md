@@ -3,16 +3,11 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
-
-### Added
-
-- TLS with a private certificate authority: client certificates (`sslcert` and `sslkey`, `PGSSLCERT` and `PGSSLKEY`), inline PEM (`sslrootcert_pem`, `sslcert_pem`, `sslkey_pem` and the `PGSSL*_PEM` variables), all checked once at startup, and a `pgtls` test service on PostgreSQL 19 with TLS.
-
 ## [0.1.0]
 
 ### Added
 
+- TLS with a private certificate authority: client certificates (`sslcert` and `sslkey`, `PGSSLCERT` and `PGSSLKEY`), inline PEM (`sslrootcert_pem`, `sslcert_pem`, `sslkey_pem` and the `PGSSL*_PEM` variables), all checked once at startup, and a `pgtls` test service on PostgreSQL 19 with TLS.
 - Serving: Streamable HTTP at `/mcp` with `GET /health` (the default `http` command), stdio (`stdio`), and the `healthcheck`, `--help` and `--version` commands.
 - Databases: several connections behind one server, configured with `DATABASE_URL`, libpq `PG*` variables, or a `PG_DATABASES` / `PG_DATABASES_FILE` JSON array.
 - TLS modes `disable`, `prefer`, `require`, `verify-ca` and `verify-full`, with an optional `sslrootcert` file.

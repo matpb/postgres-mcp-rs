@@ -138,15 +138,14 @@ fn config_error(message: &str) -> ExitCode {
 
 /// Installs the stderr subscriber. The filter comes from RUST_LOG, else LOG_LEVEL, else info.
 fn init_logging(format: LogFormat) -> Result<(), String> {
-    let filter = match env_value("RUST_LOG")? {
-        Some(value) => EnvFilter::try_new(&value).map_err(|e| format!("RUST_LOG: {e}"))?,
+    let (variable, directives) = match env_value("RUST_LOG")? {
+        Some(value) => ("RUST_LOG", value),
         None => match env_value("LOG_LEVEL")? {
-            Some(value) => {
-                EnvFilter::try_new(level_filter(&value)).map_err(|e| format!("LOG_LEVEL: {e}"))?
-            }
-            None => EnvFilter::new("info,rmcp=warn"),
+            Some(value) => ("LOG_LEVEL", level_filter(&value)),
+            None => ("LOG_LEVEL", "info,rmcp=warn".to_owned()),
         },
     };
+    let filter = EnvFilter::try_new(&directives).map_err(|e| format!("{variable}: {e}"))?;
     // Colour only when stderr is a terminal, so piped logs stay plain text.
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -156,7 +155,13 @@ fn init_logging(format: LogFormat) -> Result<(), String> {
         LogFormat::Text => builder.try_init(),
         LogFormat::Json => builder.json().try_init(),
     };
-    installed.map_err(|e| format!("cannot start logging: {e}"))
+    installed.map_err(|e| format!("cannot start logging: {e}"))?;
+    if rmcp_at_debug(&directives) {
+        tracing::warn!(
+            "debug logging is on: requests and responses, including SQL text and rows, are written to the log"
+        );
+    }
+    Ok(())
 }
 
 /// The filter for LOG_LEVEL: the level, with the rmcp protocol library held at warn unless it is debug or trace.
@@ -166,6 +171,26 @@ fn level_filter(level: &str) -> String {
     } else {
         format!("{level},rmcp=warn")
     }
+}
+
+/// True when the directives make rmcp log at debug or trace. A directive for rmcp or its modules
+/// overrides the bare level, as in EnvFilter, and the last one of each kind decides.
+fn rmcp_at_debug(directives: &str) -> bool {
+    let mut bare: Option<&str> = None;
+    let mut rmcp: Option<&str> = None;
+    for part in directives.split(',').map(str::trim) {
+        match part.split_once('=') {
+            Some((target, level)) if target == "rmcp" || target.starts_with("rmcp::") => {
+                rmcp = Some(level.trim());
+            }
+            Some(_) => {}
+            None if part == "rmcp" => rmcp = Some("trace"),
+            None if !part.is_empty() => bare = Some(part),
+            None => {}
+        }
+    }
+    let level = rmcp.or(bare).unwrap_or("info");
+    level.eq_ignore_ascii_case("debug") || level.eq_ignore_ascii_case("trace")
 }
 
 /// A variable's value; unset and empty both count as unset.

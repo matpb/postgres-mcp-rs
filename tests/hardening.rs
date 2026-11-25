@@ -5,10 +5,11 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    PORT_15, PORT_18, PORT_19, PROTOCOL_2025, app, call_tool, config_with, db_entry, one_db,
-    post_mcp, result_of,
+    PORT_15, PORT_18, PORT_19, PORT_TLS, PROTOCOL_2025, app, call_tool, config_with, db_entry,
+    one_db, post_mcp, result_of,
 };
 use postgres_mcp::config::Config;
+use postgres_mcp::gate::{GateOptions, check};
 use postgres_mcp::pg::tls::SslMode;
 use postgres_mcp::pg::wire::{ConnectConfig, Connection};
 use serde_json::{Value, json};
@@ -238,7 +239,7 @@ async fn list_databases_shows_the_same_short_texts() {
 
 const SERVERS: [u16; 3] = [PORT_18, PORT_19, PORT_15];
 
-const CURRENT_SETTING_DOTTED: &str = "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name.";
+const CURRENT_SETTING_DOTTED: &str = "\"current_setting\" after a dot would call current_setting() with a computed name, which is not allowed. Use current_setting('name') with a literal name. If it is a column of yours, give it another name with AS in a subquery.";
 const TERMINATE_DOTTED: &str = "\"pg_terminate_backend\" after a dot would call the function pg_terminate_backend(), which is not allowed: it controls the server or other sessions. If it is a column of yours, give it another name with AS in a subquery.";
 const TS_STAT_DOTTED: &str = "\"ts_stat\" after a dot would call the function ts_stat(), which is not allowed: it executes SQL text the gate cannot inspect. If it is a column of yours, give it another name with AS in a subquery.";
 
@@ -277,13 +278,19 @@ async fn dotted_function_names_are_refused_on_every_server() {
 }
 
 fn superuser_config(port: u16) -> ConnectConfig {
+    // The TLS-only server refuses a plain connection.
+    let ssl_mode = if port == PORT_TLS {
+        SslMode::Require
+    } else {
+        SslMode::Disable
+    };
     ConnectConfig {
         host: "127.0.0.1".into(),
         port,
         database: "appdb".into(),
         user: "postgres".into(),
         password: Some("test-only-superuser".into()),
-        ssl_mode: SslMode::Disable,
+        ssl_mode,
         ssl_root_cert: None,
         connect_timeout: Duration::from_secs(5),
         startup_params: Vec::new(),
@@ -376,5 +383,228 @@ async fn server_log_helpers_are_refused_in_execute_query_on_every_server() {
                 "{port}"
             );
         }
+    }
+}
+
+/// Name parts that mark a function which reads files or signals, changes or writes the server, or changes
+/// sequences, settings, sessions or large objects. The audit prints every match with the gate's verdict.
+const SUSPECT_FUNCTION_PARTS: &[&str] = &[
+    "read_file",
+    "read_binary",
+    "ls_dir",
+    "stat_file",
+    "rotate",
+    "reload",
+    "terminate",
+    "cancel_backend",
+    "advisory",
+    "_file_",
+    "import",
+    "export",
+    "logical_emit",
+    "replication_slot",
+    "replication_origin",
+    "nextval",
+    "setval",
+    "set_config",
+    "notify",
+    "promote",
+    "switch_wal",
+    "restore_point",
+    "stat_reset",
+    "to_xml",
+    "dblink",
+    "lo_",
+    "backup",
+    "wal_replay",
+    "create_restore",
+    "drop_",
+    "copy_",
+    "snapshot",
+    "restore_",
+    "clear_",
+    "import_system",
+    "binary_upgrade",
+    "pg_log_",
+    "signal",
+    "prewarm",
+    "buffercache_evict",
+    "truncate",
+    "reindex",
+    "vacuum",
+    "analyze",
+];
+
+/// A match of any of these that the gate allows fails the audit, unless `read_only_by_inspection` accepts it.
+const STRICT_FUNCTION_PARTS: &[&str] = &[
+    "read_file",
+    "read_binary",
+    "ls_dir",
+    "stat_file",
+    "rotate_logfile",
+    "reload_conf",
+    "terminate_backend",
+    "cancel_backend",
+    "advisory",
+    "logical_emit",
+    "replication_slot",
+    "replication_origin",
+    "switch_wal",
+    "restore_point",
+    "stat_reset",
+    "to_xml",
+    "binary_upgrade",
+    "import_system_collations",
+    "pg_restore_",
+    "pg_clear_",
+    "pg_log_backend",
+    "pg_log_standby",
+    "buffercache_evict",
+    "pg_prewarm",
+    "autoprewarm",
+];
+
+/// Matches of STRICT_FUNCTION_PARTS that only read fixed server state; the gate allows them on purpose.
+/// The `pg_ls_*dir` listings read one fixed directory each, and pg_ls_dir (any path) is denied.
+fn read_only_by_inspection(name: &str) -> bool {
+    (name.starts_with("pg_ls_") && name.ends_with("dir") && name != "pg_ls_dir")
+        || name.starts_with("pg_stat_get_")
+        || matches!(
+            name,
+            "pg_get_replication_slots" | "pg_show_replication_origin_status"
+        )
+}
+
+/// Functions of pg_catalog and of installed extensions, one row per schema and name.
+const FUNCTION_NAMES_SQL: &str = "SELECT DISTINCT n.nspname, p.proname \
+     FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+     WHERE n.nspname = 'pg_catalog' OR p.oid IN \
+       (SELECT d.objid FROM pg_catalog.pg_depend d \
+        WHERE d.classid = 'pg_catalog.pg_proc'::regclass AND d.deptype = 'e') \
+     ORDER BY 1, 2";
+
+/// The gate's verdict for a call to one function: denied by name, or allowed.
+fn function_verdict(schema: &str, name: &str) -> &'static str {
+    let sql = format!("SELECT {}.{}()", quoted(schema), quoted(name));
+    match check(&sql, &GateOptions::default()) {
+        Ok(_) => "ALLOWED",
+        Err(rejection) if rejection.code == "function_denied" => "denied",
+        Err(rejection) => panic!("unexpected rejection of {sql}: {rejection:?}"),
+    }
+}
+
+fn quoted(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// Every connection of the audit: the four test servers, with the TLS one as superuser over TLS.
+const AUDIT_SERVERS: [(u16, &str); 4] = [
+    (PORT_18, "15432"),
+    (PORT_19, "15433"),
+    (PORT_15, "15434"),
+    (PORT_TLS, "15435"),
+];
+
+/// Runs a query as the superuser and returns every row as text cells, with NULL as an empty string.
+async fn superuser_rows(port: u16, sql: &str) -> Vec<Vec<String>> {
+    let mut conn = Connection::connect(&superuser_config(port))
+        .await
+        .expect("superuser connect");
+    let result = conn.simple_query(sql).await.expect("superuser query");
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.clone().unwrap_or_default())
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn catalog_audit_of_suspect_function_names() {
+    let mut misses = Vec::new();
+    for (port, label) in AUDIT_SERVERS {
+        println!("== server {label}");
+        for row in superuser_rows(port, FUNCTION_NAMES_SQL).await {
+            let (schema, name) = (&row[0], &row[1]);
+            let lowered = name.to_ascii_lowercase();
+            if !SUSPECT_FUNCTION_PARTS
+                .iter()
+                .any(|part| lowered.contains(part))
+            {
+                continue;
+            }
+            let verdict = function_verdict(schema, name);
+            println!("{schema}.{name} -> {verdict}");
+            let strict = STRICT_FUNCTION_PARTS
+                .iter()
+                .any(|part| lowered.contains(part));
+            if verdict == "ALLOWED" && strict && !read_only_by_inspection(&lowered) {
+                misses.push(format!("{label} {schema}.{name}"));
+            }
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "the gate allows functions that match a strict name part:\n{}",
+        misses.join("\n")
+    );
+}
+
+/// Columns that hold a password or a password hash, as the audit's credential test.
+const CREDENTIAL_COLUMNS: &[&str] = &["umoptions", "rolpassword", "subconninfo", "passwd"];
+
+/// Relations with those columns that the gate reads on purpose: PostgreSQL shows `********` in both.
+const KEEP_READABLE_RELATIONS: &[(&str, &str)] =
+    &[("pg_catalog", "pg_roles"), ("pg_catalog", "pg_user")];
+
+#[tokio::test]
+async fn relation_audit_of_credential_columns_on_pg19() {
+    let sql = "SELECT c.table_schema, c.table_name, string_agg(c.column_name, ',' ORDER BY c.column_name) \
+         FROM information_schema.columns c \
+         WHERE c.table_schema IN ('pg_catalog', 'information_schema') \
+           AND c.column_name ~* '(password|passwd|conninfo|options|rolpassword|subconninfo|umoptions|srvoptions|ftoptions)' \
+         GROUP BY c.table_schema, c.table_name ORDER BY 1, 2";
+    let mut misses = Vec::new();
+    for row in superuser_rows(PORT_19, sql).await {
+        let (schema, table, columns) = (&row[0], &row[1], &row[2]);
+        let sql = format!("SELECT * FROM {}.{}", quoted(schema), quoted(table));
+        let verdict = match check(&sql, &GateOptions::default()) {
+            Ok(_) => "readable",
+            Err(rejection) if rejection.code == "relation_denied" => "denied",
+            Err(rejection) => panic!("unexpected rejection of {sql}: {rejection:?}"),
+        };
+        println!("{schema}.{table} [{columns}] -> {verdict}");
+        let holds_credential = columns
+            .split(',')
+            .any(|column| CREDENTIAL_COLUMNS.contains(&column));
+        let kept = KEEP_READABLE_RELATIONS
+            .iter()
+            .any(|(s, t)| *s == schema.as_str() && *t == table.as_str());
+        if holds_credential && verdict == "readable" && !kept {
+            misses.push(format!("{schema}.{table}"));
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "the gate reads relations that hold a credential column:\n{}",
+        misses.join("\n")
+    );
+    for (schema, table) in KEEP_READABLE_RELATIONS {
+        let column = if *table == "pg_roles" {
+            "rolpassword"
+        } else {
+            "passwd"
+        };
+        let unmasked = superuser_scalar(
+            PORT_19,
+            &format!(
+                "SELECT count(*) FROM {schema}.{table} WHERE {column} IS NOT NULL AND {column} <> '********'"
+            ),
+        )
+        .await;
+        assert_eq!(unmasked, "0", "{schema}.{table}.{column} shows a value");
     }
 }

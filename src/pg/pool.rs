@@ -24,6 +24,8 @@ pub struct Pool {
     idle: Mutex<Vec<Connection>>,
     types: TypeCache,
     closed: AtomicBool,
+    /// Set by the first successful connection, whose role check is then done for the pool.
+    superuser_checked: AtomicBool,
 }
 
 impl Pool {
@@ -43,6 +45,7 @@ impl Pool {
             idle: Mutex::new(Vec::new()),
             types: TypeCache::new(),
             closed: AtomicBool::new(false),
+            superuser_checked: AtomicBool::new(false),
         }
     }
 
@@ -111,7 +114,10 @@ impl Pool {
     async fn open<'a>(&'a self, permit: SemaphorePermit<'a>) -> Result<Lease<'a>, PoolError> {
         let conn =
             match Connection::connect_with_tls(&self.connect, &self.auth, self.tls.clone()).await {
-                Ok(conn) => conn,
+                Ok(conn) => {
+                    self.check_superuser_once(&conn);
+                    conn
+                }
                 Err(error) => {
                     let reason = connect_failure_text(&error);
                     tracing::warn!(
@@ -119,6 +125,7 @@ impl Pool {
                         host = %self.connect.host,
                         port = self.connect.port,
                         reason = %reason,
+                        error = %log_cause(&error, &self.connect.user),
                         "connection failed"
                     );
                     return Err(PoolError::Connect(reason));
@@ -130,6 +137,19 @@ impl Pool {
             conn,
             reused: false,
         })
+    }
+
+    /// Warns once per pool when the role is a superuser. PostgreSQL reports is_superuser at connect.
+    fn check_superuser_once(&self, conn: &Connection) {
+        if self.superuser_checked.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if conn.parameter("is_superuser") == Some("on") {
+            tracing::warn!(
+                "database \"{}\": the role is a superuser; the read-only transaction is then the only barrier against the functions it may call. Use a least-privilege role.",
+                self.name
+            );
+        }
     }
 
     /// Keeps the connection for reuse unless the pool was closed meanwhile.
@@ -182,6 +202,20 @@ pub enum PoolError {
     /// Client-facing text for a failed connect; the server's own message is only logged.
     #[error("{0}")]
     Connect(String),
+}
+
+/// The cause for the failure log: the server's message with its SQLSTATE, or the wire or TLS error text.
+/// The server's DETAIL and HINT are left out, and the configured role name is masked in the message.
+fn log_cause(error: &WireError, user: &str) -> String {
+    match error {
+        WireError::Db(db) if !user.is_empty() => format!(
+            "{} (SQLSTATE {})",
+            db.message.replace(user, "<user>"),
+            db.code
+        ),
+        WireError::Db(db) => format!("{} (SQLSTATE {})", db.message, db.code),
+        other => other.to_string(),
+    }
 }
 
 /// The client-facing text for a connect failure, by class. PostgreSQL's wording can name users and addresses.
