@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use postgres_mcp::scrub::{REDACTED, scrub, scrub_counting, scrub_value};
+use postgres_mcp::scrub::{REDACTED, cut_index, scrub, scrub_counting, scrub_value};
 use proptest::prelude::*;
 use serde_json::json;
 
@@ -223,4 +223,73 @@ fn a_third_collision_takes_the_next_number() {
         object.contains_key("k [redacted password hash]__3"),
         "{value}"
     );
+}
+
+#[test]
+fn an_md5_hash_followed_directly_by_a_scram_verifier_is_replaced_twice() {
+    assert_eq!(
+        scrub(&format!("{MD5}{SCRAM}")),
+        format!("{REDACTED}{REDACTED}")
+    );
+}
+
+#[test]
+fn a_scram_verifier_followed_directly_by_an_md5_hash_is_replaced_once() {
+    assert_eq!(scrub(&format!("{SCRAM}{MD5}")), REDACTED);
+}
+
+#[test]
+fn two_md5_hashes_without_a_separator_are_both_replaced() {
+    assert_eq!(
+        scrub(&format!("{MD5}{MD5}")),
+        format!("{REDACTED}{REDACTED}")
+    );
+}
+
+proptest! {
+    /// Hashes packed with no separator leave no full match behind, and scrubbing the output again changes nothing.
+    #[test]
+    fn packed_hashes_leave_no_full_match(
+        pieces in proptest::collection::vec(0_u8..3, 1..6),
+        hex in "[0-9a-f]{32}",
+    ) {
+        let md5 = format!("md5{hex}");
+        let text: String = pieces
+            .iter()
+            .map(|piece| match piece {
+                0 => SCRAM.to_owned(),
+                1 => md5.clone(),
+                _ => "x".to_owned(),
+            })
+            .collect();
+        let once = scrub(&text).into_owned();
+        prop_assert_eq!(scrub_counting(&once).1, 0, "{}", once);
+        prop_assert_eq!(scrub(&once).into_owned(), once.clone());
+    }
+}
+
+#[test]
+fn a_cut_never_leaves_part_of_a_marker_behind() {
+    let text = format!("abc{REDACTED}def");
+    for max in 0..=text.len() {
+        let cut = cut_index(text.as_bytes(), max);
+        assert!(cut <= max, "cut {cut} past {max}");
+        let kept = &text[..cut];
+        let partial = (1..REDACTED.len()).any(|n| kept.ends_with(&REDACTED[..n]));
+        assert!(!partial, "max {max} kept {kept:?}");
+    }
+    assert_eq!(cut_index(text.as_bytes(), text.len()), text.len());
+}
+
+#[test]
+fn a_hash_in_a_hex_escape_is_replaced_in_its_hex_form() {
+    let hex_of = |text: &str| -> String { text.bytes().map(|b| format!("{b:02x}")).collect() };
+    let text = format!("(\\\\x{})", hex_of(SCRAM));
+    assert_eq!(scrub(&text), format!("(\\\\x{})", hex_of(REDACTED)));
+}
+
+#[test]
+fn an_escape_that_holds_no_hash_is_left_alone() {
+    let text = r"a\xdeadbeef b\\x00ff";
+    assert_eq!(scrub(text), text);
 }

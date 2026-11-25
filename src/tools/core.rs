@@ -344,13 +344,17 @@ fn add_redacted_hashes(schema: &mut Option<Arc<Map<String, Value>>>) {
     let count = serde_json::json!({
         "type": "integer",
         "minimum": 0,
-        "description": "Password hash texts replaced with [redacted password hash] in this result."
+        "description": "Number of [redacted password hash] markers in this result."
     });
     if let Some(Value::Object(properties)) = schema.get_mut("properties") {
         properties.insert("redactedHashes".to_owned(), count);
     }
     match schema.get_mut("required") {
-        Some(Value::Array(required)) => required.push(Value::from("redactedHashes")),
+        Some(Value::Array(required)) => {
+            if !required.iter().any(|name| name == "redactedHashes") {
+                required.push(Value::from("redactedHashes"));
+            }
+        }
         _ => {
             schema.insert(
                 "required".to_owned(),

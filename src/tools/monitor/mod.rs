@@ -222,7 +222,10 @@ pub fn visible_text(raw: Option<&str>) -> Option<&str> {
 /// The first `limit` characters of the text, and whether any were cut.
 pub fn cut_chars(text: &str, limit: usize) -> (String, bool) {
     match text.char_indices().nth(limit) {
-        Some((index, _)) => (text[..index].to_owned(), true),
+        Some((index, _)) => {
+            let end = crate::scrub::cut_index(text.as_bytes(), index);
+            (text[..end].to_owned(), true)
+        }
         None => (text.to_owned(), false),
     }
 }
@@ -231,7 +234,7 @@ pub fn cut_chars(text: &str, limit: usize) -> (String, bool) {
 pub fn shape_query(row: &mut Map<String, Value>, chars: usize) {
     let (text, truncated) = match visible_text(row.get("query").and_then(Value::as_str)) {
         Some(full) => {
-            let (cut, was_cut) = cut_chars(&mask(full), chars);
+            let (cut, was_cut) = cut_chars(&mask(&crate::scrub::scrub_tail(full)), chars);
             (Value::String(cut), was_cut)
         }
         None => (Value::Null, false),

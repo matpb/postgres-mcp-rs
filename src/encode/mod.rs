@@ -53,7 +53,7 @@ pub fn encode_value(
         // The cut may split an md5 hash; its fragment is replaced here, and a split SCRAM hash already is.
         let (tail, cut_found) = scrub::scrub_cut_tail(&raw);
         redacted(stats, cut_found);
-        let keep = tail.len().min(limits.max_value_bytes);
+        let keep = scrub::cut_index(&tail, limits.max_value_bytes);
         return wire_truncated(&tail[..keep], full_len, stats);
     }
     let Ok(text) = std::str::from_utf8(&raw) else {
@@ -117,10 +117,9 @@ fn float(text: &str, limits: &EncodeLimits, stats: &mut EncodeStats) -> Option<V
     }
 }
 
-/// Counts replacements in the stats of the value and in the running call.
+/// Counts replacements in the stats of the value.
 fn redacted(stats: &mut EncodeStats, count: usize) {
     stats.redacted_hashes += count as u64;
-    crate::scrub::record(count);
 }
 
 /// A bytea value cut by the wire. Its kept bytes are scrubbed and cut again, so an md5 hash that straddles
@@ -135,7 +134,7 @@ fn wire_truncated_bytea(
     let (scrubbed, found) = scrub::scrub_bytes(&bytes);
     let (tail, cut_found) = scrub::scrub_cut_tail(&scrubbed);
     redacted(stats, found + cut_found);
-    let keep = tail.len().min(limits.max_value_bytes);
+    let keep = scrub::cut_index(&tail, limits.max_value_bytes);
     stats.truncated_values += 1;
     let decoded_len = full_len.saturating_sub(2) / 2;
     Value::String(format!(
@@ -196,10 +195,12 @@ fn bytea(text: &str, limits: &EncodeLimits, stats: &mut EncodeStats) -> Option<V
     if decoded_len <= cap {
         return Some(Value::String(format!("\\x{hex}")));
     }
+    let decoded = unhex_pairs(hex.as_bytes());
+    let keep = scrub::cut_index(&decoded, cap);
     stats.truncated_values += 1;
     Some(Value::String(format!(
-        "\\x{}…[truncated: {cap} of {decoded_len} bytes]",
-        &hex[..cap * 2]
+        "\\x{}…[truncated: {keep} of {decoded_len} bytes]",
+        self::hex(&decoded[..keep])
     )))
 }
 
@@ -209,7 +210,7 @@ pub(super) fn text_value(s: &str, limits: &EncodeLimits, stats: &mut EncodeStats
     if s.len() <= max {
         return Value::String(s.to_string());
     }
-    let mut cut = max;
+    let mut cut = crate::scrub::cut_index(s.as_bytes(), max);
     while !s.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -230,11 +231,12 @@ pub(super) fn absorb(stats: &mut EncodeStats, other: &EncodeStats) {
 
 /// The wire cut the value: keep the valid prefix, lossy-decoded, with the marker.
 fn wire_truncated(raw: &[u8], full_len: usize, stats: &mut EncodeStats) -> Value {
-    let cut = match std::str::from_utf8(raw) {
+    let valid = match std::str::from_utf8(raw) {
         Ok(_) => raw.len(),
         Err(e) if e.error_len().is_none() => e.valid_up_to(),
         Err(_) => raw.len(),
     };
+    let cut = scrub::cut_index(raw, valid);
     stats.truncated_values += 1;
     Value::String(format!(
         "{}…[truncated: {cut} of {full_len} bytes]",
@@ -248,10 +250,11 @@ fn hex_capped(raw: &[u8], limits: &EncodeLimits, stats: &mut EncodeStats) -> Val
     if raw.len() <= cap {
         return Value::String(format!("\\x{}", hex(raw)));
     }
+    let keep = scrub::cut_index(raw, cap);
     stats.truncated_values += 1;
     Value::String(format!(
-        "\\x{}…[truncated: {cap} of {} bytes]",
-        hex(&raw[..cap]),
+        "\\x{}…[truncated: {keep} of {} bytes]",
+        hex(&raw[..keep]),
         raw.len()
     ))
 }

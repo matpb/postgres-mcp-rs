@@ -1,50 +1,81 @@
 //! Best-effort masking of secrets in log text: SQL PASSWORD literals, connection-string keys and URL passwords.
 
+use std::borrow::Cow;
+
 /// Replacement for a masked secret.
 const MASK: &str = "***";
 /// Keys whose value is masked when written as `key=value` or `key = 'value'`.
 const KEYS: &[&[u8]] = &[b"password", b"sslpassword", b"passfile"];
 
-/// The final pass over a value that leaves the server: hashes are replaced and counted, then strings are masked.
-/// Keys in `pre_masked` were masked by their tool already; masking them again cuts text after a nested literal.
-pub fn scrub_and_mask(value: &mut serde_json::Value, pre_masked: &[&str]) -> usize {
-    let found = crate::scrub::scrub_value(value);
-    let mut pending: Vec<(&mut serde_json::Value, bool)> = vec![(value, false)];
-    while let Some((node, skip)) = pending.pop() {
+/// The final pass over a value that leaves the server: hashes are replaced, then the PASSWORD literal mask runs on
+/// every string. Keys in `pre_masked` were masked by their tool already; `statement_text` keys also lose a hash cut at their end.
+pub fn scrub_and_mask(value: &mut serde_json::Value, pre_masked: &[&str], statement_text: &[&str]) {
+    crate::scrub::scrub_value(value);
+    let mut pending: Vec<(&mut serde_json::Value, bool, bool)> = vec![(value, false, false)];
+    while let Some((node, skip, statement)) = pending.pop() {
         match node {
-            serde_json::Value::String(text) if !skip => {
-                let masked = mask(text.as_str());
-                if masked != *text {
-                    *text = masked;
+            serde_json::Value::String(text) => {
+                let masked = if skip {
+                    None
+                } else {
+                    owned_or_none(mask_password_literals(text))
+                };
+                let tailed = if statement {
+                    owned_or_none(crate::scrub::scrub_tail(masked.as_deref().unwrap_or(text)))
+                } else {
+                    None
+                };
+                if let Some(replaced) = tailed.or(masked) {
+                    *text = replaced;
                 }
             }
             serde_json::Value::Array(items) => {
-                pending.extend(items.iter_mut().map(|item| (item, skip)));
+                pending.extend(items.iter_mut().map(|item| (item, skip, statement)));
             }
             serde_json::Value::Object(map) => {
-                pending.extend(
-                    map.iter_mut()
-                        .map(|(key, child)| (child, skip || pre_masked.contains(&key.as_str()))),
-                );
+                pending.extend(map.iter_mut().map(|(key, child)| {
+                    (
+                        child,
+                        skip || pre_masked.contains(&key.as_str()),
+                        statement || statement_text.contains(&key.as_str()),
+                    )
+                }));
             }
             _ => {}
         }
     }
-    found
+}
+
+fn owned_or_none(text: Cow<'_, str>) -> Option<String> {
+    match text {
+        Cow::Owned(owned) => Some(owned),
+        Cow::Borrowed(_) => None,
+    }
+}
+
+/// Returns `text` with each quoted literal after the keyword PASSWORD replaced by `'***'`; other text is unchanged.
+pub fn mask_password_literals(text: &str) -> Cow<'_, str> {
+    let masked = mask_keyed(text.as_bytes(), true);
+    if masked == text.as_bytes() {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(String::from_utf8_lossy(&masked).into_owned())
+    }
 }
 
 /// Returns `text` with secrets replaced by `***`; text without secrets comes back unchanged.
 pub fn mask(text: &str) -> String {
-    let keyed = mask_keyed(text.as_bytes());
+    let keyed = mask_keyed(text.as_bytes(), false);
     let masked = mask_urls(&keyed);
     String::from_utf8_lossy(&masked).into_owned()
 }
 
-fn mask_keyed(text: &[u8]) -> Vec<u8> {
+/// Masks every keyed secret. With `literal_only`, only the PASSWORD literal forms are masked.
+fn mask_keyed(text: &[u8], literal_only: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
-        match keyed_secret(text, i, &mut out) {
+        match keyed_secret(text, i, &mut out, literal_only) {
             Some(next) => i = next,
             None => {
                 out.push(text[i]);
@@ -56,11 +87,14 @@ fn mask_keyed(text: &[u8]) -> Vec<u8> {
 }
 
 /// Masks the secret of the keyword at `start`, appends the result to `out` and returns the index after it.
-fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
+fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>, literal_only: bool) -> Option<usize> {
     if start > 0 && is_word(text[start - 1]) {
         return None;
     }
     for key in KEYS {
+        if literal_only && *key != b"password" {
+            continue;
+        }
         let end = start + key.len();
         let Some(word) = text.get(start..end) else {
             continue;
@@ -70,7 +104,7 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
         }
         let k = skip_spaces(text, end);
         return match text.get(k) {
-            Some(b'=') => {
+            Some(b'=') if !literal_only => {
                 let v = skip_spaces(text, k + 1);
                 let value_end = keyed_value_end(text, v);
                 out.extend_from_slice(&text[start..end]);
@@ -90,7 +124,11 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
             }
             // Escape string E'...': backslash escapes and doubled quotes.
             Some(b'E' | b'e') if *key == b"password" && text.get(k + 1) == Some(&b'\'') => {
-                out.extend_from_slice(&text[start..=k]);
+                if literal_only {
+                    out.extend_from_slice(&text[start..k]);
+                } else {
+                    out.extend_from_slice(&text[start..=k]);
+                }
                 out.extend_from_slice(b"'***'");
                 Some(escape_end(text, k + 1))
             }
@@ -111,9 +149,13 @@ fn keyed_secret(text: &[u8], start: usize, out: &mut Vec<u8>) -> Option<usize> {
                     None => text.len(),
                 };
                 out.extend_from_slice(&text[start..k]);
-                out.extend_from_slice(tag);
-                out.extend_from_slice(MASK.as_bytes());
-                out.extend_from_slice(tag);
+                if literal_only {
+                    out.extend_from_slice(b"'***'");
+                } else {
+                    out.extend_from_slice(tag);
+                    out.extend_from_slice(MASK.as_bytes());
+                    out.extend_from_slice(tag);
+                }
                 Some(end)
             }
             _ => None,

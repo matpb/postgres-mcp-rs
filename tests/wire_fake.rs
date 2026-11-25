@@ -1395,3 +1395,58 @@ async fn explain_plan_over_the_byte_cap_is_refused_and_poisons() {
     assert_same(&err, WireError::Refused("plan too large".into()));
     assert!(conn.is_poisoned());
 }
+
+/// Log lines of this test binary, written through one global subscriber.
+fn captured_logs() -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || LogSink(sink.clone()))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("one subscriber per test binary");
+        buffer
+    })
+    .clone()
+}
+
+/// Writes log bytes into the shared buffer.
+struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut bytes) = self.0.lock() {
+            bytes.extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The pool's connect-failure log line carries the server's message with the hash replaced.
+#[tokio::test]
+async fn a_connect_failure_logs_the_server_message_with_its_hash_replaced() {
+    const HASH: &str = "SCRAM-SHA-256$4096:c2FsdA==$a2V5:a2V5";
+    let logs = captured_logs();
+    let message = format!("password authentication failed for user \"{HASH}\"");
+    let (port, _task) = spawn_server(vec![
+        Step::ReadUntagged,
+        Step::Write(error_response("28P01", &message)),
+    ])
+    .await;
+    let pool = Pool::new(cfg(port), 1).with_name("log_site_connect");
+    let before = logs.lock().expect("log buffer").len();
+    assert!(pool.checkout(Duration::from_secs(5)).await.is_err());
+    let text = String::from_utf8_lossy(&logs.lock().expect("log buffer")[before..]).into_owned();
+    assert!(text.contains("connection failed"), "{text}");
+    assert!(text.contains("log_site_connect"), "{text}");
+    assert!(text.contains("[redacted password hash]"), "{text}");
+    assert!(!text.contains(HASH), "{text}");
+}

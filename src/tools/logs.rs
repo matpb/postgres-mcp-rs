@@ -557,7 +557,7 @@ fn stamp(timestamp: &str) -> &str {
     timestamp.get(..23).unwrap_or(timestamp)
 }
 
-/// Replaces password hashes, counts them in the running call, and masks secrets. This runs before the filters
+/// Replaces password hashes and masks secrets; the count comes from the returned output. This runs before the filters
 /// and the cut, so neither sees unredacted text and a cut never leaves part of a hash.
 fn mask_entry(mut entry: Entry) -> Entry {
     entry.message = clean(&entry.message);
@@ -568,8 +568,7 @@ fn mask_entry(mut entry: Entry) -> Entry {
 }
 
 fn clean(text: &str) -> String {
-    let (scrubbed, found) = scrub::scrub_counting(text);
-    scrub::record(found);
+    let (scrubbed, _) = scrub::scrub_counting(text);
     mask::mask(&scrubbed)
 }
 
@@ -617,7 +616,7 @@ fn cut(text: String, max: usize, truncated: &mut u64) -> String {
     if text.len() <= max {
         return text;
     }
-    let mut end = max;
+    let mut end = crate::scrub::cut_index(text.as_bytes(), max);
     while !text.is_char_boundary(end) {
         end -= 1;
     }

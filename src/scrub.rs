@@ -38,16 +38,96 @@ fn hash_end(bytes: &[u8], at: usize) -> Option<usize> {
             return None;
         }
         let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
-        let after_ok = bytes
-            .get(digits_end)
-            .is_none_or(|byte| !byte.is_ascii_alphanumeric());
+        let rest_after = bytes.get(digits_end..).unwrap_or_default();
+        let after_ok = !rest_after.first().is_some_and(u8::is_ascii_alphanumeric)
+            || rest_after.starts_with(SCRAM_PREFIX)
+            || rest_after.starts_with(MD5_PREFIX);
         return (before_ok && after_ok).then_some(digits_end);
     }
     None
 }
 
-/// Replaces every password hash in the bytes. Borrows the input when there is none; returns the count.
+/// Replaces every password hash in the bytes until none is left. Borrows the input when there is none; returns
+/// the count. A pass can expose a hash it could not see before, so the pass repeats; each pass removes one.
 pub fn scrub_bytes(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
+    let mut count = 0;
+    let mut owned: Option<Vec<u8>> = None;
+    loop {
+        let input = owned.as_deref().unwrap_or(bytes);
+        let (plain, found) = scrub_pass(input);
+        let (escaped, more) = hex_stage(&plain);
+        if found + more == 0 {
+            break;
+        }
+        count += found + more;
+        let next = escaped.into_owned();
+        owned = Some(next);
+    }
+    match owned {
+        Some(buffer) => (Cow::Owned(buffer), count),
+        None => (Cow::Borrowed(bytes), 0),
+    }
+}
+
+/// Replaces hashes that sit in `\x` hex escapes, as a bytea value inside a record's text does. The hex of each
+/// escape is decoded, scrubbed, and written back in hex.
+fn hex_stage(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
+    let mut out: Option<Vec<u8>> = None;
+    let mut copied = 0;
+    let mut count = 0;
+    let mut at = 1;
+    while at < bytes.len() {
+        if bytes[at] != b'x' || bytes[at - 1] != b'\\' {
+            at += 1;
+            continue;
+        }
+        let start = at + 1;
+        let run = bytes[start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_hexdigit())
+            .count();
+        let even = run & !1;
+        let decoded = unhex_hex(&bytes[start..start + even]);
+        let (scrubbed, found) = scrub_pass(&decoded);
+        if found == 0 {
+            at = start + even;
+            continue;
+        }
+        let buffer = out.get_or_insert_with(|| Vec::with_capacity(bytes.len()));
+        buffer.extend_from_slice(&bytes[copied..start]);
+        buffer.extend_from_slice(hex_text(&scrubbed).as_bytes());
+        count += found;
+        copied = start + even;
+        at = copied;
+    }
+    match out {
+        None => (Cow::Borrowed(bytes), 0),
+        Some(mut buffer) => {
+            buffer.extend_from_slice(&bytes[copied..]);
+            (Cow::Owned(buffer), count)
+        }
+    }
+}
+
+/// The bytes of hex digit pairs; the caller passes an even number of hex digits.
+fn unhex_hex(digits: &[u8]) -> Vec<u8> {
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = char::from(pair[0]).to_digit(16).unwrap_or(0) as u8;
+            let low = char::from(pair[1]).to_digit(16).unwrap_or(0) as u8;
+            high << 4 | low
+        })
+        .collect()
+}
+
+/// Lower-case hex of the bytes.
+fn hex_text(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// One left-to-right pass of `scrub_bytes`.
+fn scrub_pass(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
     let mut out: Option<Vec<u8>> = None;
     let mut copied = 0;
     let mut count = 0;
@@ -96,6 +176,36 @@ pub fn scrub_cut_tail(bytes: &[u8]) -> (Cow<'_, [u8]>, usize) {
         }
     }
     (Cow::Borrowed(bytes), 0)
+}
+
+/// The longest prefix of `text` within `max` bytes that does not end inside a marker: a marker that the cut
+/// would split starts the cut instead.
+pub fn cut_index(text: &[u8], max: usize) -> usize {
+    if max >= text.len() {
+        return text.len();
+    }
+    let from = (max + 1).saturating_sub(REDACTED.len());
+    for start in from..max {
+        if text[start..].starts_with(REDACTED.as_bytes()) {
+            return start;
+        }
+    }
+    max
+}
+
+/// `text` with a hash cut at its end replaced, when one is there.
+pub fn scrub_tail(text: &str) -> Cow<'_, str> {
+    match scrub_cut_tail(text.as_bytes()) {
+        (Cow::Owned(bytes), _) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+        (Cow::Borrowed(_), _) => Cow::Borrowed(text),
+    }
+}
+
+/// The markers in a returned value, as text and as the hex of their bytes (a bytea value shows them as hex).
+pub fn count_markers(value: &Value) -> u64 {
+    let text = value.to_string();
+    let hex: String = REDACTED.bytes().map(|b| format!("{b:02x}")).collect();
+    (text.matches(REDACTED).count() + text.matches(hex.as_str()).count()) as u64
 }
 
 /// Replaces every password hash in the text; the count is the number of replacements.
@@ -148,15 +258,19 @@ pub fn record(count: usize) {
     }
 }
 
-/// The replacements the running call has made so far; zero outside a call.
+/// Sets the running call's count to the markers in what it returns; zero outside a call.
+pub fn set_total(count: u64) {
+    let _ = CALL_REDACTIONS.try_with(|counter| counter.store(count, Ordering::Relaxed));
+}
+
+/// The running call's count so far; zero outside a call.
 pub fn total() -> u64 {
     CALL_REDACTIONS
         .try_with(|counter| counter.load(Ordering::Relaxed))
         .unwrap_or(0)
 }
 
-/// Scrubs every string of a JSON value and every object key, without recursion. Returns the count, which
-/// is also added to the running call.
+/// Scrubs every string of a JSON value and every object key, without recursion. Returns the count of replacements.
 pub fn scrub_value(value: &mut Value) -> usize {
     let mut count = 0;
     let mut pending: Vec<&mut Value> = vec![value];
@@ -178,7 +292,6 @@ pub fn scrub_value(value: &mut Value) -> usize {
             _ => {}
         }
     }
-    record(count);
     count
 }
 

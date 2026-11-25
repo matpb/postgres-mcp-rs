@@ -368,11 +368,12 @@ pub fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, McpError> {
     })
 }
 
-/// The final pass over a tool result: password hashes are replaced and counted, string values are masked, and
-/// `redactedHashes` is set to the replacements the call has made so far.
-fn scrubbed(mut value: Value, pre_masked: &[&str]) -> Value {
-    mask::scrub_and_mask(&mut value, pre_masked);
-    let total = scrub::total();
+/// The final pass over a tool result: hashes are replaced, string values are masked, and `redactedHashes` is the
+/// number of markers in the result, which the call's counter takes too.
+fn scrubbed(mut value: Value, tool: &str) -> Value {
+    mask::scrub_and_mask(&mut value, pre_masked(tool), statement_text(tool));
+    let total = scrub::count_markers(&value);
+    scrub::set_total(total);
     if let Some(object) = value.as_object_mut() {
         object.insert("redactedHashes".to_owned(), Value::from(total));
     }
@@ -382,16 +383,26 @@ fn scrubbed(mut value: Value, pre_masked: &[&str]) -> Value {
 /// Scrubs and masks a completion result, keys included, by round-tripping it through its JSON form.
 fn scrub_completion(result: CompleteResult) -> CompleteResult {
     let Ok(mut value) = serde_json::to_value(&result) else {
-        return result;
+        return CompleteResult::new(CompletionInfo::default());
     };
-    mask::scrub_and_mask(&mut value, &[]);
+    mask::scrub_and_mask(&mut value, &[], &[]);
+    scrub::set_total(scrub::count_markers(&value));
     serde_json::from_value(value).unwrap_or_else(|_| CompleteResult::new(CompletionInfo::default()))
 }
 
 /// The client-facing success shape: structured content and the same JSON as one text block.
 /// The value must come from `scrubbed`; the text block is scrubbed again as a guard.
-fn success(value: Value) -> CallToolResult {
-    let text = scrub::scrub(&value.to_string()).into_owned();
+fn success(tool: &str, value: Value) -> CallToolResult {
+    let json = value.to_string();
+    let (text, found) = scrub::scrub_counting(&json);
+    if found > 0 {
+        tracing::warn!(
+            tool,
+            count = found,
+            "output guard replaced text after the main pass"
+        );
+    }
+    let text = text.into_owned();
     let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.structured_content = Some(value);
     result
@@ -560,6 +571,14 @@ fn pre_masked(tool: &str) -> &'static [&'static str] {
     }
 }
 
+/// The keys of statement text, which also lose a hash cut short at their end.
+fn statement_text(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "list_activity" | "query_stats" => &["query"],
+        _ => &[],
+    }
+}
+
 /// What the audit line and the client need from one tool call.
 struct ToolRun {
     result: CallToolResult,
@@ -617,7 +636,10 @@ impl PgMcp {
             .and_then(ToolError::sqlstate)
             .map(str::to_owned);
         let result = match call.result {
-            Ok(value) => success(scrubbed(value, pre_masked(name))),
+            Ok(value) => {
+                let value = scrubbed(value, name);
+                success(name, value)
+            }
             Err(error) => {
                 let text = error.message();
                 let (message, count) = scrub::scrub_counting(&text);

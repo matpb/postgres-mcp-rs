@@ -53,7 +53,7 @@ pub const EXECUTE_QUERY: &str = "Run ONE read-only SQL statement and return its 
      ST_AsGeoJSON(col) or col::text when you want another shape.\n\
      - Oversized text is cut and ends with \"…[truncated: X of Y bytes]\"; truncatedValues counts \
      them. Re-query with substr() for the rest. rawFallbacks counts values returned as raw text \
-     because they did not parse as their type. SQL NULL is null. Text shaped like a PostgreSQL password hash is replaced with [redacted password hash] in every result, and redactedHashes counts the replacements.";
+     because they did not parse as their type. SQL NULL is null. Text shaped like a PostgreSQL password hash is replaced with [redacted password hash] in every result, and redactedHashes is the number of [redacted password hash] markers in the result. A quoted literal after the keyword PASSWORD is replaced with '***' in every string value.";
 
 pub const EXECUTE_QUERY_SQL_PARAM: &str = "One read-only SQL statement: SELECT, WITH, VALUES, TABLE, EXPLAIN or SHOW. No placeholders; \
      inline the values.";

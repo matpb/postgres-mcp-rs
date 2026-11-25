@@ -1694,3 +1694,54 @@ async fn describe_table_quoted_name_with_dot_and_uppercase() {
     assert_eq!(ok(&rows)["columns"][0]["name"], "Select", "{rows}");
     assert_eq!(ok(&rows)["rows"], json!([{"Select": 1}]), "{rows}");
 }
+
+/// Every `required` array in a schema has unique names, and each one is a property of the same object.
+fn check_required_names(node: &Value, path: &str) {
+    let mut pending = vec![(node, path.to_owned())];
+    while let Some((value, at)) = pending.pop() {
+        match value {
+            Value::Object(object) => {
+                if let Some(required) = object.get("required") {
+                    let names = required.as_array().expect("required is an array");
+                    let mut seen = std::collections::HashSet::new();
+                    for name in names {
+                        let name = name.as_str().expect("required names are strings");
+                        assert!(seen.insert(name), "{at}: {name} is required twice");
+                        let known = object
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|props| props.contains_key(name));
+                        assert!(known, "{at}: required {name} is not a property");
+                    }
+                }
+                pending.extend(
+                    object
+                        .iter()
+                        .map(|(key, child)| (child, format!("{at}.{key}"))),
+                );
+            }
+            Value::Array(items) => {
+                pending.extend(items.iter().map(|child| (child, format!("{at}[]"))));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every tool's input and output schema lists each required name once, and only names it declares.
+#[tokio::test]
+async fn every_tool_schema_lists_each_required_name_once() {
+    let router = app(one_db(PORT_18, &[]));
+    let body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+    let reply = post_mcp(&router, &body, &[("mcp-protocol-version", PROTOCOL_2025)]).await;
+    let tools = array(&result_of(&reply.json())["tools"], "tools").clone();
+    assert!(tools.len() >= 20, "{} tools", tools.len());
+    for tool in &tools {
+        let name = tool["name"].as_str().expect("tool name");
+        for key in ["inputSchema", "outputSchema"] {
+            if let Some(schema) = tool.get(key) {
+                check_required_names(schema, &format!("{name}.{key}"));
+            }
+        }
+    }
+}

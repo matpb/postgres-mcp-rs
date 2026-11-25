@@ -62,6 +62,10 @@ fn the_docs_forbid_the_broad_profile_in_the_exact_words() {
     assert!(README.contains(
         "This is the recommended setup. It reads the tables it is granted and nothing else."
     ));
+    assert!(README.contains("- **Password hash scrubber.** Every tool result, resource body, completion and error text, and every log field that can carry text from the database, is scanned before it leaves the server, and text shaped like a PostgreSQL password hash in its stored form (SCRAM-SHA-256 verifier or md5 hash) is replaced with [redacted password hash]. It is always on and cannot be configured off. Each successful tool result carries the count as `redactedHashes`; the audit line and a warning line carry the same count for tools, resources and completions. A quoted literal after the keyword PASSWORD, as in CREATE ROLE or ALTER ROLE, is replaced with '***' in every string value; that mask is not counted. Error texts and log lines get the hash replacement only."));
+    assert!(README.contains(
+        "`redactedHashes` is the number of `[redacted password hash]` markers in the result."
+    ));
     assert!(!README.contains("For local development only"));
 }
 
@@ -69,9 +73,10 @@ fn the_docs_forbid_the_broad_profile_in_the_exact_words() {
 fn the_security_docs_carry_the_layer_texts_exactly() {
     let security = include_str!("../SECURITY.md");
     assert!(security.contains("- **Views and functions written by others.** The server refuses the credential catalogs by name and filters them out of pg_stats, pg_stats_ext and pg_stats_ext_exprs. A view or a SECURITY DEFINER function in your own schemas that reads those catalogs with its owner's rights is not known to the server; the role's privileges decide whether it can be used. pg_roles also shows per-role settings (rolconfig)."));
-    assert!(security.contains("- **Transformed hashes.** The scrubber recognises password hashes in their stored form. SQL that transforms a value before returning it (reverse, substring, encode) is not recognised; the gate, which refuses the credential catalogs and filters the statistics views, is what stops such a query from reaching a hash in the first place. A hash copied into an ordinary table by someone with access is caught only in its stored form."));
+    assert!(security.contains("- **Transformed hashes.** The scrubber recognises password hashes in their stored form. SQL that transforms a value before returning it (reverse, substring, encode, concatenation without a separator, an escaped form) is not recognised. For the credential catalogs, the gate refuses them and filters the statistics views; that is what stops such a query from reaching a hash in the first place. A hash copied into an ordinary table by someone with access is caught only in its stored form. The gate also refuses TOAST tables and the functions that return raw page or write-ahead log data. Statement text of other sessions, visible to a role with pg_monitor, can hold a password hash that someone typed in a CREATE ROLE or ALTER ROLE statement; it is redacted in its stored form only."));
+    assert!(security.contains("- **TimescaleDB job configuration.** `list_jobs` returns each job's `config` as it is stored; only the hash scrubber and the PASSWORD literal mask run on its string values, so a secret under a key such as password is returned. Keep secrets out of job configuration."));
     assert!(security.contains("This holds for every role, superusers included."));
-    assert!(security.contains("**19. Password hash scrubber.** Every tool result, resource body, completion and error text, and every log field that can carry text from the database, is scanned before it leaves the server, and text shaped like a PostgreSQL password hash in its stored form (SCRAM-SHA-256 verifier or md5 hash) is replaced with [redacted password hash]. A password literal after the word PASSWORD in statement text is masked the same way. It is always on and cannot be configured off. The audit line counts the replacements."));
+    assert!(security.contains("**19. Password hash scrubber.** Every tool result, resource body, completion and error text, and every log field that can carry text from the database, is scanned before it leaves the server, and text shaped like a PostgreSQL password hash in its stored form (SCRAM-SHA-256 verifier or md5 hash) is replaced with [redacted password hash]. It is always on and cannot be configured off. Each successful tool result carries the count as `redactedHashes`; the audit line and a warning line carry the same count for tools, resources and completions. A quoted literal after the keyword PASSWORD, as in CREATE ROLE or ALTER ROLE, is replaced with '***' in every string value; that mask is not counted. Error texts and log lines get the hash replacement only."));
     assert!(security.contains("The TOAST tables of all catalogs are refused by name, and so are the foreign server and foreign-data wrapper catalogs."));
     assert!(security.contains("The gate also refuses TOAST tables and the functions that return raw page or write-ahead log data. Statement text of other sessions, visible to a role with pg_monitor, can hold a password hash that someone typed in a CREATE ROLE or ALTER ROLE statement; it is redacted in its stored form only."));
     assert!(!security.contains("Statistics and role settings"));
@@ -82,5 +87,8 @@ fn the_tool_description_carries_both_sentences() {
     let text = postgres_mcp::tools::text::EXECUTE_QUERY;
     assert!(text.contains("The statistics views pg_stats, pg_stats_ext and pg_stats_ext_exprs never return rows for the catalogs that hold credentials."));
     assert!(text.contains("Name them directly in FROM or JOIN; a correlated subquery over one scans the whole view once per outer row."));
-    assert!(text.contains("Text shaped like a PostgreSQL password hash is replaced with [redacted password hash] in every result, and redactedHashes counts the replacements."));
+    assert!(text.contains("Text shaped like a PostgreSQL password hash is replaced with [redacted password hash] in every result, and redactedHashes is the number of [redacted password hash] markers in the result."));
+    assert!(text.contains(
+        "A quoted literal after the keyword PASSWORD is replaced with '***' in every string value."
+    ));
 }

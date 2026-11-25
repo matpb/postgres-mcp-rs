@@ -3,6 +3,18 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.2]
+
+### Fixed
+
+- The `execute_query` output schema listed `redactedHashes` twice in `required`, which JSON Schema forbids, so clients that validate schemas could not call the tool.
+- The PASSWORD mask in results covers only the quoted literal after the keyword PASSWORD. Other text in rows, such as `Forgot your password = reset it via the portal`, is returned unchanged.
+- `redactedHashes` counts only the markers in the text that is returned: a replacement in text that a cut removed is not counted, and a marker is never cut in half.
+- Hash-shaped column names are replaced before duplicate names are numbered, so `columns[].name`, `originalName` and the row keys agree.
+- Adjacent password hashes with no separator are each replaced: an md5 hash directly before or after a SCRAM verifier, or two md5 hashes.
+- An md5 hash that PostgreSQL cut short in statement text, such as `pg_stat_activity.query`, keeps none of its digits.
+- A hash inside a record's text, where a bytea value is written in hex, is replaced in its hex form.
+
 ## [0.1.1]
 
 ### Changed
@@ -15,7 +27,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- A password-hash scrubber. Every tool result, resource, completion, error text and database-bearing log field is scanned, and text shaped like a SCRAM-SHA-256 verifier or an md5 hash is replaced with `[redacted password hash]`. Each result carries `redactedHashes`, and the audit line carries `redacted_hashes`.
+- A password-hash scrubber. Every tool result, resource, completion, error text and database-bearing log field is scanned, and text shaped like a SCRAM-SHA-256 verifier or an md5 hash is replaced with `[redacted password hash]`. Each successful tool result carries `redactedHashes`; resources, completions and error results carry no count field, and the audit line carries `redacted_hashes`.
 - A credential exposure test matrix that runs each role on each test server through every known path, the statistics-view and audit tests, and a false-positive scan of every seeded table.
 
 ## [0.1.0]

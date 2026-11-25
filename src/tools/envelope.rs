@@ -53,7 +53,11 @@ pub fn build(
         elapsed,
         ..
     } = output;
-    let raw_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+    let raw_names: Vec<String> = result
+        .columns
+        .iter()
+        .map(|c| crate::scrub::scrub(&c.name).into_owned())
+        .collect();
     let deduped = dedup_columns(&raw_names);
     let columns = result
         .columns

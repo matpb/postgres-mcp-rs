@@ -626,12 +626,9 @@ async fn a_value_cut_inside_a_scram_hash_holds_no_part_of_it() {
         .to_owned();
     assert_eq!(
         value,
-        format!(
-            "{}{}…[truncated: 64 of 87 bytes]",
-            "x".repeat(50),
-            "[redacted pass"
-        )
+        format!("{}…[truncated: 50 of 87 bytes]", "x".repeat(50))
     );
+    assert!(!value.replace(REDACTED, "").contains("[reda"), "{value}");
     assert_clean(&value, "cut value", needles);
 }
 
@@ -656,8 +653,9 @@ async fn a_value_cut_inside_an_md5_hash_holds_no_digits() {
         .to_owned();
     assert_eq!(
         value,
-        format!("{} [reda…[truncated: 64 of 94 bytes]", "x".repeat(58))
+        format!("{} …[truncated: 59 of 94 bytes]", "x".repeat(58))
     );
+    assert!(!value.replace(REDACTED, "").contains("[reda"), "{value}");
     assert_clean(&value, "cut value", needles);
 }
 
@@ -1044,11 +1042,19 @@ fn check_call(
         "{tool}: protocol error {response}"
     );
     assert_clean(&response.to_string(), tool, needles);
+    assert_clean(lines, &format!("{tool} log lines"), needles);
     let audited = audit_count(lines, tool, database);
     if let Some(reported) = reported_count(response) {
         assert_eq!(
             reported, audited,
             "{tool}: result and audit disagree\n{response}\n{lines}"
+        );
+    }
+    if let Some(structured) = response["result"].get("structuredContent") {
+        let markers = structured.to_string().matches(REDACTED).count() as u64;
+        assert_eq!(
+            markers, audited,
+            "{tool}: markers returned vs redactedHashes\n{response}"
         );
     }
     if audited > 0 {
@@ -1076,6 +1082,21 @@ async fn park_session() -> Connection {
         .expect("parked query");
     conn
 }
+
+/// Tools whose results carry no text from the seeded fixtures: their count must be zero.
+const NO_SEEDED_TEXT: &[&str] = &[
+    "list_databases",
+    "server_info",
+    "list_schemas",
+    "get_privileges",
+    "replication_status",
+    "database_stats",
+    "list_hypertables",
+    "list_continuous_aggregates",
+    "list_jobs",
+    "table_stats",
+    "describe_hypertable",
+];
 
 /// Every tool, every resource and one completion on 15432 as the superuser: no planted text reaches the client,
 /// the planted sources show the marker, and each call's counts agree with its own audit line.
@@ -1108,12 +1129,30 @@ async fn every_tool_resource_and_completion_scrubs_and_counts_what_it_returns() 
     for name in &names {
         let start = log_len();
         let response = call_tool(&router, name, arguments_for(name)).await;
-        check_call(name, &response, &log_since(start), needles, SCOPE);
+        let audited = check_call(name, &response, &log_since(start), needles, SCOPE);
+        if NO_SEEDED_TEXT.contains(&name.as_str()) {
+            assert_eq!(
+                audited, 0,
+                "{name} has no seeded text to replace: {response}"
+            );
+        }
     }
 
     // The failing statement puts a hash past the 4096-byte cut of its log line, where a cut could split it.
-    let failing = format!("SELECT repeat('x', 4080) || '{PLANTED}'::int");
+    let failing = format!("SELECT '{}{PLANTED}'::int", "x".repeat(4080));
     let _ = call_tool(&router, "execute_query", json!({ "sql": failing })).await;
+    let _ = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": format!("SELECT '{PLANTED}'::int")}),
+    )
+    .await;
+    let _ = call_tool(
+        &router,
+        "execute_query",
+        json!({"sql": format!("SELECT 1 AS \"{PLANTED}\" FROM pg_database LIMIT 1")}),
+    )
+    .await;
     let planted = [
         (
             "describe_table",
@@ -1140,6 +1179,16 @@ async fn every_tool_resource_and_completion_scrubs_and_counts_what_it_returns() 
             json!({"sql": format!("SELECT * FROM hashes.hash_sources WHERE label = '{PLANTED}'")}),
         ),
         ("list_activity", json!({"all_databases": true})),
+        ("search_schema", json!({"query": "hash"})),
+        ("list_objects", json!({"schema": "hashes"})),
+        (
+            "read_server_log",
+            json!({"contains": "invalid input syntax for type integer", "limit": 50}),
+        ),
+        (
+            "query_stats",
+            json!({"contains": "pg_database LIMIT", "limit": 5}),
+        ),
     ];
     for (tool, args) in planted {
         let start = log_len();
@@ -1221,14 +1270,105 @@ async fn every_tool_resource_and_completion_scrubs_and_counts_what_it_returns() 
 async fn a_log_filter_for_a_hash_matches_nothing() {
     let needles = needles().await;
     let router = router_for(PORT_18, "postgres", "test-only-superuser");
-    let response = call_tool(
+    let _ = call_tool(
         &router,
-        "read_server_log",
-        json!({"contains": "SCRAM-SHA-256", "limit": 50}),
+        "execute_query",
+        json!({"sql": format!("SELECT '{PLANTED}'::int")}),
     )
     .await;
-    assert_clean(&response.to_string(), "log filter", needles);
-    assert!(!response.to_string().contains(REDACTED), "{response}");
+    let shown = call_tool(
+        &router,
+        "read_server_log",
+        json!({"contains": "invalid input syntax for type integer", "limit": 50}),
+    )
+    .await;
+    assert!(shown.to_string().contains(REDACTED), "{shown}");
+    let filtered = call_tool(
+        &router,
+        "read_server_log",
+        json!({"contains": "c2FsdA==", "limit": 50}),
+    )
+    .await;
+    assert_eq!(
+        result_of(&filtered)["structuredContent"]["entries"],
+        json!([]),
+        "{filtered}"
+    );
+    assert_clean(&filtered.to_string(), "log filter", needles);
+}
+
+/// A hash in a log message is replaced before the 4096-byte cut, and the cut never leaves part of the marker.
+#[tokio::test]
+async fn a_hash_at_the_log_message_cut_is_not_returned_whole_or_in_part() {
+    let needles = needles().await;
+    let router = router_for(PORT_18, "postgres", "test-only-superuser");
+    for (count, label) in [(4080, "past the cut"), (4050, "across the cut")] {
+        let failing = format!("SELECT '{}{PLANTED}'::int", "x".repeat(count));
+        let _ = call_tool(&router, "execute_query", json!({ "sql": failing })).await;
+        let shown = call_tool(
+            &router,
+            "read_server_log",
+            json!({"contains": "xxxxxxxxxxxxxxxx", "limit": 5}),
+        )
+        .await;
+        let text = shown.to_string();
+        assert_clean(&text, label, needles);
+        let entries = result_of(&shown)["structuredContent"]["entries"].clone();
+        let entries = entries.as_array().expect("entries");
+        for entry in entries {
+            let whole_only = entry.to_string().replace(REDACTED, "");
+            assert!(
+                !whole_only.contains("[redacted"),
+                "{label}: a partial marker in {entry}"
+            );
+        }
+        let truncated = entries.iter().any(|entry| {
+            entry["message"].as_str().is_some_and(|message| {
+                message.contains("[truncated") && !message.contains("[redacted")
+            })
+        });
+        assert!(truncated, "{label}: {shown}");
+    }
+}
+
+/// A value that only looks like the end of an md5 hash is user data and comes back unchanged.
+#[tokio::test]
+async fn a_user_value_ending_in_md5_letters_is_returned_unchanged() {
+    for text in ["note md5abc", "md5d41d8cd98f00b204e9800998ecf8427"] {
+        assert_eq!(returned_text(text).await, text);
+    }
+}
+
+/// Two hash-shaped column aliases: the names and the row keys carry the markers, numbered when they collide.
+#[tokio::test]
+async fn hash_shaped_column_names_are_replaced_before_they_are_numbered() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let first = "md5d41d8cd98f00b204e9800998ecf8427e";
+    let second = "md50123456789abcdef0123456789abcdef";
+    let sql = format!("SELECT 1 AS \"{first}\", 2 AS \"{second}\"");
+    let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+    let content = &result_of(&response)["structuredContent"];
+    let columns = content["columns"].as_array().expect("columns");
+    assert_eq!(columns[0]["name"], json!(REDACTED), "{response}");
+    assert_eq!(
+        columns[1]["name"],
+        json!("[redacted password hash]__2"),
+        "{response}"
+    );
+    assert_eq!(content["rows"][0][REDACTED], json!(1), "{response}");
+    assert_eq!(
+        content["rows"][0]["[redacted password hash]__2"],
+        json!(2),
+        "{response}"
+    );
+    let markers = content.to_string().matches(REDACTED).count();
+    assert_eq!(
+        content["redactedHashes"],
+        json!(markers as u64),
+        "{response}"
+    );
+    assert!(!response.to_string().contains("md5d41"), "{response}");
+    assert!(!response.to_string().contains("md50123"), "{response}");
 }
 
 /// A role whose search_path defines its own `<>` for name still gets the catalog's meaning in the filter.
@@ -1292,4 +1432,185 @@ async fn an_unknown_tool_name_with_a_hash_is_scrubbed_in_the_error() {
         "{response}"
     );
     assert!(!response.to_string().contains(PLANTED), "{response}");
+}
+
+/// A text value in execute_query, as the server returns it, for the given SQL text.
+async fn returned_text(text: &str) -> String {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let sql = format!("SELECT '{}' AS v", text.replace('\'', "''"));
+    let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+    result_of(&response)["structuredContent"]["rows"][0]["v"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Ordinary text that contains the word password is returned byte for byte.
+#[tokio::test]
+async fn ordinary_text_with_the_word_password_is_returned_unchanged() {
+    for text in [
+        "Forgot your password = reset it via the portal",
+        "postgres://u:pw@h/db",
+        "host=h password=secret",
+        "passfile=/tmp/x",
+    ] {
+        assert_eq!(returned_text(text).await, text);
+    }
+}
+
+/// A quoted literal after the keyword PASSWORD is masked in every string value, in every quoting form.
+#[tokio::test]
+async fn a_password_literal_after_the_keyword_is_masked_in_rows() {
+    for (text, expected) in [
+        (
+            "ALTER ROLE x PASSWORD 'secret'",
+            "ALTER ROLE x PASSWORD '***'",
+        ),
+        (
+            "CREATE ROLE x ENCRYPTED PASSWORD 'secret'",
+            "CREATE ROLE x ENCRYPTED PASSWORD '***'",
+        ),
+        (
+            "CREATE ROLE x PASSWORD $$secret$$",
+            "CREATE ROLE x PASSWORD '***'",
+        ),
+        (
+            "CREATE ROLE x PASSWORD E'se\\'cret'",
+            "CREATE ROLE x PASSWORD '***'",
+        ),
+    ] {
+        assert_eq!(returned_text(text).await, expected, "{text}");
+    }
+}
+
+/// PostgreSQL cuts a long statement at track_activity_query_size; the md5 digits it keeps are not returned.
+#[tokio::test]
+async fn a_statement_cut_by_postgres_keeps_no_digits_of_an_md5_hash() {
+    let router = router_for(PORT_18, "postgres", "test-only-superuser");
+    let mut config = superuser_config(PORT_18);
+    config.startup_params = vec![("application_name".to_owned(), "tail_probe".to_owned())];
+    let mut conn = Connection::connect(&config).await.expect("probe connect");
+    let sql = format!(
+        "SELECT pg_sleep(3), '{} md5fedcba9876543210fedcba9876543210'",
+        "x".repeat(991)
+    );
+    let sleeper = tokio::spawn(async move { conn.simple_query(&sql).await.map(|_| ()) });
+    let mut row = Value::Null;
+    for _ in 0..50 {
+        let listed = call_tool(
+            &router,
+            "list_activity",
+            json!({"all_databases": true, "query_chars": 4000}),
+        )
+        .await;
+        row = result_of(&listed)["structuredContent"]["sessions"]
+            .as_array()
+            .and_then(|sessions| {
+                sessions.iter().find(|s| {
+                    s["application"] == json!("tail_probe") && s["state"] == json!("active")
+                })
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
+        if !row.is_null() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let query = row["query"].as_str().expect("probe row").to_owned();
+    assert!(query.ends_with(REDACTED), "{row}");
+    assert!(!query.contains("fedcba98"), "{row}");
+    sleeper
+        .await
+        .expect("probe task")
+        .expect("probe statement ran");
+}
+
+/// A hash inside a record is hex in the record's text; the record comes back with the marker's hex, not the hash's.
+#[tokio::test]
+async fn a_hash_inside_a_record_is_replaced_in_its_hex_form() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let sql = format!("SELECT ROW(convert_to('{PLANTED}', 'UTF8'))::text AS v");
+    let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+    let value = result_of(&response)["structuredContent"]["rows"][0]["v"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!value.contains("534352414d2d5348412d"), "{value}");
+    assert!(
+        value.contains("5b72656461637465642070617373776f726420686173685d"),
+        "{value}"
+    );
+}
+
+/// A hash that an invalid argument echoes is replaced in the error text, and the error holds no needle.
+#[tokio::test]
+async fn an_invalid_argument_that_echoes_a_hash_is_scrubbed_in_the_error() {
+    let needles = needles().await;
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let response = call_tool(&router, "query_stats", json!({ "limit": PLANTED })).await;
+    assert_clean(&response.to_string(), "invalid argument", needles);
+    assert!(response.to_string().contains(REDACTED), "{response}");
+}
+
+/// A resource name that holds a hash is replaced in the not-found error, and the error holds no needle.
+#[tokio::test]
+async fn a_resource_error_that_names_a_hash_is_scrubbed() {
+    let needles = needles().await;
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": format!("postgres://appdb/hashes/{PLANTED}")}});
+    let response = post_mcp(&router, &body, &[("mcp-protocol-version", PROTOCOL_2025)])
+        .await
+        .json();
+    assert_clean(&response.to_string(), "resource error", needles);
+    assert!(response.to_string().contains(REDACTED), "{response}");
+}
+
+/// A completion prefix that holds a hash is never returned: no completion value carries it.
+#[tokio::test]
+async fn a_completion_for_a_hash_returns_no_needle() {
+    let needles = needles().await;
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let completion = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "completion/complete",
+        "params": {
+            "ref": {"type": "ref/resource", "uri": "postgres://{database}/{schema}"},
+            "argument": {"name": "schema", "value": PLANTED},
+        },
+    });
+    let response = post_mcp(
+        &router,
+        &completion,
+        &[("mcp-protocol-version", PROTOCOL_2025)],
+    )
+    .await
+    .json();
+    assert_clean(&response.to_string(), "completion", needles);
+}
+
+/// A bytea array too large for the value cut keeps no hash in hex, and its count is the markers it returns.
+#[tokio::test]
+async fn a_large_bytea_array_holds_no_hash_hex() {
+    let router = router_for(PORT_18, "mcp_ro", "test-only-ro");
+    let sql = format!(
+        "SELECT ARRAY(SELECT convert_to('{PLANTED}', 'UTF8') FROM generate_series(1, 400)) AS v"
+    );
+    let response = call_tool(&router, "execute_query", json!({ "sql": sql })).await;
+    let content = &result_of(&response)["structuredContent"];
+    let text = content["rows"][0]["v"].to_string();
+    assert!(!text.contains("534352414d2d5348412d32353624"), "{response}");
+    assert!(
+        text.contains("5b72656461637465642070617373776f726420686173685d"),
+        "{response}"
+    );
+    assert_eq!(
+        content["redactedHashes"].as_u64(),
+        Some(
+            text.matches("5b72656461637465642070617373776f726420686173685d")
+                .count() as u64
+        ),
+        "{response}"
+    );
 }

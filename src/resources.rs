@@ -165,11 +165,11 @@ pub async fn read(
         .err()
         .and_then(ToolError::sqlstate)
         .map(str::to_owned);
-    // The final pass runs on the value before it is serialized, and again on the text it becomes. The count is
-    // the replacements of this call, which the caller runs under its counter.
+    // The final pass runs on the value before it is serialized. The count is the markers in the body.
     let outcome = match outcome {
         Ok((name, mut value)) => {
-            crate::tools::mask::scrub_and_mask(&mut value, &[]);
+            crate::tools::mask::scrub_and_mask(&mut value, &[], &[]);
+            scrub::set_total(scrub::count_markers(&value));
             Ok((name, value))
         }
         Err(error) => Err(read_error(error)),
@@ -202,9 +202,19 @@ pub async fn read(
     }
     match outcome {
         Ok((_, value)) => {
-            let text = scrub::scrub(&value.to_string()).into_owned();
+            let json = value.to_string();
+            let (text, found) = scrub::scrub_counting(&json);
+            if found > 0 {
+                tracing::warn!(
+                    tool,
+                    count = found,
+                    "output guard replaced text after the main pass"
+                );
+            }
+            let text = text.into_owned();
             Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(text, uri).with_mime_type(JSON_MIME),
+                ResourceContents::text(text, scrub::scrub(uri).into_owned())
+                    .with_mime_type(JSON_MIME),
             ]))
         }
         Err(error) => Err(error),
