@@ -14,6 +14,8 @@ pub struct Record<'a> {
     pub sqlstate: Option<&'a str>,
     /// The SQL text; only its digest is logged.
     pub sql: Option<&'a str>,
+    /// Password hash texts replaced in the result; only the count is logged.
+    pub redacted_hashes: u64,
 }
 
 /// Writes the audit line when the audit log is enabled.
@@ -33,6 +35,7 @@ pub fn record(enabled: bool, record: &Record<'_>) {
         rows,
         sqlstate = record.sqlstate,
         sql_sha256 = sql_sha256.as_deref(),
+        redacted_hashes = record.redacted_hashes,
         "tool call"
     );
 }

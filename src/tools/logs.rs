@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::core::tool;
 use super::mask;
 use super::{Call, ToolError, Toolset, parse_args, text, value_of};
+use crate::scrub;
 use crate::server::AppState;
 use parse::{Entry, Format, rank};
 use query::LogFile;
@@ -556,12 +557,20 @@ fn stamp(timestamp: &str) -> &str {
     timestamp.get(..23).unwrap_or(timestamp)
 }
 
+/// Replaces password hashes, counts them in the running call, and masks secrets. This runs before the filters
+/// and the cut, so neither sees unredacted text and a cut never leaves part of a hash.
 fn mask_entry(mut entry: Entry) -> Entry {
-    entry.message = mask::mask(&entry.message);
-    entry.detail = entry.detail.as_deref().map(mask::mask);
-    entry.statement = entry.statement.as_deref().map(mask::mask);
-    entry.context = entry.context.as_deref().map(mask::mask);
+    entry.message = clean(&entry.message);
+    entry.detail = entry.detail.as_deref().map(clean);
+    entry.statement = entry.statement.as_deref().map(clean);
+    entry.context = entry.context.as_deref().map(clean);
     entry
+}
+
+fn clean(text: &str) -> String {
+    let (scrubbed, found) = scrub::scrub_counting(text);
+    scrub::record(found);
+    mask::mask(&scrubbed)
 }
 
 /// The filters, applied to a masked entry.

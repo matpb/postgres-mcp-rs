@@ -592,7 +592,7 @@ async fn not_installed_databases_report_timescaledb_false() {
                 .collect();
             assert_eq!(
                 keys,
-                BTreeSet::from(["database", "timescaledb", "note"]),
+                BTreeSet::from(["database", "timescaledb", "note", "redactedHashes"]),
                 "{name} on {port}"
             );
         }

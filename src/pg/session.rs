@@ -192,7 +192,8 @@ async fn verify_session(lease: &mut Lease<'_>, settings: &SessionSettings) -> Re
         Err(e) => return Err(wire_failure(e)),
     };
     if result.status != TxStatus::InTransaction || !session_ok(&result.rows) {
-        tracing::warn!(status = ?result.status, values = ?result.rows, "session check failed");
+        let values = crate::scrub::scrub(&format!("{:?}", result.rows)).into_owned();
+        tracing::warn!(status = ?result.status, values = %values, "session check failed");
         return Err(Failure::Drop(RunError::Internal(
             "session check failed".into(),
         )));
@@ -306,7 +307,7 @@ fn allowed_tag(tag: &str) -> bool {
 /// Asks the server to cancel the running query. A failed cancel request is only logged.
 async fn stop_query(handle: &CancelHandle) {
     if let Err(e) = handle.cancel().await {
-        tracing::debug!(error = %e, "cancel request failed");
+        tracing::debug!(error = %crate::scrub::scrub(&e.to_string()), "cancel request failed");
     }
 }
 
@@ -352,7 +353,9 @@ async fn reset(conn: &mut Connection) -> Result<(), WireError> {
 async fn reset_and_release(mut lease: Lease<'_>) {
     match reset(lease.conn()).await {
         Ok(()) => lease.release(true),
-        Err(e) => tracing::warn!(error = %e, "session reset failed; closing the connection"),
+        Err(e) => {
+            tracing::warn!(error = %crate::scrub::scrub(&e.to_string()), "session reset failed; closing the connection")
+        }
     }
 }
 

@@ -9,7 +9,7 @@ These invariants are the product. A change that weakens one is wrong, even when 
 - **Read-only, always.** There is no write tool, no write flag and no path that sends a client's SQL around the gate. Enforced by: the gate in `src/gate.rs` (`check`, `ALLOWED_NODES`, `DENIED_FUNCTIONS`), and the read-only transaction in `src/pg/session.rs` (`begin_sql`, `run_held`). The `generic_plan` option of `explain_query` sends user SQL over the simple protocol, but only behind the server-side preflight in `explain_unbound`.
 - **One statement per call, parser-based.** `src/gate.rs` parses with PostgreSQL's parser and refuses anything not on the node allow-list. Unknown constructs are refused, not allowed. Adding a node type means adding a corpus case in `tests/gate_corpus/allow.sql` or `deny.sql`.
 - **Session state never leaks.** Each connection is checked before use (`verify_session`, `SESSION_CHECK` in `src/pg/session.rs`), pinned at connect time (`connect_config` in `src/config.rs`), and reset with `ROLLBACK` then `DISCARD ALL` (`reset` in `src/pg/session.rs`).
-- **Credentials stay out of output.** Credential catalogs and secret settings are denied in `src/gate.rs` (`CREDENTIAL_RELATIONS`, `SECRET_SETTINGS`), and `SHOW ALL` rows for them are dropped in `src/tools/envelope.rs`. Passwords are redacted in `Debug` output (`src/pg/wire.rs`, `src/config.rs`).
+- **Credentials stay out of output.** Credential catalogs and secret settings are denied in `src/gate.rs` (`CREDENTIAL_RELATIONS`, `SECRET_SETTINGS`), and `SHOW ALL` rows for them are dropped in `src/tools/envelope.rs`. The statistics views are rewritten by the gate (`STATS_VIEWS`, `STATS_HIDDEN_TABLES`), and `Accepted.sql` is the only text to run. Password-hash text is replaced in every result, resource, error and log line by `src/scrub.rs`; `scrubbed` in `src/tools/mod.rs` is the single result path. Passwords are redacted in `Debug` output (`src/pg/wire.rs`, `src/config.rs`).
 - **Exposure stays narrow.** `MCP_HOST` defaults to `127.0.0.1`, and the compose example publishes the port on `127.0.0.1`. The Origin, API key and Host checks live in `src/http_guard.rs` and `build_router` in `src/server.rs`. Do not loosen them.
 - **Stdout is the JSON-RPC channel in stdio mode.** Logs go to stderr (`init_logging` in `src/server.rs`). Never `println!` in a server path.
 - **Caps hold.** Row, value, response, request and SQL-length caps are in `src/config.rs` (`Limits`) and enforced in `src/pg/wire.rs` (`keep_row`) and `src/gate.rs`.
@@ -39,7 +39,8 @@ Tests that need PostgreSQL expect the test stack on `127.0.0.1` ports 15432 (Tim
 - `src/config.rs`: every environment variable, its bounds and errors; `ENV_VARS`; database forms.
 - `src/http_guard.rs`: Origin check, API key digest comparison, 401 and 403 bodies.
 - `src/audit.rs`: the per-call audit line.
-- `src/gate.rs`: the SQL gate: allow-lists, deny-lists, credential and secret rules.
+- `src/gate.rs`: the SQL gate: allow-lists, deny-lists, credential and secret rules, and the statistics-view rewrite.
+- `src/scrub.rs`: the password-hash scrubber applied to every result, resource, error and log line.
 - `src/pg/wire.rs`: PostgreSQL wire client: startup, auth under `AuthPolicy` (SCRAM, MD5, cleartext, trust), extended and simple query (`explain_unbound` for user text), cancel, streamed rows with value and byte caps.
 - `src/pg/session.rs`: `run_readonly`: transaction, session check, timeouts, reset.
 - `src/pg/pool.rs`: per-database semaphore pool.
@@ -83,6 +84,7 @@ Each of these looks harmless and breaks a guarantee or a test.
 - **Test stack ports.** The ports 15432 to 15435 appear in both `docker-compose.test.yml` and `tests/common/mod.rs`. Change both or neither.
 - **No certificate or key in the repo.** The `pgtls` service generates the test CA, certificates and keys at its first start (`docker/tls-initdb/10_tls.sh`), and the tests read them back. Never commit a `.pem`, `.crt` or `.key` file, or a key literal.
 - **Test stack required.** The integration tests fail without the stack. `verify.sh` does not need it.
+- **Test roles.** `mcp_ro` holds `pg_read_all_data` on purpose: it is the hostile broad role that the credential tests use, and `mcp_cert` in the TLS seed holds it too. `mcp_recipe` is the README recipe role and must keep only what the recipe grants. Do not give `mcp_recipe` more privileges.
 - **Container bind address.** The image sets `MCP_HOST=0.0.0.0` so Docker's port mapping works. Changing it breaks the container, and the published port must stay on `127.0.0.1`.
 - **Loopback origins.** Loopback origins are always allowed by design. Do not remove that exception without updating `SECURITY.md`.
 - **`prefer` falls back to plaintext.** A server that answers `N` to the TLS request gets an unencrypted connection in `prefer` mode. Keep that behaviour documented, and do not describe `prefer` as encrypted.

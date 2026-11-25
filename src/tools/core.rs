@@ -15,6 +15,7 @@ use super::{Call, INTERNAL_MAX_ROWS, Runner, Statement, ToolError, Toolset, valu
 use crate::gate::{GateOptions, StatementKind};
 use crate::pg::session::RunOutput;
 use crate::pg::wire::{FetchLimits, Field, Truncation};
+use crate::scrub;
 use crate::server::AppState;
 
 /// Time allowed per database for list_databases.
@@ -330,7 +331,33 @@ pub fn tool_with_leading<I: JsonSchema + 'static, O: JsonSchema + 'static>(
         .with_input_schema::<I>()
         .with_output_schema::<O>();
     set_descriptions(&mut tool.input_schema, docs, leading);
+    add_redacted_hashes(&mut tool.output_schema);
     tool
+}
+
+/// Adds the `redactedHashes` count to an output schema: every result carries it.
+fn add_redacted_hashes(schema: &mut Option<Arc<Map<String, Value>>>) {
+    let Some(schema) = schema.as_mut() else {
+        return;
+    };
+    let schema = Arc::make_mut(schema);
+    let count = serde_json::json!({
+        "type": "integer",
+        "minimum": 0,
+        "description": "Password hash texts replaced with [redacted password hash] in this result."
+    });
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.insert("redactedHashes".to_owned(), count);
+    }
+    match schema.get_mut("required") {
+        Some(Value::Array(required)) => required.push(Value::from("redactedHashes")),
+        _ => {
+            schema.insert(
+                "required".to_owned(),
+                Value::Array(vec![Value::from("redactedHashes")]),
+            );
+        }
+    }
 }
 
 /// Replaces the description of each named property in a generated input schema. A `leading` property
@@ -371,7 +398,9 @@ pub async fn list_databases(state: Arc<AppState>, ct: &CancellationToken) -> Cal
     let mut probes = tokio::task::JoinSet::new();
     for (index, db) in state.config.databases.iter().enumerate() {
         let (state, name, ct) = (state.clone(), db.name.clone(), ct.clone());
-        probes.spawn(async move { (index, probe(state, name, ct).await) });
+        probes.spawn(scrub::under_counter(scrub::call_counter(), async move {
+            (index, probe(state, name, ct).await)
+        }));
     }
     let mut statuses = Vec::with_capacity(state.config.databases.len());
     while let Some(joined) = probes.join_next().await {
@@ -493,8 +522,9 @@ async fn explain(
     check_server_versions(&runner, args, ct).await?;
 
     let prefix = explain_prefix(args);
-    let offset = u32::try_from(prefix.chars().count()).unwrap_or(u32::MAX);
-    let sql = format!("{prefix}{}", args.sql);
+    let offset =
+        (!accepted.rewritten).then(|| u32::try_from(prefix.chars().count()).unwrap_or(u32::MAX));
+    let sql = format!("{prefix}{}", accepted.sql);
     let fetch = FetchLimits {
         max_rows: INTERNAL_MAX_ROWS,
         max_bytes: limits.max_response_bytes,

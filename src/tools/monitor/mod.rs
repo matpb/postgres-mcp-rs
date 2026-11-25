@@ -161,7 +161,7 @@ pub async fn wide_rows(
             max_bytes: WIDE_RESPONSE_BYTES,
             max_value_bytes: WIDE_VALUE_BYTES,
         },
-        offset: 0,
+        offset: Some(0),
         search_path_catalog_only: true,
     };
     let (name, output) = Runner::new(state)

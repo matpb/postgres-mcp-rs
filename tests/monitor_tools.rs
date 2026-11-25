@@ -1021,7 +1021,11 @@ async fn replication_status_publication_table_counts_by_kind() {
         json!(3),
         "the three leaves of shop.events"
     );
-    assert_eq!(tables("pub_schema"), json!(2), "the tables of schema app");
+    assert_eq!(
+        tables("pub_schema"),
+        json!(4),
+        "the tables of schema app: items, orders, recipe_later and leaky"
+    );
 }
 
 #[tokio::test]
@@ -1128,8 +1132,10 @@ async fn list_activity_masks_password_in_statement_text() {
 async fn query_stats_masks_password_in_statement_text() {
     let mut holder = raw(PORT_18, "postgres", SUPER_PASSWORD, MASK_HOLDER_APP).await;
     let marker_alias = format!("mask_probe_{MASK_MARKER}");
-    let sql =
-        format!("SELECT 'ALTER ROLE nobody PASSWORD ''hunter2-{MASK_MARKER}''' AS {marker_alias}");
+    // The extra columns give the statement a query id no other statement shares; aliases are not part of it.
+    let sql = format!(
+        "SELECT 'ALTER ROLE nobody PASSWORD ''hunter2-{MASK_MARKER}''' AS {marker_alias}, 17 AS b, 2.5 AS c, true AS d, NULL::int8 AS e WHERE 17 = 17"
+    );
     holder.simple_query(&sql).await.expect("statement runs");
     let result = call(
         ro_config(PORT_18),

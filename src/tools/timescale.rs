@@ -225,7 +225,7 @@ async fn query(
             max_bytes: MAX_RESPONSE_BYTES,
             max_value_bytes: MAX_VALUE_BYTES,
         },
-        offset: 0,
+        offset: Some(0),
         search_path_catalog_only: true,
     };
     let (name, output) = Runner::new(state)

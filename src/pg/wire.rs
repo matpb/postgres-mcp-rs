@@ -327,7 +327,7 @@ impl Connection {
         self.ensure_usable()?;
         let result = self.explain_unbound_inner(sql, max_bytes).await;
         if let Err(WireError::Protocol(reason)) = &result {
-            tracing::error!(reason = %reason, "explain response rejected; connection dropped");
+            tracing::error!(reason = %crate::scrub::scrub(reason), "explain response rejected; connection dropped");
         }
         self.note(&result);
         result
@@ -344,7 +344,7 @@ impl Connection {
         }
         .await;
         if let Err(e) = result {
-            tracing::debug!(error = %e, "connection close was not clean");
+            tracing::debug!(error = %crate::scrub::scrub(&e.to_string()), "connection close was not clean");
         }
     }
 
@@ -824,7 +824,7 @@ impl Connection {
         if let Some(t) = truncated {
             // A failed cancel leaves the statement running; the bounded drain below still reads it to ReadyForQuery.
             if let Err(e) = self.cancel.cancel().await {
-                tracing::warn!(error = %e, "cancel request after a capped fetch failed; draining the statement");
+                tracing::warn!(error = %crate::scrub::scrub(&e.to_string()), "cancel request after a capped fetch failed; draining the statement");
             }
             let (tx_status, other) = self.discard_until_ready(skip).await?;
             if let Some(e) = other {

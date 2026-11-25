@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CompleteRequestMethod,
-    CompleteRequestParams, CompleteResult, ContentBlock, Implementation,
+    CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock, Implementation,
     ListResourceTemplatesRequestMethod, ListResourceTemplatesResult, ListResourcesRequestMethod,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestMethod,
     ReadResourceRequestParams, ReadResourceResponse, ResourcesCapability, ServerCapabilities,
@@ -38,6 +38,7 @@ use crate::pg::session::{
 };
 use crate::pg::wire::{DbError, FetchLimits};
 use crate::resources;
+use crate::scrub;
 use crate::server::AppState;
 use envelope::QueryEnvelope;
 
@@ -110,14 +111,16 @@ impl ToolError {
     }
 
     /// Maps a session error; `offset` is the length of any SQL prefix added before the submitted text.
-    pub fn from_run(error: RunError, database: &str, offset: u32) -> ToolError {
+    pub fn from_run(error: RunError, database: &str, offset: Option<u32>) -> ToolError {
         match error {
             RunError::Refused(message) => ToolError::Rejected(refusal_text(&message)),
             RunError::Db(mut e) => {
-                e.position = e
-                    .position
-                    .and_then(|p| p.checked_sub(offset))
-                    .filter(|p| *p > 0);
+                // Without an offset the text was rewritten, so the parser's position no longer matches the caller's text.
+                e.position = offset.and_then(|offset| {
+                    e.position
+                        .and_then(|p| p.checked_sub(offset))
+                        .filter(|p| *p > 0)
+                });
                 ToolError::Db(Box::new(e))
             }
             RunError::Timeout(ms) => ToolError::Timeout(ms),
@@ -161,8 +164,9 @@ pub struct Statement<'a> {
     pub params: &'a [Option<&'a str>],
     pub user_sql: bool,
     pub fetch: FetchLimits,
-    /// Characters the runner prepended to the submitted SQL, subtracted from error positions.
-    pub offset: u32,
+    /// Characters the runner prepended to the submitted SQL, subtracted from error positions; None when the
+    /// submitted text was rewritten and no position can be reported.
+    pub offset: Option<u32>,
     /// True when the server's own catalog SQL runs; false for user SQL, which keeps the role's search_path.
     pub search_path_catalog_only: bool,
 }
@@ -201,11 +205,11 @@ impl<'a> Runner<'a> {
         };
         let accepted = check_sql(sql, options).await?;
         let statement = Statement {
-            sql,
+            sql: &accepted.sql,
             params: &[],
             user_sql: true,
             fetch: user_fetch(limits.max_rows, self.state),
-            offset: 0,
+            offset: (!accepted.rewritten).then_some(0),
             search_path_catalog_only: false,
         };
         let output = run(db, &pool, statement, ct).await?;
@@ -230,7 +234,7 @@ impl<'a> Runner<'a> {
             params,
             user_sql: false,
             fetch: user_fetch(INTERNAL_MAX_ROWS, self.state),
-            offset: 0,
+            offset: Some(0),
             search_path_catalog_only: true,
         };
         let (name, output) = self.internal_raw(database, statement, ct).await?;
@@ -260,7 +264,7 @@ impl<'a> Runner<'a> {
         database: Option<&str>,
         sql: &str,
         fetch: FetchLimits,
-        offset: u32,
+        offset: Option<u32>,
         ct: &CancellationToken,
     ) -> Result<(String, RunOutput), ToolError> {
         let (db, pool) = self.state.pool(database)?;
@@ -358,13 +362,36 @@ impl PgMcp {
 }
 
 pub fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T, McpError> {
-    serde_json::from_value(args)
-        .map_err(|e| McpError::invalid_params(format!("invalid arguments: {e}"), None))
+    serde_json::from_value(args).map_err(|e| {
+        let message = format!("invalid arguments: {e}");
+        McpError::invalid_params(scrub::scrub(&message).into_owned(), None)
+    })
+}
+
+/// The final pass over a tool result: password hashes are replaced and counted, string values are masked, and
+/// `redactedHashes` is set to the replacements the call has made so far.
+fn scrubbed(mut value: Value, pre_masked: &[&str]) -> Value {
+    mask::scrub_and_mask(&mut value, pre_masked);
+    let total = scrub::total();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("redactedHashes".to_owned(), Value::from(total));
+    }
+    value
+}
+
+/// Scrubs and masks a completion result, keys included, by round-tripping it through its JSON form.
+fn scrub_completion(result: CompleteResult) -> CompleteResult {
+    let Ok(mut value) = serde_json::to_value(&result) else {
+        return result;
+    };
+    mask::scrub_and_mask(&mut value, &[]);
+    serde_json::from_value(value).unwrap_or_else(|_| CompleteResult::new(CompletionInfo::default()))
 }
 
 /// The client-facing success shape: structured content and the same JSON as one text block.
+/// The value must come from `scrubbed`; the text block is scrubbed again as a guard.
 fn success(value: Value) -> CallToolResult {
-    let text = value.to_string();
+    let text = scrub::scrub(&value.to_string()).into_owned();
     let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.structured_content = Some(value);
     result
@@ -431,8 +458,9 @@ impl ServerHandler for PgMcp {
         if !self.resources_enabled() {
             return Err(McpError::method_not_found::<ReadResourceRequestMethod>());
         }
-        resources::read(&self.state, &request.uri, &context.ct)
+        scrub::counted(resources::read(&self.state, &request.uri, &context.ct))
             .await
+            .0
             .map(ReadResourceResponse::from)
     }
 
@@ -445,7 +473,11 @@ impl ServerHandler for PgMcp {
             return Err(McpError::method_not_found::<CompleteRequestMethod>());
         }
         let started = Instant::now();
-        let result = resources::complete(&self.state, request, &context.ct).await;
+        let (result, redacted_hashes) = scrub::counted(async {
+            let result = resources::complete(&self.state, request, &context.ct).await;
+            scrub_completion(result)
+        })
+        .await;
         audit::record(
             self.state.config.audit_log,
             &audit::Record {
@@ -456,8 +488,16 @@ impl ServerHandler for PgMcp {
                 rows: None,
                 sqlstate: None,
                 sql: None,
+                redacted_hashes,
             },
         );
+        if redacted_hashes > 0 {
+            tracing::warn!(
+                tool = "completion",
+                count = redacted_hashes,
+                "password hash text was redacted from a result"
+            );
+        }
         Ok(result)
     }
 
@@ -477,15 +517,69 @@ impl ServerHandler for PgMcp {
         let name = request.name.to_string();
         if !self.tools.iter().any(|t| t.name.as_ref() == name) {
             return Err(McpError::invalid_params(
-                format!("unknown tool: {name}"),
+                scrub::scrub(&format!("unknown tool: {name}")).into_owned(),
                 None,
             ));
         }
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let ct = context.ct;
-        let state = &self.state;
         let started = Instant::now();
-        let call = match name.as_str() {
+        let (run, redacted_hashes) =
+            scrub::counted(self.run_tool(&name, args, context.ct.clone())).await;
+        let run = run?;
+        audit::record(
+            self.state.config.audit_log,
+            &audit::Record {
+                tool: &name,
+                database: run.database.as_deref(),
+                ok: run.ok,
+                duration: started.elapsed(),
+                rows: run.rows,
+                sqlstate: run.sqlstate.as_deref(),
+                sql: run.sql.as_deref(),
+                redacted_hashes,
+            },
+        );
+        if redacted_hashes > 0 {
+            tracing::warn!(
+                tool = %name,
+                database = run.database.as_deref(),
+                count = redacted_hashes,
+                "password hash text was redacted from a result"
+            );
+        }
+        Ok(CallToolResponse::from(run.result))
+    }
+}
+
+/// The keys whose text the tool masked before its own cut or filter, so the final pass leaves them alone.
+fn pre_masked(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "list_activity" | "query_stats" => &["query"],
+        "read_server_log" => &["message", "detail", "statement", "context"],
+        _ => &[],
+    }
+}
+
+/// What the audit line and the client need from one tool call.
+struct ToolRun {
+    result: CallToolResult,
+    ok: bool,
+    database: Option<String>,
+    rows: Option<usize>,
+    sqlstate: Option<String>,
+    sql: Option<String>,
+}
+
+impl PgMcp {
+    /// Runs one tool and builds its scrubbed result. Its replacements are counted by the call that wraps it.
+    async fn run_tool(
+        &self,
+        name: &str,
+        args: Value,
+        ct: CancellationToken,
+    ) -> Result<ToolRun, McpError> {
+        let state = &self.state;
+        let call = match name {
             "list_databases" => {
                 let _: core::NoArgs = parse_args(args)?;
                 core::list_databases(state.clone(), &ct).await
@@ -494,13 +588,13 @@ impl ServerHandler for PgMcp {
             "explain_query" => core::explain_query(state, parse_args(args)?, &ct).await,
             "server_info" => core::server_info(state, parse_args(args)?, &ct).await,
             _ => {
-                let routed = match schema::dispatch(state, &name, args.clone(), &ct).await {
+                let routed = match schema::dispatch(state, name, args.clone(), &ct).await {
                     Some(call) => Some(call),
-                    None => match monitor::dispatch(state, &name, args.clone(), &ct).await {
+                    None => match monitor::dispatch(state, name, args.clone(), &ct).await {
                         Some(call) => Some(call),
-                        None => match logs::dispatch(state, &name, args.clone(), &ct).await {
+                        None => match logs::dispatch(state, name, args.clone(), &ct).await {
                             Some(call) => Some(call),
-                            None => timescale::dispatch(state, &name, args, &ct).await,
+                            None => timescale::dispatch(state, name, args, &ct).await,
                         },
                     },
                 };
@@ -508,29 +602,36 @@ impl ServerHandler for PgMcp {
                     Some(call) => call?,
                     None => {
                         return Err(McpError::invalid_params(
-                            format!("unknown tool: {name}"),
+                            scrub::scrub(&format!("unknown tool: {name}")).into_owned(),
                             None,
                         ));
                     }
                 }
             }
         };
-        audit::record(
-            state.config.audit_log,
-            &audit::Record {
-                tool: &name,
-                database: call.database.as_deref(),
-                ok: call.result.is_ok(),
-                duration: started.elapsed(),
-                rows: call.rows,
-                sqlstate: call.result.as_ref().err().and_then(ToolError::sqlstate),
-                sql: call.sql.as_deref(),
-            },
-        );
+        let ok = call.result.is_ok();
+        let sqlstate = call
+            .result
+            .as_ref()
+            .err()
+            .and_then(ToolError::sqlstate)
+            .map(str::to_owned);
         let result = match call.result {
-            Ok(value) => success(value),
-            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.message())]),
+            Ok(value) => success(scrubbed(value, pre_masked(name))),
+            Err(error) => {
+                let text = error.message();
+                let (message, count) = scrub::scrub_counting(&text);
+                scrub::record(count);
+                CallToolResult::error(vec![ContentBlock::text(message.into_owned())])
+            }
         };
-        Ok(CallToolResponse::from(result))
+        Ok(ToolRun {
+            result,
+            ok,
+            database: call.database,
+            rows: call.rows,
+            sqlstate,
+            sql: call.sql,
+        })
     }
 }

@@ -780,3 +780,76 @@ SELECT (u).umoptions FROM (SELECT * FROM information_schema.user_mapping_options
 --;;
 -- code: relation_denied
 SELECT (u).umoptions FROM (SELECT * FROM pg_catalog.pg_statistic) u;
+--;;
+-- code: function_denied
+SELECT heap_page_items('x'::bytea);
+--;;
+-- code: function_denied
+SELECT bt_page_items('x'::bytea);
+--;;
+-- code: function_denied
+SELECT brin_page_items('x'::bytea);
+--;;
+-- code: function_denied
+SELECT gin_page_items('x'::bytea);
+--;;
+-- code: function_denied
+SELECT gist_page_items('x'::bytea);
+--;;
+-- code: function_denied
+SELECT hash_page_items('x'::bytea);
+--;;
+-- code: function_denied
+SELECT spgist_page_items('x'::bytea);
+--;;
+-- code: function_denied
+SELECT pg_mcv_list_items('x'::pg_mcv_list);
+--;;
+-- code: function_denied
+SELECT _postgis_stats('t'::regclass, 'geom');
+--;;
+-- code: relation_denied
+SELECT chunk_data FROM pg_toast.pg_toast_2619;
+--;;
+-- code: relation_denied
+SELECT chunk_data FROM "PG_TOAST"."PG_TOAST_2619";
+--;;
+-- code: relation_denied
+SELECT chunk_data FROM pg_toast_2619;
+--;;
+-- code: relation_denied
+SELECT chunk_data FROM pg_toast.pg_toast_1260;
+--;;
+-- code: relation_denied
+SELECT encode(chunk_data, 'base64') FROM pg_toast.pg_toast_2619;
+--;;
+-- code: relation_denied
+SELECT convert_from(chunk_data, 'UTF8') FROM pg_toast.pg_toast_2619;
+--;;
+-- code: relation_denied
+SELECT count(*) FROM pg_toast_temp_1.pg_toast_temp_1_x;
+--;;
+-- code: function_denied
+SELECT pg_get_wal_block_info('0/0', '0/1');
+--;;
+-- code: function_denied
+SELECT pg_get_wal_record_info('0/0');
+--;;
+-- code: function_denied
+SELECT pg_get_wal_records_info('0/0', '0/1');
+--;;
+-- code: function_denied
+SELECT pg_get_wal_records_info_till_end_of_wal('0/0');
+--;;
+-- code: function_denied
+SELECT pg_get_wal_stats('0/0', '0/1');
+--;;
+-- code: function_denied
+SELECT pg_get_wal_stats_till_end_of_wal('0/0');
+--;;
+-- code: function_denied
+SELECT pg_available_wal_summaries();
+--;;
+-- code: function_denied
+SELECT pg_wal_summary_contents('0/0'::pg_lsn, '0/1'::pg_lsn);
+--;;

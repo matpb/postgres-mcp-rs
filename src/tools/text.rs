@@ -19,14 +19,15 @@ pub const EXECUTE_QUERY: &str = "Run ONE read-only SQL statement and return its 
      with side effects (nextval, set_config, pg_advisory_lock, pg_terminate_backend, dblink, \
      query_to_xml, lo_import, pg_read_file and similar). The rejection message names the construct. \
      Catalogs that hold credentials (pg_authid, pg_shadow, pg_settings) are not readable here; use \
-     server_info for settings.\n\
+     server_info for settings. The statistics views pg_stats, pg_stats_ext and pg_stats_ext_exprs never \
+     return rows for the catalogs that hold credentials. Name them directly in FROM or JOIN; a correlated subquery over one scans the whole view once per outer row.\n\
      The statement runs in a READ ONLY transaction that is always rolled back, under a server-side \
      time limit. Each call is independent: no session state survives between calls.\n\
-     ROWS: at most the server row cap is returned (default 1000) and the SQL is not rewritten. \
+     ROWS: at most the server row cap is returned (default 1000). Apart from the statistics views named above, the SQL runs as written. \
      \"truncated\": true means more rows existed or the response size budget was reached; add a LIMIT, \
      aggregate, or select fewer columns. Use ORDER BY for a stable page.\n\
      RESULT: {database, columns, rows, rowCount, truncated, truncatedReason?, truncatedValues, \
-     rawFallbacks, executionTimeMs}.\n\
+     rawFallbacks, redactedHashes, executionTimeMs}.\n\
      - columns: [{name, type, typeOid, originalName?}] in SELECT order, present even with zero rows. \
      rows: one {column: value} object per row. Duplicate column names become \"id__2\", \"id__3\" with \
      originalName set.\n\
@@ -52,7 +53,7 @@ pub const EXECUTE_QUERY: &str = "Run ONE read-only SQL statement and return its 
      ST_AsGeoJSON(col) or col::text when you want another shape.\n\
      - Oversized text is cut and ends with \"…[truncated: X of Y bytes]\"; truncatedValues counts \
      them. Re-query with substr() for the rest. rawFallbacks counts values returned as raw text \
-     because they did not parse as their type. SQL NULL is null.";
+     because they did not parse as their type. SQL NULL is null. Text shaped like a PostgreSQL password hash is replaced with [redacted password hash] in every result, and redactedHashes counts the replacements.";
 
 pub const EXECUTE_QUERY_SQL_PARAM: &str = "One read-only SQL statement: SELECT, WITH, VALUES, TABLE, EXPLAIN or SHOW. No placeholders; \
      inline the values.";
@@ -73,7 +74,8 @@ pub fn server_instructions(databases: &[String]) -> String {
 }
 
 pub const LIMIT_PARAM: &str = "Maximum number of entries to return (default 100, at most 500).";
-pub const CURSOR_PARAM: &str = "Opaque cursor from a previous call's nextCursor, to fetch the next page.";
+pub const CURSOR_PARAM: &str =
+    "Opaque cursor from a previous call's nextCursor, to fetch the next page.";
 pub const SCHEMA_PARAM: &str = "Schema name. Omit to cover every schema except the system ones.";
 
 pub const SERVER_INFO_TITLE: &str = "Server and connection info";
@@ -210,19 +212,28 @@ pub const NOT_INSTALLED_TIMESCALE: &str = "TimescaleDB is not installed in this 
      extension; ordinary tables are available through list_objects and describe_table.";
 
 // Parameter descriptions moved from the tool modules; each is one client-facing string.
-pub const READ_SERVER_LOG_LIST_FILES_PARAM: &str = "Return the log files and logging settings instead of log entries.";
-pub const READ_SERVER_LOG_SINCE_PARAM: &str = "Only entries at or after this time (ISO 8601, e.g. 2026-01-31T14:00:00Z).";
+pub const READ_SERVER_LOG_LIST_FILES_PARAM: &str =
+    "Return the log files and logging settings instead of log entries.";
+pub const READ_SERVER_LOG_SINCE_PARAM: &str =
+    "Only entries at or after this time (ISO 8601, e.g. 2026-01-31T14:00:00Z).";
 pub const READ_SERVER_LOG_UNTIL_PARAM: &str = "Only entries before this time (ISO 8601).";
 pub const READ_SERVER_LOG_MIN_SEVERITY_PARAM: &str = "Lowest severity to return: DEBUG, INFO, NOTICE, WARNING, ERROR, FATAL or PANIC. LOG lines rank as INFO.";
-pub const READ_SERVER_LOG_CONTAINS_PARAM: &str = "Case-insensitive text that must appear in the message, detail or statement.";
-pub const READ_SERVER_LOG_USER_PARAM: &str = "Only entries of this database role (structured formats only).";
-pub const READ_SERVER_LOG_ENTRY_DATABASE_PARAM: &str = "Only entries of this database name (structured formats only).";
+pub const READ_SERVER_LOG_CONTAINS_PARAM: &str =
+    "Case-insensitive text that must appear in the message, detail or statement.";
+pub const READ_SERVER_LOG_USER_PARAM: &str =
+    "Only entries of this database role (structured formats only).";
+pub const READ_SERVER_LOG_ENTRY_DATABASE_PARAM: &str =
+    "Only entries of this database name (structured formats only).";
 pub const READ_SERVER_LOG_PID_PARAM: &str = "Only entries of this backend process id.";
-pub const READ_SERVER_LOG_FILE_PARAM: &str = "Read this log file instead of the newest ones (a name from list_files).";
+pub const READ_SERVER_LOG_FILE_PARAM: &str =
+    "Read this log file instead of the newest ones (a name from list_files).";
 pub const DESCRIBE_HYPERTABLE_HYPERTABLE_PARAM: &str = "Hypertable name, bare or as schema.name.";
-pub const DESCRIBE_HYPERTABLE_SCHEMA_PARAM: &str = "Schema of the hypertable. Optional when the name is unique.";
-pub const DESCRIBE_HYPERTABLE_CHUNK_LIMIT_PARAM: &str = "Chunks to list, newest first (default 20, at most 500).";
-pub const DESCRIBE_HYPERTABLE_CHUNK_CURSOR_PARAM: &str = "Cursor from a previous call's nextChunkCursor.";
+pub const DESCRIBE_HYPERTABLE_SCHEMA_PARAM: &str =
+    "Schema of the hypertable. Optional when the name is unique.";
+pub const DESCRIBE_HYPERTABLE_CHUNK_LIMIT_PARAM: &str =
+    "Chunks to list, newest first (default 20, at most 500).";
+pub const DESCRIBE_HYPERTABLE_CHUNK_CURSOR_PARAM: &str =
+    "Cursor from a previous call's nextChunkCursor.";
 pub const LIST_JOBS_JOB_ID_PARAM: &str = "Only this job.";
 pub const LIST_JOBS_HISTORY_PARAM: &str = "Return recent runs instead of the job list.";
 pub const LIST_JOBS_ONLY_FAILURES_PARAM: &str = "With history: only failed runs.";
@@ -230,29 +241,40 @@ pub const LIST_ACTIVITY_STATE_PARAM: &str = "Only sessions in this state: active
 pub const LIST_ACTIVITY_MIN_DURATION_MS_PARAM: &str = "Only sessions whose current query (or transaction, when idle in transaction) has run at least this long.";
 pub const LIST_ACTIVITY_USER_PARAM: &str = "Only sessions of this role.";
 pub const LIST_ACTIVITY_ALL_DATABASES_PARAM: &str = "Include sessions connected to other databases of the server. Default false: this database only.";
-pub const LIST_ACTIVITY_ONLY_BLOCKED_PARAM: &str = "Only sessions waiting on a lock, plus the sessions blocking them.";
+pub const LIST_ACTIVITY_ONLY_BLOCKED_PARAM: &str =
+    "Only sessions waiting on a lock, plus the sessions blocking them.";
 pub const LIST_ACTIVITY_INCLUDE_BACKGROUND_PARAM: &str = "Include background workers (autovacuum, WAL writer, extension workers). Default false: client backends only.";
-pub const LIST_ACTIVITY_QUERY_CHARS_PARAM: &str = "Characters of query text to return per session, 0 to 4000. Default 500.";
+pub const LIST_ACTIVITY_QUERY_CHARS_PARAM: &str =
+    "Characters of query text to return per session, 0 to 4000. Default 500.";
 pub const QUERY_STATS_ORDER_BY_PARAM: &str = "Ranking: total_time (default), mean_time, calls, rows, io (blocks read), temp (temp blocks written).";
 pub const QUERY_STATS_MIN_CALLS_PARAM: &str = "Only statements called at least this many times.";
 pub const QUERY_STATS_CONTAINS_PARAM: &str = "Case-insensitive text the statement must contain.";
-pub const QUERY_STATS_ALL_DATABASES_PARAM: &str = "Include statements from other databases. Default false.";
-pub const QUERY_STATS_QUERY_CHARS_PARAM: &str = "Characters of statement text per entry, 0 to 4000. Default 500.";
-pub const QUERY_STATS_LIMIT_PARAM: &str = "Maximum number of statements to return (default 20, at most 500).";
+pub const QUERY_STATS_ALL_DATABASES_PARAM: &str =
+    "Include statements from other databases. Default false.";
+pub const QUERY_STATS_QUERY_CHARS_PARAM: &str =
+    "Characters of statement text per entry, 0 to 4000. Default 500.";
+pub const QUERY_STATS_LIMIT_PARAM: &str =
+    "Maximum number of statements to return (default 20, at most 500).";
 pub const DATABASE_STATS_SECTIONS_PARAM: &str = "Sections to return: database, io, wal, checkpointer, progress, wait_events. Default: database, checkpointer and progress.";
 pub const TABLE_STATS_TABLE_PARAM: &str = "Only this table (bare name, combine with schema).";
-pub const TABLE_STATS_ORDER_BY_PARAM: &str = "Ranking: size (default), seq_scan, idx_scan, dead_rows, writes, last_autovacuum.";
+pub const TABLE_STATS_ORDER_BY_PARAM: &str =
+    "Ranking: size (default), seq_scan, idx_scan, dead_rows, writes, last_autovacuum.";
 pub const TABLE_STATS_INCLUDE_INDEXES_PARAM: &str = "Add each table's indexes with their scan counts and sizes. Default true when a single table is requested, else false.";
 pub const TABLE_STATS_UNUSED_INDEXES_PARAM: &str = "Return only indexes never scanned since the last statistics reset (primary keys and unique indexes excluded).";
 pub const EXPLAIN_QUERY_SQL_PARAM: &str = "The statement to explain, without the EXPLAIN keyword.";
 pub const EXPLAIN_QUERY_FORMAT_PARAM: &str = "Plan format: text (default), json, yaml or xml.";
-pub const EXPLAIN_QUERY_ANALYZE_PARAM: &str = "Execute the statement and report actual times and row counts.";
+pub const EXPLAIN_QUERY_ANALYZE_PARAM: &str =
+    "Execute the statement and report actual times and row counts.";
 pub const EXPLAIN_QUERY_BUFFERS_PARAM: &str = "Include shared, local and temporary buffer usage.";
 pub const EXPLAIN_QUERY_VERBOSE_PARAM: &str = "Include output columns and schema-qualified names.";
-pub const EXPLAIN_QUERY_SETTINGS_PARAM: &str = "Include configuration settings that differ from the defaults (PostgreSQL 12 or newer).";
-pub const EXPLAIN_QUERY_WAL_PARAM: &str = "Include WAL usage; needs analyze (PostgreSQL 13 or newer).";
-pub const EXPLAIN_QUERY_MEMORY_PARAM: &str = "Include planner memory usage (PostgreSQL 17 or newer).";
-pub const EXPLAIN_QUERY_SERIALIZE_PARAM: &str = "Measure the time to convert the output for transfer; needs analyze (PostgreSQL 17 or newer).";
+pub const EXPLAIN_QUERY_SETTINGS_PARAM: &str =
+    "Include configuration settings that differ from the defaults (PostgreSQL 12 or newer).";
+pub const EXPLAIN_QUERY_WAL_PARAM: &str =
+    "Include WAL usage; needs analyze (PostgreSQL 13 or newer).";
+pub const EXPLAIN_QUERY_MEMORY_PARAM: &str =
+    "Include planner memory usage (PostgreSQL 17 or newer).";
+pub const EXPLAIN_QUERY_SERIALIZE_PARAM: &str =
+    "Measure the time to convert the output for transfer; needs analyze (PostgreSQL 17 or newer).";
 pub const EXPLAIN_QUERY_GENERIC_PLAN_PARAM: &str = "Plan with generic parameters so the statement may contain $1 placeholders (PostgreSQL 16 or newer); not with analyze.";
 
 pub const RESOURCE_DATABASE_TITLE: &str = "Database";

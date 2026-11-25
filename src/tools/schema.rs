@@ -233,7 +233,7 @@ async fn run_rows(
             max_bytes: 8 * MIB,
             max_value_bytes: MIB,
         },
-        offset: 0,
+        offset: Some(0),
         search_path_catalog_only: true,
     };
     let (name, output) = Runner::new(state)

@@ -9,7 +9,7 @@ use common::{
     one_db, post_mcp, result_of,
 };
 use postgres_mcp::config::Config;
-use postgres_mcp::gate::{GateOptions, check};
+use postgres_mcp::gate::{GateOptions, check, credential_roots};
 use postgres_mcp::pg::tls::SslMode;
 use postgres_mcp::pg::wire::{ConnectConfig, Connection};
 use serde_json::{Value, json};
@@ -389,6 +389,11 @@ async fn server_log_helpers_are_refused_in_execute_query_on_every_server() {
 /// Name parts that mark a function which reads files or signals, changes or writes the server, or changes
 /// sequences, settings, sessions or large objects. The audit prints every match with the gate's verdict.
 const SUSPECT_FUNCTION_PARTS: &[&str] = &[
+    "wal",
+    "page",
+    "raw",
+    "tuple",
+    "heap",
     "read_file",
     "read_binary",
     "ls_dir",
@@ -437,6 +442,11 @@ const SUSPECT_FUNCTION_PARTS: &[&str] = &[
 
 /// A match of any of these that the gate allows fails the audit, unless `read_only_by_inspection` accepts it.
 const STRICT_FUNCTION_PARTS: &[&str] = &[
+    "wal",
+    "page",
+    "raw",
+    "tuple",
+    "heap",
     "read_file",
     "read_binary",
     "ls_dir",
@@ -471,7 +481,23 @@ fn read_only_by_inspection(name: &str) -> bool {
         || name.starts_with("pg_stat_get_")
         || matches!(
             name,
-            "pg_get_replication_slots" | "pg_show_replication_origin_status"
+            "pg_get_replication_slots"
+                | "pg_show_replication_origin_status"
+                | "heap_tableam_handler"
+                | "raw_array_subscript_handler"
+                | "pg_current_wal_flush_lsn"
+                | "pg_current_wal_insert_lsn"
+                | "pg_current_wal_lsn"
+                | "pg_last_wal_receive_lsn"
+                | "pg_last_wal_replay_lsn"
+                | "pg_get_wal_replay_pause_state"
+                | "pg_get_wal_resource_managers"
+                | "pg_get_wal_summarizer_state"
+                | "pg_is_wal_replay_paused"
+                | "pg_split_walfile_name"
+                | "pg_walfile_name"
+                | "pg_walfile_name_offset"
+                | "pg_wal_lsn_diff"
         )
 }
 
@@ -606,5 +632,433 @@ async fn relation_audit_of_credential_columns_on_pg19() {
         )
         .await;
         assert_eq!(unmasked, "0", "{schema}.{table}.{column} shows a value");
+    }
+}
+
+/// Every view and materialized view with its definition on one line, for the closure below.
+const VIEW_DEFINITIONS_SQL: &str = "SELECT n.nspname, c.relname, replace(pg_catalog.pg_get_viewdef(c.oid, true), chr(10), ' ') \
+     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE c.relkind IN ('v', 'm') AND n.nspname <> 'pg_toast' ORDER BY 1, 2";
+
+/// Views that read a credential catalog and show no credential. Each is proven by the column names it has.
+const KEEP_VIEWS: &[(&str, &str)] = &[
+    (
+        "information_schema._pg_foreign_table_columns",
+        "foreign table column options, not server or mapping options",
+    ),
+    (
+        "information_schema._pg_foreign_tables",
+        "foreign table names and options, not server or mapping options",
+    ),
+    (
+        "information_schema.administrable_role_authorizations",
+        "role names and the admin flag",
+    ),
+    (
+        "information_schema.applicable_roles",
+        "role names and the inherit flag",
+    ),
+    (
+        "information_schema.column_options",
+        "foreign table column options",
+    ),
+    (
+        "information_schema.column_privileges",
+        "privilege and object names",
+    ),
+    ("information_schema.enabled_roles", "role names"),
+    (
+        "information_schema.foreign_table_options",
+        "foreign table options",
+    ),
+    ("information_schema.foreign_tables", "foreign table names"),
+    (
+        "information_schema.role_column_grants",
+        "privilege and object names",
+    ),
+    (
+        "information_schema.role_routine_grants",
+        "privilege and object names",
+    ),
+    (
+        "information_schema.role_table_grants",
+        "privilege and object names",
+    ),
+    (
+        "information_schema.role_udt_grants",
+        "privilege and object names",
+    ),
+    (
+        "information_schema.role_usage_grants",
+        "privilege and object names",
+    ),
+    (
+        "information_schema.routine_privileges",
+        "privilege and object names",
+    ),
+    ("information_schema.schemata", "schema names and owners"),
+    (
+        "information_schema.table_privileges",
+        "privilege and object names",
+    ),
+    (
+        "information_schema.udt_privileges",
+        "privilege and object names",
+    ),
+    (
+        "information_schema.usage_privileges",
+        "privilege and object names",
+    ),
+    (
+        "information_schema.user_mappings",
+        "mapping owner and server name, without the options",
+    ),
+    ("pg_catalog.pg_group", "group names and member ids"),
+    (
+        "pg_catalog.pg_policies",
+        "policy names and expressions the owner wrote",
+    ),
+    ("pg_catalog.pg_prepared_xacts", "transaction ids and owners"),
+    ("pg_catalog.pg_seclabels", "security label names"),
+    (
+        "pg_catalog.pg_stat_activity",
+        "session state; the query column is not a credential catalog",
+    ),
+    (
+        "pg_catalog.pg_stat_replication",
+        "replication positions and client addresses",
+    ),
+    (
+        "pg_catalog.pg_stat_subscription",
+        "subscription progress without the connection string",
+    ),
+    (
+        "pg_catalog.pg_stat_subscription_stats",
+        "subscription counters",
+    ),
+    ("public.geometry_columns", "table and column names"),
+    ("timescaledb_information.job_stats", "job run statistics"),
+];
+
+/// Views whose credential column PostgreSQL masks as `********`; proven by counting unmasked values.
+const MASKED_VIEWS: &[(&str, &str, &str)] = &[
+    ("pg_catalog", "pg_roles", "rolpassword"),
+    ("pg_catalog", "pg_user", "passwd"),
+];
+
+/// Splits the view names that the definition text mentions as whole words.
+fn mentions(text: &str, word: &str) -> bool {
+    let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back().is_some_and(identifier);
+        let after = text[at + word.len()..]
+            .chars()
+            .next()
+            .is_some_and(identifier);
+        !before && !after
+    })
+}
+
+/// Views that read a root, directly or through another such view. PostgreSQL records no dependency on a
+/// pinned catalog, so the closure is taken from the definition text; it may include extra views.
+fn reached_views(rows: &[Vec<String>]) -> Vec<(String, String)> {
+    let mut reached = vec![false; rows.len()];
+    let mut names: Vec<String> = credential_roots().into_iter().map(str::to_owned).collect();
+    loop {
+        let mut changed = false;
+        for (index, row) in rows.iter().enumerate() {
+            if reached[index] || !names.iter().any(|name| mentions(&row[2], name)) {
+                continue;
+            }
+            reached[index] = true;
+            changed = true;
+            names.push(row[1].clone());
+        }
+        if !changed {
+            break;
+        }
+    }
+    rows.iter()
+        .zip(reached)
+        .filter(|(_, hit)| *hit)
+        .map(|(row, _)| (row[0].clone(), row[1].clone()))
+        .collect()
+}
+
+/// The gate's verdict for a read of one relation: denied, rewritten, or readable as it is.
+fn view_verdict(schema: &str, name: &str) -> &'static str {
+    let sql = format!("SELECT * FROM {}.{}", quoted(schema), quoted(name));
+    match check(&sql, &GateOptions::default()) {
+        Ok(accepted) if accepted.rewritten => "rewritten",
+        Ok(_) => "readable",
+        Err(rejection) if rejection.code == "relation_denied" => "denied",
+        Err(rejection) => panic!("unexpected rejection of {sql}: {rejection:?}"),
+    }
+}
+
+#[tokio::test]
+async fn views_over_credential_catalogs_are_denied_rewritten_or_proven() {
+    let mut misses = Vec::new();
+    for (port, label) in AUDIT_SERVERS {
+        let rows = superuser_rows(port, VIEW_DEFINITIONS_SQL).await;
+        let reached = reached_views(&rows);
+        println!(
+            "== server {label}: {} views reach a credential catalog",
+            reached.len()
+        );
+        for (schema, name) in reached {
+            let verdict = view_verdict(&schema, &name);
+            println!("{schema}.{name} -> {verdict}");
+            if verdict != "readable" {
+                continue;
+            }
+            if let Some((_, _, column)) = MASKED_VIEWS
+                .iter()
+                .find(|(s, t, _)| *s == schema && *t == name)
+            {
+                let unmasked = superuser_scalar(
+                    port,
+                    &format!(
+                        "SELECT count(*) FROM {schema}.{name} WHERE {column} IS NOT NULL AND {column} <> '********'"
+                    ),
+                )
+                .await;
+                assert_eq!(unmasked, "0", "{schema}.{name}.{column} shows a value");
+                continue;
+            }
+            let kept = KEEP_VIEWS
+                .iter()
+                .any(|(view, _)| *view == format!("{schema}.{name}"));
+            if !kept {
+                misses.push(format!("{label} {schema}.{name}"));
+                continue;
+            }
+            let credential_columns = superuser_scalar(
+                port,
+                &format!(
+                    "SELECT count(*) FROM information_schema.columns WHERE table_schema = '{schema}' \
+                     AND table_name = '{name}' AND column_name ~ 'password|passwd|conninfo|umoptions|srvoptions|rolpassword'"
+                ),
+            )
+            .await;
+            assert_eq!(
+                credential_columns, "0",
+                "{schema}.{name} has a credential column"
+            );
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "views read a credential catalog and are neither denied, rewritten nor kept:\n{}",
+        misses.join("\n")
+    );
+}
+
+/// Name parts of a function that could return stored values of a table or its statistics.
+const STORED_VALUE_PARTS: [&str; 7] = [
+    "stats",
+    "statistic",
+    "to_xml",
+    "to_json",
+    "relation",
+    "page",
+    "tuple",
+];
+
+/// Matching functions the gate allows on purpose, with the reason. A trailing `_` makes the entry a prefix.
+const READ_ONLY_NAMED: &[(&str, &str)] = &[
+    (
+        "pg_stat_get_",
+        "server counters and activity, no table values",
+    ),
+    (
+        "pg_relation_",
+        "sizes, paths and flags of a relation, no values",
+    ),
+    ("pg_total_relation_size", "size of a relation"),
+    (
+        "pg_filenode_relation",
+        "maps a file node to a relation name",
+    ),
+    (
+        "pg_get_statisticsobjdef",
+        "definitions of extended statistics objects",
+    ),
+    (
+        "pg_get_statisticsobjdef_columns",
+        "column names of a statistics object",
+    ),
+    (
+        "pg_get_statisticsobjdef_expressions",
+        "expressions of a statistics object",
+    ),
+    ("pg_statistics_obj_is_visible", "boolean visibility check"),
+    (
+        "pg_stat_have_stats",
+        "boolean: whether the server holds counters for an object",
+    ),
+    (
+        "pg_get_multixact_stats",
+        "multixact usage counters, no table values",
+    ),
+    ("to_json", "converts a value that the caller passes in"),
+    ("to_jsonb", "converts a value that the caller passes in"),
+    ("row_to_json", "converts a row that the caller passes in"),
+    (
+        "array_to_json",
+        "converts an array that the caller passes in",
+    ),
+    (
+        "hstore_to_json",
+        "converts an hstore that the caller passes in",
+    ),
+    (
+        "hstore_to_json_loose",
+        "converts an hstore that the caller passes in",
+    ),
+    (
+        "hstore_to_jsonb",
+        "converts an hstore that the caller passes in",
+    ),
+    (
+        "hstore_to_jsonb_loose",
+        "converts an hstore that the caller passes in",
+    ),
+    ("relation_size", "size of a relation, TimescaleDB internal"),
+    (
+        "relation_approximate_size",
+        "approximate size of a relation, TimescaleDB internal",
+    ),
+    (
+        "chunk_compression_stats",
+        "compression counters of hypertable chunks",
+    ),
+    (
+        "hypertable_compression_stats",
+        "compression counters of a hypertable",
+    ),
+    (
+        "chunk_columnstore_stats",
+        "columnstore counters of hypertable chunks",
+    ),
+    (
+        "hypertable_columnstore_stats",
+        "columnstore counters of a hypertable",
+    ),
+    (
+        "compressed_chunk_local_stats",
+        "compression counters of a chunk, TimescaleDB internal",
+    ),
+    (
+        "compressed_chunk_remote_stats",
+        "compression counters of a chunk, TimescaleDB internal",
+    ),
+];
+
+/// Every function whose name has a stored-value part is denied by the gate or is on READ_ONLY_NAMED.
+#[tokio::test]
+async fn functions_named_for_stored_values_are_denied_or_read_only() {
+    let mut misses = Vec::new();
+    for (port, label) in AUDIT_SERVERS {
+        for row in superuser_rows(port, FUNCTION_NAMES_SQL).await {
+            let (schema, name) = (&row[0], &row[1]);
+            let lowered = name.to_ascii_lowercase();
+            if !STORED_VALUE_PARTS.iter().any(|part| lowered.contains(part)) {
+                continue;
+            }
+            let verdict = function_verdict(schema, name);
+            println!("{label} {schema}.{name} -> {verdict}");
+            let listed = READ_ONLY_NAMED
+                .iter()
+                .any(|(entry, _)| match entry.strip_suffix('_') {
+                    Some(prefix) => lowered.starts_with(prefix),
+                    None => lowered == *entry,
+                });
+            if verdict == "ALLOWED" && !listed {
+                misses.push(format!("{label} {schema}.{name}"));
+            }
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "functions named for stored values are allowed and not listed:\n{}",
+        misses.join("\n")
+    );
+}
+
+/// Servers with the credential seeds; the TLS server has none.
+const SEEDED_SERVERS: [(u16, &str); 3] =
+    [(PORT_18, "15432"), (PORT_19, "15433"), (PORT_15, "15434")];
+
+/// The sampled password hashes of pg_authid sit in pg_statistic, and large values there are stored out of line.
+/// Superuser SQL here checks the seeds, so the connection bypasses the gate by design.
+#[tokio::test]
+async fn sampled_password_hashes_are_stored_out_of_line() {
+    for (port, label) in SEEDED_SERVERS {
+        let sql = if superuser_scalar(
+            port,
+            "SELECT current_setting('server_version_num')::int >= 170000",
+        )
+        .await
+            == "t"
+        {
+            "SELECT count(*) > 0 FROM pg_catalog.pg_statistic s WHERE s.starelid = 'pg_catalog.pg_authid'::regclass \
+             AND (pg_column_toast_chunk_id(s.stavalues1) IS NOT NULL OR pg_column_toast_chunk_id(s.stavalues2) IS NOT NULL \
+             OR pg_column_toast_chunk_id(s.stavalues3) IS NOT NULL OR pg_column_toast_chunk_id(s.stavalues4) IS NOT NULL \
+             OR pg_column_toast_chunk_id(s.stavalues5) IS NOT NULL)"
+        } else {
+            "SELECT count(*) > 0 FROM pg_toast.pg_toast_2619"
+        };
+        assert_eq!(
+            superuser_scalar(port, sql).await,
+            "t",
+            "{label}: no out-of-line statistics"
+        );
+    }
+}
+
+/// The TOAST table of each credential root is refused by name, in both spellings, and each one is listed.
+#[tokio::test]
+async fn toast_tables_of_every_credential_root_are_refused() {
+    let roots = credential_roots();
+    let list = roots
+        .iter()
+        .map(|root| format!("'{root}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for (port, label) in SEEDED_SERVERS {
+        println!("== server {label}");
+        let sql = format!(
+            "SELECT r.relname, COALESCE(t.relname, '') FROM pg_catalog.pg_class r \
+             LEFT JOIN pg_catalog.pg_class t ON t.oid = r.reltoastrelid \
+             WHERE r.relnamespace = 'pg_catalog'::regnamespace AND r.relname IN ({list}) ORDER BY 1"
+        );
+        let rows = superuser_rows(port, &sql).await;
+        assert_eq!(rows.len(), roots.len(), "{label}: every root exists");
+        let mut with_toast = 0;
+        for row in rows {
+            let (root, toast) = (&row[0], &row[1]);
+            if toast.is_empty() {
+                println!("{root} -> no TOAST table");
+                continue;
+            }
+            with_toast += 1;
+            let qualified = format!("SELECT count(*) FROM pg_toast.{toast}");
+            let plain = format!("SELECT count(*) FROM {toast}");
+            for sql in [qualified, plain] {
+                let rejection = check(&sql, &GateOptions::default()).expect_err(&sql);
+                assert_eq!(rejection.code, "relation_denied", "{label} {sql}");
+                assert_eq!(
+                    rejection.message,
+                    "TOAST tables are not readable through this server. Read the table they belong to.",
+                    "{label} {sql}"
+                );
+            }
+            println!("{root} -> {toast} refused");
+        }
+        assert!(
+            with_toast >= 2,
+            "{label}: expected TOAST tables for pg_statistic and pg_authid"
+        );
     }
 }

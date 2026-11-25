@@ -5,6 +5,34 @@ const MASK: &str = "***";
 /// Keys whose value is masked when written as `key=value` or `key = 'value'`.
 const KEYS: &[&[u8]] = &[b"password", b"sslpassword", b"passfile"];
 
+/// The final pass over a value that leaves the server: hashes are replaced and counted, then strings are masked.
+/// Keys in `pre_masked` were masked by their tool already; masking them again cuts text after a nested literal.
+pub fn scrub_and_mask(value: &mut serde_json::Value, pre_masked: &[&str]) -> usize {
+    let found = crate::scrub::scrub_value(value);
+    let mut pending: Vec<(&mut serde_json::Value, bool)> = vec![(value, false)];
+    while let Some((node, skip)) = pending.pop() {
+        match node {
+            serde_json::Value::String(text) if !skip => {
+                let masked = mask(text.as_str());
+                if masked != *text {
+                    *text = masked;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                pending.extend(items.iter_mut().map(|item| (item, skip)));
+            }
+            serde_json::Value::Object(map) => {
+                pending.extend(
+                    map.iter_mut()
+                        .map(|(key, child)| (child, skip || pre_masked.contains(&key.as_str()))),
+                );
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// Returns `text` with secrets replaced by `***`; text without secrets comes back unchanged.
 pub fn mask(text: &str) -> String {
     let keyed = mask_keyed(text.as_bytes());

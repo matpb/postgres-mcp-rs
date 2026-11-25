@@ -6,7 +6,11 @@ mod json;
 mod range;
 mod types;
 
+use std::borrow::Cow;
+
 use serde_json::Value;
+
+use crate::scrub;
 
 pub use columns::dedup_columns;
 pub use types::{TypeInfo, TypeKind, builtin_type};
@@ -23,11 +27,14 @@ pub struct EncodeLimits {
 pub struct EncodeStats {
     pub truncated_values: u64,
     pub raw_fallbacks: u64,
+    /// Password hashes replaced in the values, before they were decoded or cut.
+    pub redacted_hashes: u64,
 }
 
 const MAX_SAFE_INTEGER: u128 = 9_007_199_254_740_991;
 
 /// Encodes one non-NULL value. `raw` may be a prefix of the value; `full_len` is its real length.
+/// Password hashes in the kept bytes are replaced before the value is decoded or cut again.
 pub fn encode_value(
     raw: &[u8],
     full_len: usize,
@@ -35,12 +42,23 @@ pub fn encode_value(
     limits: &EncodeLimits,
     stats: &mut EncodeStats,
 ) -> Value {
-    if full_len > raw.len() {
-        return wire_truncated(raw, full_len, stats);
+    let complete = full_len <= raw.len();
+    if let (false, TypeKind::Bytea, Some(hex_text)) = (complete, &ty.kind, raw.strip_prefix(b"\\x"))
+    {
+        return wire_truncated_bytea(hex_text, full_len, limits, stats);
     }
-    let Ok(text) = std::str::from_utf8(raw) else {
+    let (raw, found) = scrub_raw(raw, ty);
+    redacted(stats, found);
+    if !complete {
+        // The cut may split an md5 hash; its fragment is replaced here, and a split SCRAM hash already is.
+        let (tail, cut_found) = scrub::scrub_cut_tail(&raw);
+        redacted(stats, cut_found);
+        let keep = tail.len().min(limits.max_value_bytes);
+        return wire_truncated(&tail[..keep], full_len, stats);
+    }
+    let Ok(text) = std::str::from_utf8(&raw) else {
         stats.raw_fallbacks += 1;
-        return hex_capped(raw, limits, stats);
+        return hex_capped(&raw, limits, stats);
     };
     match decode(text, ty, limits, stats) {
         Some(value) => value,
@@ -99,10 +117,79 @@ fn float(text: &str, limits: &EncodeLimits, stats: &mut EncodeStats) -> Option<V
     }
 }
 
+/// Counts replacements in the stats of the value and in the running call.
+fn redacted(stats: &mut EncodeStats, count: usize) {
+    stats.redacted_hashes += count as u64;
+    crate::scrub::record(count);
+}
+
+/// A bytea value cut by the wire. Its kept bytes are scrubbed and cut again, so an md5 hash that straddles
+/// the cut is replaced in the bytes it is made of. The result stays hex, so the marker reads as hex bytes.
+fn wire_truncated_bytea(
+    hex_text: &[u8],
+    full_len: usize,
+    limits: &EncodeLimits,
+    stats: &mut EncodeStats,
+) -> Value {
+    let bytes = unhex_pairs(hex_text);
+    let (scrubbed, found) = scrub::scrub_bytes(&bytes);
+    let (tail, cut_found) = scrub::scrub_cut_tail(&scrubbed);
+    redacted(stats, found + cut_found);
+    let keep = tail.len().min(limits.max_value_bytes);
+    stats.truncated_values += 1;
+    let decoded_len = full_len.saturating_sub(2) / 2;
+    Value::String(format!(
+        "\\x{}…[truncated: {keep} of {decoded_len} bytes]",
+        hex(&tail[..keep])
+    ))
+}
+
+/// Replaces password hashes in a raw value. A bytea value is scrubbed as the bytes its hex text stands for.
+fn scrub_raw<'a>(raw: &'a [u8], ty: &TypeInfo) -> (Cow<'a, [u8]>, usize) {
+    match ty.kind {
+        TypeKind::Bytea => scrub_bytea_text(raw),
+        _ => scrub::scrub_bytes(raw),
+    }
+}
+
+/// Scrubs the bytes of a `\x` hex text. Returns the text unchanged when no hash is found.
+fn scrub_bytea_text(raw: &[u8]) -> (Cow<'_, [u8]>, usize) {
+    let Some(hex_text) = raw.strip_prefix(b"\\x") else {
+        return (Cow::Borrowed(raw), 0);
+    };
+    let bytes = unhex_pairs(hex_text);
+    let (scrubbed, found) = scrub::scrub_bytes(&bytes);
+    if found == 0 {
+        return (Cow::Borrowed(raw), 0);
+    }
+    let mut text = b"\\x".to_vec();
+    text.extend_from_slice(hex(&scrubbed).as_bytes());
+    (Cow::Owned(text), found)
+}
+
+/// The bytes of each complete pair of hex digits, stopping at the first character that is not a digit.
+fn unhex_pairs(hex_text: &[u8]) -> Vec<u8> {
+    let digit = |b: u8| char::from(b).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(hex_text.len() / 2);
+    for pair in hex_text.chunks_exact(2) {
+        match (digit(pair[0]), digit(pair[1])) {
+            (Some(high), Some(low)) => out.push(high << 4 | low),
+            _ => break,
+        }
+    }
+    out
+}
+
 fn bytea(text: &str, limits: &EncodeLimits, stats: &mut EncodeStats) -> Option<Value> {
     let hex = text.strip_prefix("\\x")?;
     if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
+    }
+    let (scrubbed, found) = scrub_bytea_text(text.as_bytes());
+    if found > 0 {
+        redacted(stats, found);
+        let replaced = String::from_utf8_lossy(&scrubbed).into_owned();
+        return bytea(&replaced, limits, stats);
     }
     let decoded_len = hex.len() / 2;
     let cap = limits.max_binary_preview_bytes;
@@ -138,6 +225,7 @@ pub(super) fn text_value(s: &str, limits: &EncodeLimits, stats: &mut EncodeStats
 pub(super) fn absorb(stats: &mut EncodeStats, other: &EncodeStats) {
     stats.truncated_values += other.truncated_values;
     stats.raw_fallbacks += other.raw_fallbacks;
+    stats.redacted_hashes += other.redacted_hashes;
 }
 
 /// The wire cut the value: keep the valid prefix, lossy-decoded, with the marker.

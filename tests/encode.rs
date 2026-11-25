@@ -37,6 +37,7 @@ fn stats(truncated_values: u64, raw_fallbacks: u64) -> EncodeStats {
     EncodeStats {
         truncated_values,
         raw_fallbacks,
+        redacted_hashes: 0,
     }
 }
 
@@ -782,4 +783,49 @@ fn expected_array(dims: &[usize], cells: &[Option<String>]) -> Value {
             .map(|k| expected_array(&dims[1..], &cells[k * stride..(k + 1) * stride]))
             .collect(),
     )
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_hex(text: &str) -> String {
+    let digits = text.strip_prefix("\\x").expect("bytea text");
+    let bytes: Vec<u8> = (0..digits.len() / 2)
+        .map(|i| u8::from_str_radix(&digits[2 * i..2 * i + 2], 16).expect("hex"))
+        .collect();
+    String::from_utf8(bytes).expect("utf8")
+}
+
+#[test]
+fn a_complete_bytea_cell_holding_a_hash_shows_the_marker_as_hex() {
+    let scram = "SCRAM-SHA-256$4096:c2FsdA==$a2V5:a2V5";
+    let raw = format!("\\x{}", hex_of(scram.as_bytes()));
+    let mut st = EncodeStats::default();
+    let v = encode_value(raw.as_bytes(), raw.len(), &ty(17), &BIG, &mut st);
+    let expected = format!("\\x{}", hex_of(b"[redacted password hash]"));
+    assert_eq!(v, json!(expected));
+    assert_eq!(
+        decode_hex(v.as_str().expect("text")),
+        "[redacted password hash]"
+    );
+    assert_eq!(st.redacted_hashes, 1);
+}
+
+#[test]
+fn an_md5_hash_straddling_the_wire_cut_of_a_bytea_cell_is_replaced_in_its_bytes() {
+    let md5 = "md5d41d8cd98f00b204e9800998ecf8427e";
+    let full: Vec<u8> = [b"xxxx ".as_slice(), md5.as_bytes()].concat();
+    let full_text = format!("\\x{}", hex_of(&full));
+    // The value is 40 bytes; the wire keeps 36 bytes of its 82-byte hex text: "\x", then 17 bytes of xxxx, a space, md5 and nine digits.
+    let kept = &full_text[..36];
+    let mut st = EncodeStats::default();
+    let v = encode_value(kept.as_bytes(), full_text.len(), &ty(17), &LIM, &mut st);
+    let text = v.as_str().expect("text");
+    let (shown, marker) = text.split_once('…').expect("truncation marker");
+    assert_eq!(marker, "[truncated: 29 of 40 bytes]");
+    assert_eq!(decode_hex(shown), "xxxx [redacted password hash]");
+    assert!(!decode_hex(shown).contains("md5"), "{text}");
+    assert_eq!(st.redacted_hashes, 1);
+    assert_eq!(st.truncated_values, 1);
 }

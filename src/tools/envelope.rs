@@ -24,6 +24,8 @@ pub struct QueryEnvelope {
     pub truncated_reason: Option<&'static str>,
     pub truncated_values: u64,
     pub raw_fallbacks: u64,
+    /// Password hash texts replaced in the values of this result.
+    pub redacted_hashes: u64,
     pub execution_time_ms: u64,
 }
 
@@ -107,6 +109,7 @@ pub fn build(
         truncated_reason,
         truncated_values: stats.truncated_values,
         raw_fallbacks: stats.raw_fallbacks,
+        redacted_hashes: stats.redacted_hashes,
         execution_time_ms: elapsed_ms(elapsed),
     }
 }

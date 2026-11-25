@@ -76,7 +76,12 @@ async fn tool_outcome(config: Config, name: &str, arguments: Value) -> Result<Va
             .expect("error text")
             .to_owned())
     } else {
-        Ok(result["structuredContent"].clone())
+        let mut content = result["structuredContent"].clone();
+        // redactedHashes is a tool-result field; a resource body does not carry it.
+        if let Some(object) = content.as_object_mut() {
+            object.remove("redactedHashes");
+        }
+        Ok(content)
     }
 }
 

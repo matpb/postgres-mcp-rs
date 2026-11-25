@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1]
+
+### Changed
+
+- The statistics views `pg_stats`, `pg_stats_ext` and `pg_stats_ext_exprs` are read through a filter that drops the rows of the catalogs that hold password hashes and stored passwords, and a planner fence keeps a caller's predicate from running on a hidden row. The gate rewrites each reference and refuses forms it cannot rewrite with `relation_denied`. The filter applies to every role, superusers included.
+- The gate also refuses the foreign server and wrapper catalogs and their information_schema views, whose options can hold a connection password, and the pageinspect page-item and `pg_mcv_list_items` functions.
+- The recommended role recipe uses `pg_monitor` instead of `pg_read_all_stats`, and the docs warn against `pg_read_all_data` and superuser connections.
+- The gate refuses TOAST tables by name (`pg_toast` schema and `pg_toast_<digits>` relations), which hold the out-of-line values of the credential catalogs, and the functions that return raw write-ahead log data (`pg_get_wal_*`), with `relation_denied` and `function_denied`.
+- Statement text is masked on the way out: a password literal after PASSWORD, as in a typed `ALTER ROLE`, shows as `'***'`, in every tool result and resource.
+
+### Added
+
+- A password-hash scrubber. Every tool result, resource, completion, error text and database-bearing log field is scanned, and text shaped like a SCRAM-SHA-256 verifier or an md5 hash is replaced with `[redacted password hash]`. Each result carries `redactedHashes`, and the audit line carries `redacted_hashes`.
+- A credential exposure test matrix that runs each role on each test server through every known path, the statistics-view and audit tests, and a false-positive scan of every seeded table.
+
 ## [0.1.0]
 
 ### Added

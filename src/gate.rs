@@ -1,5 +1,6 @@
 //! Read-only query gate: accepts one statement that is provably read-only, rejects the rest.
 
+use pg_query::protobuf::{ScanToken, Token};
 use serde_json::{Map, Value};
 
 /// Limits and switches for [`check`].
@@ -25,9 +26,14 @@ pub enum StatementKind {
     Show { name: String },
 }
 
+/// The gate's verdict. `sql` is the text to run: the input, or the input with statistics-view references
+/// replaced. No call site may run the original text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted {
     pub kind: StatementKind,
+    pub sql: String,
+    /// True when `sql` differs from the input, so error positions no longer match the caller's text.
+    pub rewritten: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,22 +62,52 @@ pub const SECRET_SETTINGS: &[&str] = &[
 /// Relations that expose credentials, matched by lowercased name when unqualified or in pg_catalog or
 /// information_schema. pg_roles and pg_user show `********` for passwords and stay readable.
 const CREDENTIAL_RELATIONS: &[&str] = &[
-    "pg_authid",
     "pg_shadow",
-    "pg_user_mapping",
     "pg_user_mappings",
     "_pg_user_mappings",
     "user_mapping_options",
-    "pg_subscription",
     "pg_settings",
     "pg_file_settings",
     "pg_hba_file_rules",
     "pg_ident_file_mappings",
     "pg_config",
+    "_pg_foreign_servers",
+    "_pg_foreign_data_wrappers",
+    "foreign_servers",
+    "foreign_server_options",
+    "foreign_data_wrappers",
+    "foreign_data_wrapper_options",
+];
+
+/// Plain catalog tables that hold credentials or sampled credential values. Their TOAST tables are refused
+/// by name, and the statistics views never return their rows.
+const PLAIN_CATALOG_TABLES: &[&str] = &[
+    "pg_authid",
+    "pg_user_mapping",
+    "pg_subscription",
     "pg_db_role_setting",
     "pg_statistic",
     "pg_statistic_ext_data",
+    "pg_foreign_server",
+    "pg_foreign_data_wrapper",
 ];
+
+/// The relations whose rows the statistics views hide, and the roots of the TOAST and view audits: the plain
+/// catalog tables and pg_largeobject.
+pub fn credential_roots() -> Vec<&'static str> {
+    PLAIN_CATALOG_TABLES
+        .iter()
+        .copied()
+        .chain(std::iter::once("pg_largeobject"))
+        .collect()
+}
+
+fn is_credential_relation(name: &str) -> bool {
+    PLAIN_CATALOG_TABLES.contains(&name) || CREDENTIAL_RELATIONS.contains(&name)
+}
+
+/// Statistics views. A reference to one reads the rows of the view that the filter below leaves visible.
+const STATS_VIEWS: &[&str] = &["pg_stats", "pg_stats_ext", "pg_stats_ext_exprs"];
 
 /// The relations of CREDENTIAL_RELATIONS that hold server settings; their message names server_info.
 const SETTINGS_RELATIONS: &[&str] = &["pg_settings", "pg_file_settings"];
@@ -198,6 +234,8 @@ const R_SETTINGS: &str = "it can expose credentials; use the server_info tool";
 const R_TIMESCALE: &str = "it changes TimescaleDB objects";
 const R_CRON: &str = "it changes scheduled jobs";
 const R_RAW_PAGES: &str = "it changes or reads table pages directly";
+const R_WAL_DATA: &str = "it returns raw write-ahead log data";
+const R_STAT_VALUES: &str = "it returns sampled column values held in statistics";
 const R_EXTENSION: &str = "it is an extension routine the gate does not allow";
 const R_NETWORK: &str = "it makes network requests";
 const R_TIMESCALE_INTERNAL: &str = "it calls TimescaleDB internals the gate cannot classify";
@@ -343,6 +381,41 @@ const DENIED_FUNCTIONS: &[(&str, &str)] = &[
     ("heap_force_freeze", R_RAW_PAGES),
     ("pg_truncate_visibility_map", R_RAW_PAGES),
     ("get_raw_page", R_RAW_PAGES),
+    ("heap_page_items", R_RAW_PAGES),
+    ("bt_page_items", R_RAW_PAGES),
+    ("brin_page_items", R_RAW_PAGES),
+    ("gin_page_items", R_RAW_PAGES),
+    ("gist_page_items", R_RAW_PAGES),
+    ("hash_page_items", R_RAW_PAGES),
+    ("spgist_page_items", R_RAW_PAGES),
+    ("brin_metapage_info", R_RAW_PAGES),
+    ("brin_page_type", R_RAW_PAGES),
+    ("bt_multi_page_stats", R_RAW_PAGES),
+    ("bt_page_stats", R_RAW_PAGES),
+    ("fsm_page_contents", R_RAW_PAGES),
+    ("gin_leafpage_items", R_RAW_PAGES),
+    ("gin_metapage_info", R_RAW_PAGES),
+    ("gin_page_opaque_info", R_RAW_PAGES),
+    ("gist_page_items_bytea", R_RAW_PAGES),
+    ("gist_page_opaque_info", R_RAW_PAGES),
+    ("hash_metapage_info", R_RAW_PAGES),
+    ("hash_page_stats", R_RAW_PAGES),
+    ("hash_page_type", R_RAW_PAGES),
+    ("heap_page_item_attrs", R_RAW_PAGES),
+    ("heap_tuple_infomask_flags", R_RAW_PAGES),
+    ("page_checksum", R_RAW_PAGES),
+    ("page_header", R_RAW_PAGES),
+    ("tuple_data_split", R_RAW_PAGES),
+    ("pg_get_wal_block_info", R_WAL_DATA),
+    ("pg_get_wal_record_info", R_WAL_DATA),
+    ("pg_get_wal_records_info", R_WAL_DATA),
+    ("pg_get_wal_records_info_till_end_of_wal", R_WAL_DATA),
+    ("pg_get_wal_stats", R_WAL_DATA),
+    ("pg_get_wal_stats_till_end_of_wal", R_WAL_DATA),
+    ("pg_available_wal_summaries", R_FILES),
+    ("pg_wal_summary_contents", R_FILES),
+    ("pg_mcv_list_items", R_STAT_VALUES),
+    ("_postgis_stats", R_STAT_VALUES),
     ("autoprewarm_dump_now", R_MAINTENANCE),
     ("autoprewarm_start_worker", R_MAINTENANCE),
     ("pg_logdir_ls", R_FILES),
@@ -432,8 +505,45 @@ fn analyse(sql: &str, opts: &GateOptions) -> Result<Accepted, Rejection> {
     };
     let tree = serde_json::to_value(node).map_err(|error| parse_failed(error.to_string()))?;
     let kind = classify(&tree)?;
-    walk(&tree, opts)?;
-    Ok(Accepted { kind })
+    let mut found = Found::default();
+    walk(&tree, opts, &mut found)?;
+    if let Some(name) = found
+        .cte_names
+        .iter()
+        .find(|name| STATS_VIEWS.contains(&name.as_str()))
+    {
+        return Err(view_denied(name));
+    }
+    if found.views.is_empty() {
+        return Ok(Accepted {
+            kind,
+            sql: sql.to_owned(),
+            rewritten: false,
+        });
+    }
+    let rewritten = rewrite_views(sql, &found.views)?;
+    Ok(Accepted {
+        kind,
+        sql: rewritten,
+        rewritten: true,
+    })
+}
+
+/// What the walk found that the statistics-view rewrite needs.
+#[derive(Default)]
+struct Found {
+    views: Vec<ViewRef>,
+    cte_names: Vec<String>,
+}
+
+/// One reference to a statistics view, with the RangeVar fields the splice reads.
+struct ViewRef {
+    view: &'static str,
+    /// Byte offset of the first name token, from the parser; -1 when unknown.
+    location: i64,
+    qualified: bool,
+    aliased: bool,
+    inherits: bool,
 }
 
 fn classify(tree: &Value) -> Result<StatementKind, Rejection> {
@@ -496,7 +606,7 @@ fn is_false_value(arg: Option<&Value>) -> bool {
 }
 
 /// Visits every object and array of the tree without recursion.
-fn walk(root: &Value, opts: &GateOptions) -> Result<(), Rejection> {
+fn walk(root: &Value, opts: &GateOptions, found: &mut Found) -> Result<(), Rejection> {
     let mut pending: Vec<(&Value, usize)> = vec![(root, 1)];
     while let Some((value, depth)) = pending.pop() {
         if depth > MAX_DEPTH {
@@ -509,7 +619,7 @@ fn walk(root: &Value, opts: &GateOptions) -> Result<(), Rejection> {
             Value::Object(map) => {
                 check_fields(map)?;
                 if let Some((variant, body)) = node_of(value) {
-                    check_node(variant, body, opts)?;
+                    check_node(variant, body, opts, found)?;
                 }
                 pending.extend(map.values().map(|child| (child, depth + 1)));
             }
@@ -537,7 +647,12 @@ fn check_fields(map: &Map<String, Value>) -> Result<(), Rejection> {
     Ok(())
 }
 
-fn check_node(variant: &str, body: &Value, opts: &GateOptions) -> Result<(), Rejection> {
+fn check_node(
+    variant: &str,
+    body: &Value,
+    opts: &GateOptions,
+    found: &mut Found,
+) -> Result<(), Rejection> {
     if !ALLOWED_NODES.contains(&variant) {
         let message =
             format!("This query uses a construct the read-only gate does not allow: {variant}.");
@@ -548,11 +663,25 @@ fn check_node(variant: &str, body: &Value, opts: &GateOptions) -> Result<(), Rej
             "placeholder",
             "Parameter placeholders ($1) are not supported. Inline the value.",
         )),
-        "CommonTableExpr" => check_cte(body),
+        "CommonTableExpr" => {
+            if let Some(name) = str_field(body, "ctename") {
+                found.cte_names.push(name.to_owned());
+            }
+            check_cte(body)
+        }
         "FuncCall" => check_function(body),
         "AIndirection" => check_indirection(body),
         "ColumnRef" => check_column_ref(body),
-        "RangeVar" => check_relation(body),
+        "RangeVar" => {
+            check_relation(body)?;
+            if let Some(view) = stats_view_of(body) {
+                if str_field(body, "catalogname").is_some_and(|name| !name.is_empty()) {
+                    return Err(view_denied(view));
+                }
+                found.views.push(view_ref(body, view));
+            }
+            Ok(())
+        }
         "VariableShowStmt" => check_setting(str_field(body, "name").unwrap_or_default()),
         _ => Ok(()),
     }
@@ -617,6 +746,17 @@ fn check_indirection(body: &Value) -> Result<(), Rejection> {
 /// `rel.name` calls name(rel) when rel has no column of that name; the last name is the one called.
 fn check_column_ref(body: &Value) -> Result<(), Rejection> {
     let fields = items(body, "fields");
+    if let [catalog, view, _] = fields {
+        let view_name =
+            string_part(view).and_then(|name| STATS_VIEWS.iter().copied().find(|v| *v == name));
+        if let (Some("pg_catalog"), Some(view)) = (string_part(catalog), view_name) {
+            let message = format!(
+                "{} Refer to its columns as {view}.column or through an alias.",
+                view_message(view)
+            );
+            return Err(reject("relation_denied", message));
+        }
+    }
     if fields.len() < 2 {
         return Ok(());
     }
@@ -656,6 +796,22 @@ fn check_current_setting(body: &Value) -> Result<(), Rejection> {
     }
 }
 
+const TOAST_MESSAGE: &str =
+    "TOAST tables are not readable through this server. Read the table they belong to.";
+
+/// A TOAST table holds the out-of-line values of its catalog or table: a schema of pg_toast, a temporary
+/// TOAST schema, or a relation named pg_toast_<digits> or pg_toast_<digits>_index in any schema.
+fn is_toast_relation(schema: &str, relname: &str) -> bool {
+    if schema == "pg_toast" || schema.starts_with("pg_toast_temp_") {
+        return true;
+    }
+    let Some(rest) = relname.strip_prefix("pg_toast_") else {
+        return false;
+    };
+    let digits = rest.strip_suffix("_index").unwrap_or(rest);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn check_relation(body: &Value) -> Result<(), Rejection> {
     let relname = str_field(body, "relname")
         .unwrap_or_default()
@@ -663,7 +819,10 @@ fn check_relation(body: &Value) -> Result<(), Rejection> {
     let schema = str_field(body, "schemaname")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if CREDENTIAL_RELATIONS.contains(&relname.as_str())
+    if is_toast_relation(&schema, &relname) {
+        return Err(reject("relation_denied", TOAST_MESSAGE));
+    }
+    if is_credential_relation(&relname)
         && matches!(schema.as_str(), "" | "pg_catalog" | "information_schema")
     {
         let message = if SETTINGS_RELATIONS.contains(&relname.as_str()) {
@@ -676,6 +835,177 @@ fn check_relation(body: &Value) -> Result<(), Rejection> {
             )
         };
         return Err(reject("relation_denied", message));
+    }
+    Ok(())
+}
+
+/// The statistics view a RangeVar names, when it is the catalog view itself: unqualified or in pg_catalog.
+fn stats_view_of(body: &Value) -> Option<&'static str> {
+    let relname = str_field(body, "relname")?;
+    let schema = str_field(body, "schemaname").unwrap_or_default();
+    if !matches!(schema, "" | "pg_catalog") {
+        return None;
+    }
+    STATS_VIEWS.iter().copied().find(|view| *view == relname)
+}
+
+/// Reads the RangeVar fields the splice needs. A missing inh counts as ONLY, so the reference is refused.
+fn view_ref(body: &Value, view: &'static str) -> ViewRef {
+    ViewRef {
+        view,
+        location: body.get("location").and_then(Value::as_i64).unwrap_or(-1),
+        qualified: str_field(body, "schemaname").is_some_and(|schema| !schema.is_empty()),
+        aliased: body.get("alias").is_some_and(|alias| !alias.is_null()),
+        inherits: body.get("inh").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+fn view_message(view: &str) -> String {
+    format!(
+        "{view} can only be read as a plain table reference in FROM or JOIN, for example: SELECT attname, n_distinct FROM pg_stats WHERE tablename = 'orders'"
+    )
+}
+
+fn view_denied(view: &str) -> Rejection {
+    reject("relation_denied", view_message(view))
+}
+
+/// The name of a String node, such as one part of a dotted reference.
+fn string_part(value: &Value) -> Option<&str> {
+    match node_of(value) {
+        Some(("String", body)) => str_field(body, "sval"),
+        _ => None,
+    }
+}
+
+/// Replaces each statistics-view reference by the filtered catalog view. Any reference that cannot be
+/// located with certainty is refused.
+fn rewrite_views(sql: &str, views: &[ViewRef]) -> Result<String, Rejection> {
+    let fallback = views.first().map_or("pg_stats", |view| view.view);
+    let scanned = pg_query::scan(sql).map_err(|_| view_denied(fallback))?;
+    let mut edits = Vec::with_capacity(views.len());
+    for view in views {
+        edits.push(splice(&scanned.tokens, view)?);
+    }
+    edits.sort_by_key(|edit| edit.start);
+    let mut out = String::with_capacity(sql.len() + 256 * edits.len());
+    let mut cursor = 0;
+    for edit in edits {
+        if edit.start < cursor {
+            return Err(view_denied(edit.view));
+        }
+        let kept = sql
+            .get(cursor..edit.start)
+            .ok_or_else(|| view_denied(edit.view))?;
+        out.push_str(kept);
+        out.push_str(&edit.text);
+        cursor = edit.end;
+    }
+    out.push_str(sql.get(cursor..).ok_or_else(|| view_denied(fallback))?);
+    verify_rewrite(&out, views.len(), fallback)?;
+    Ok(out)
+}
+
+/// One replacement: the byte range of the reference's name and the text that replaces it.
+struct Edit {
+    view: &'static str,
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// Finds the name of one reference in the token stream. The name must follow FROM, a comma of the FROM
+/// list or JOIN, and must not be followed by `*` or TABLESAMPLE.
+fn splice(tokens: &[ScanToken], view: &ViewRef) -> Result<Edit, Rejection> {
+    let denied = || view_denied(view.view);
+    let start = usize::try_from(view.location).map_err(|_| denied())?;
+    let index = tokens
+        .iter()
+        .position(|token| usize::try_from(token.start).ok() == Some(start))
+        .ok_or_else(denied)?;
+    let before = previous_token(tokens, index);
+    let follows_list = [Token::From, Token::Join, Token::Ascii44, Token::Ascii40]
+        .iter()
+        .any(|kind| Some(*kind as i32) == before);
+    if !follows_list || !view.inherits {
+        return Err(denied());
+    }
+    let ident = |at: usize| {
+        tokens
+            .get(at)
+            .filter(|token| token.token == Token::Ident as i32)
+    };
+    let last = if view.qualified {
+        if tokens.get(index + 1).map(|token| token.token) != Some(Token::Ascii46 as i32) {
+            return Err(denied());
+        }
+        index + 2
+    } else {
+        index
+    };
+    ident(index).ok_or_else(denied)?;
+    let last_token = ident(last).ok_or_else(denied)?;
+    let end = usize::try_from(last_token.end).map_err(|_| denied())?;
+    let after = tokens.get(last + 1).map(|token| token.token);
+    if after == Some(Token::Ascii42 as i32) || after == Some(Token::Tablesample as i32) {
+        return Err(denied());
+    }
+    let name = view.view;
+    let hidden = credential_roots().join(",");
+    let mut text = format!(
+        "(SELECT * FROM pg_catalog.{name} WHERE schemaname OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.name OR tablename OPERATOR(pg_catalog.<>) ALL ('{{{hidden}}}'::pg_catalog.name[]) OFFSET 0)"
+    );
+    if !view.aliased {
+        text.push_str(" AS ");
+        text.push_str(name);
+    }
+    Ok(Edit {
+        view: name,
+        start,
+        end,
+        text,
+    })
+}
+
+/// The kind of the nearest token before `index` that is not a comment.
+fn previous_token(tokens: &[ScanToken], index: usize) -> Option<i32> {
+    tokens[..index]
+        .iter()
+        .rev()
+        .map(|token| token.token)
+        .find(|kind| *kind != Token::SqlComment as i32 && *kind != Token::CComment as i32)
+}
+
+/// Parses the rewritten text again. It is refused unless it parses and holds exactly one injected filter per
+/// reference, with no statistics-view name left outside one.
+fn verify_rewrite(out: &str, references: usize, fallback: &'static str) -> Result<(), Rejection> {
+    let parsed = pg_query::parse(out, pg_query::ParserOptions::DEFAULT)
+        .map_err(|_| view_denied(fallback))?;
+    let tree =
+        serde_json::to_value(&parsed.protobuf).map_err(|error| parse_failed(error.to_string()))?;
+    let (mut injected, mut bare) = (0_usize, 0_usize);
+    let mut pending = vec![&tree];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(map) => {
+                if let Some(range_var) = map.get("RangeVar") {
+                    let relname = str_field(range_var, "relname").unwrap_or_default();
+                    if STATS_VIEWS.contains(&relname) {
+                        if str_field(range_var, "schemaname") == Some("pg_catalog") {
+                            injected += 1;
+                        } else {
+                            bare += 1;
+                        }
+                    }
+                }
+                pending.extend(map.values());
+            }
+            Value::Array(list) => pending.extend(list.iter()),
+            _ => {}
+        }
+    }
+    if bare != 0 || injected != references {
+        return Err(view_denied(fallback));
     }
     Ok(())
 }

@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::audit;
+use crate::scrub;
 use crate::server::AppState;
 use crate::tools::core::{self, DatabaseArgs};
 use crate::tools::schema::NON_SYSTEM;
@@ -158,6 +159,22 @@ pub async fn read(
             ("resource:table", database, outcome)
         }
     };
+    let ok = outcome.is_ok();
+    let sqlstate = outcome
+        .as_ref()
+        .err()
+        .and_then(ToolError::sqlstate)
+        .map(str::to_owned);
+    // The final pass runs on the value before it is serialized, and again on the text it becomes. The count is
+    // the replacements of this call, which the caller runs under its counter.
+    let outcome = match outcome {
+        Ok((name, mut value)) => {
+            crate::tools::mask::scrub_and_mask(&mut value, &[]);
+            Ok((name, value))
+        }
+        Err(error) => Err(read_error(error)),
+    };
+    let redacted_hashes = scrub::total();
     let database = match &outcome {
         Ok((name, _)) => Some(name.clone()),
         Err(_) => state.resolve_name(Some(&requested)),
@@ -167,28 +184,45 @@ pub async fn read(
         &audit::Record {
             tool,
             database: database.as_deref(),
-            ok: outcome.is_ok(),
+            ok,
             duration: started.elapsed(),
             rows: None,
-            sqlstate: outcome.as_ref().err().and_then(ToolError::sqlstate),
+            sqlstate: sqlstate.as_deref(),
             sql: None,
+            redacted_hashes,
         },
     );
+    if redacted_hashes > 0 {
+        tracing::warn!(
+            tool,
+            database = database.as_deref(),
+            count = redacted_hashes,
+            "password hash text was redacted from a result"
+        );
+    }
     match outcome {
-        Ok((_, value)) => Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(value.to_string(), uri).with_mime_type(JSON_MIME),
-        ])),
-        Err(error) => Err(read_error(error)),
+        Ok((_, value)) => {
+            let text = scrub::scrub(&value.to_string()).into_owned();
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(text, uri).with_mime_type(JSON_MIME),
+            ]))
+        }
+        Err(error) => Err(error),
     }
 }
 
 /// Unknown names are resource-not-found with the tool's text; any other failure is an internal error with its short text.
 fn read_error(error: ToolError) -> McpError {
-    match error {
-        ToolError::Config(message) | ToolError::Rejected(message) => {
-            McpError::resource_not_found(message, None)
-        }
-        other => McpError::internal_error(other.message(), None),
+    let (text, not_found) = match error {
+        ToolError::Config(message) | ToolError::Rejected(message) => (message, true),
+        other => (other.message(), false),
+    };
+    let (scrubbed, found) = scrub::scrub_counting(&text);
+    scrub::record(found);
+    if not_found {
+        McpError::resource_not_found(scrubbed.into_owned(), None)
+    } else {
+        McpError::internal_error(scrubbed.into_owned(), None)
     }
 }
 

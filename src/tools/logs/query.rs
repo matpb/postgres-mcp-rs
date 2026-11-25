@@ -236,7 +236,7 @@ pub async fn read_chunk(
             max_bytes: 8 * 1_048_576,
             max_value_bytes: 2 * READ_LEN + 2,
         },
-        offset: 0,
+        offset: Some(0),
         search_path_catalog_only: true,
     };
     let (_, output) = Runner::new(state)

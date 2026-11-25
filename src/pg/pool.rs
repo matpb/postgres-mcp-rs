@@ -124,8 +124,8 @@ impl Pool {
                         connection = %self.name,
                         host = %self.connect.host,
                         port = self.connect.port,
-                        reason = %reason,
-                        error = %log_cause(&error, &self.connect.user),
+                        reason = %crate::scrub::scrub(&reason),
+                        error = %crate::scrub::scrub(&log_cause(&error, &self.connect.user)),
                         "connection failed"
                     );
                     return Err(PoolError::Connect(reason));

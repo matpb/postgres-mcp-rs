@@ -1122,3 +1122,341 @@ proptest! {
         }
     }
 }
+
+/// The filtered catalog view that replaces a statistics-view reference; the brief's text, exactly.
+fn filtered(view: &str, tail: &str) -> String {
+    format!(
+        "(SELECT * FROM pg_catalog.{view} WHERE schemaname OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.name OR tablename OPERATOR(pg_catalog.<>) ALL ('{{pg_authid,pg_user_mapping,pg_subscription,pg_db_role_setting,pg_statistic,pg_statistic_ext_data,pg_foreign_server,pg_foreign_data_wrapper,pg_largeobject}}'::pg_catalog.name[]) OFFSET 0){tail}"
+    )
+}
+
+fn rewritten(sql: &str) -> String {
+    match gate(sql) {
+        Ok(accepted) => accepted.sql,
+        Err(rejection) => panic!("rejected {sql}: {}", rejection.message),
+    }
+}
+
+#[test]
+fn unqualified_reference_gets_the_view_name_as_alias() {
+    let sql = "SELECT attname FROM pg_stats WHERE tablename = 'orders'";
+    let expected = format!(
+        "SELECT attname FROM {} WHERE tablename = 'orders'",
+        filtered("pg_stats", " AS pg_stats")
+    );
+    assert_eq!(rewritten(sql), expected);
+    assert!(gate(sql).unwrap().rewritten);
+}
+
+#[test]
+fn qualified_and_quoted_references_are_rewritten_to_the_same_text() {
+    let expected = |tail: &str| {
+        format!(
+            "SELECT attname FROM {} WHERE true",
+            filtered("pg_stats", tail)
+        )
+    };
+    assert_eq!(
+        rewritten("SELECT attname FROM pg_catalog.pg_stats WHERE true"),
+        expected(" AS pg_stats")
+    );
+    assert_eq!(
+        rewritten("SELECT attname FROM \"pg_stats\" WHERE true"),
+        expected(" AS pg_stats")
+    );
+    assert_eq!(
+        rewritten("SELECT attname FROM pg_catalog.\"pg_stats\" WHERE true"),
+        expected(" AS pg_stats")
+    );
+    assert_eq!(
+        rewritten("SELECT attname FROM PG_STATS WHERE true"),
+        expected(" AS pg_stats")
+    );
+}
+
+#[test]
+fn aliased_references_keep_the_users_alias_text() {
+    let expected = |alias: &str| {
+        format!(
+            "SELECT s.attname FROM {} WHERE true",
+            filtered("pg_stats", alias)
+        )
+    };
+    assert_eq!(
+        rewritten("SELECT s.attname FROM pg_stats s WHERE true"),
+        expected(" s")
+    );
+    assert_eq!(
+        rewritten("SELECT s.attname FROM pg_stats AS s WHERE true"),
+        expected(" AS s")
+    );
+}
+
+#[test]
+fn joined_and_nested_references_are_rewritten() {
+    let joined = rewritten("SELECT p.attname FROM (SELECT 1) AS q JOIN pg_stats AS p ON true");
+    assert_eq!(
+        joined,
+        format!(
+            "SELECT p.attname FROM (SELECT 1) AS q JOIN {} ON true",
+            filtered("pg_stats", " AS p")
+        )
+    );
+    let nested = rewritten("SELECT * FROM (SELECT * FROM pg_stats) AS q");
+    assert_eq!(
+        nested,
+        format!(
+            "SELECT * FROM (SELECT * FROM {}) AS q",
+            filtered("pg_stats", " AS pg_stats")
+        )
+    );
+}
+
+#[test]
+fn two_references_in_one_statement_are_both_rewritten() {
+    let sql = "SELECT * FROM pg_stats a, pg_stats_ext b";
+    let expected = format!(
+        "SELECT * FROM {} a, {} b",
+        filtered("pg_stats", ""),
+        filtered("pg_stats_ext", "")
+    );
+    assert_eq!(rewritten(sql), expected);
+}
+
+#[test]
+fn literals_and_comments_naming_the_view_are_untouched() {
+    let sql = "SELECT 'FROM pg_stats', '\"pg_stats\"' /* pg_stats */ FROM pg_class -- pg_stats\nWHERE false";
+    assert_eq!(rewritten(sql), sql);
+    let mixed = "SELECT '--pg_stats' FROM pg_stats";
+    assert_eq!(
+        rewritten(mixed),
+        format!(
+            "SELECT '--pg_stats' FROM {}",
+            filtered("pg_stats", " AS pg_stats")
+        )
+    );
+}
+
+#[test]
+fn a_user_table_in_another_schema_named_like_the_view_is_untouched() {
+    let sql = "SELECT * FROM app.pg_stats";
+    assert_eq!(rewritten(sql), sql);
+    assert!(!gate(sql).unwrap().rewritten);
+}
+
+#[test]
+fn statements_without_statistics_views_are_byte_identical() {
+    for sql in [
+        "SELECT 1",
+        "SELECT *\n  FROM   app.items  AS i\nWHERE i.id = 1",
+        "WITH x AS (SELECT 1) SELECT * FROM x",
+        "EXPLAIN (FORMAT JSON) SELECT * FROM pg_class",
+        "SHOW search_path",
+    ] {
+        let accepted = gate(sql).unwrap();
+        assert_eq!(accepted.sql, sql);
+        assert!(!accepted.rewritten, "{sql}");
+    }
+}
+
+#[test]
+fn forms_that_cannot_be_spliced_are_refused_with_the_exact_text() {
+    let message = |view: &str| {
+        format!(
+            "{view} can only be read as a plain table reference in FROM or JOIN, for example: SELECT attname, n_distinct FROM pg_stats WHERE tablename = 'orders'"
+        )
+    };
+    for (sql, view) in [
+        ("TABLE pg_stats", "pg_stats"),
+        ("SELECT * FROM ONLY pg_stats", "pg_stats"),
+        ("SELECT * FROM pg_stats *", "pg_stats"),
+        ("SELECT * FROM pg_stats TABLESAMPLE SYSTEM (10)", "pg_stats"),
+        (
+            "WITH pg_stats AS (SELECT 1 AS x) SELECT * FROM pg_stats",
+            "pg_stats",
+        ),
+        ("TABLE pg_stats_ext", "pg_stats_ext"),
+    ] {
+        match gate(sql) {
+            Err(rejection) => {
+                assert_eq!(rejection.code, "relation_denied", "{sql}");
+                assert_eq!(rejection.message, message(view), "{sql}");
+            }
+            Ok(accepted) => panic!("accepted as {accepted:?}: {sql}"),
+        }
+    }
+}
+
+proptest! {
+    /// Generated references: the rewritten text parses, and the view appears only inside the filter.
+    #[test]
+    fn rewritten_text_parses_and_names_the_view_only_in_the_filter(
+        qualified in any::<bool>(),
+        quoted in any::<bool>(),
+        alias in 0_u8..3,
+        copies in 1_usize..4,
+    ) {
+        let name = match (qualified, quoted) {
+            (false, false) => "pg_stats".to_owned(),
+            (false, true) => "\"pg_stats\"".to_owned(),
+            (true, false) => "pg_catalog.pg_stats".to_owned(),
+            (true, true) => "pg_catalog.\"pg_stats\"".to_owned(),
+        };
+        let froms: Vec<String> = (0..copies)
+            .map(|i| match alias {
+                0 => name.clone(),
+                1 => format!("{name} x{i}"),
+                _ => format!("{name} AS x{i}"),
+            })
+            .collect();
+        let sql = format!("SELECT 1 FROM {}", froms.join(", "));
+        let accepted = gate(&sql).expect("generated statement is accepted");
+        prop_assert!(accepted.rewritten);
+        prop_assert!(pg_query::parse(&accepted.sql, pg_query::ParserOptions::DEFAULT).is_ok(), "{}", accepted.sql);
+        prop_assert_eq!(accepted.sql.matches("FROM pg_catalog.pg_stats WHERE").count(), copies, "{}", accepted.sql);
+        prop_assert!(!accepted.sql.contains("FROM pg_stats "), "{}", accepted.sql);
+    }
+}
+
+const TOAST_MESSAGE: &str =
+    "TOAST tables are not readable through this server. Read the table they belong to.";
+
+#[test]
+fn toast_tables_are_refused_with_exact_message_in_every_spelling() {
+    for sql in [
+        "SELECT chunk_data FROM pg_toast.pg_toast_2619",
+        "SELECT chunk_data FROM \"pg_toast\".\"pg_toast_2619\"",
+        "SELECT chunk_data FROM \"PG_TOAST\".\"PG_TOAST_2619\"",
+        "SELECT chunk_data FROM pg_toast_2619",
+        "SELECT chunk_data FROM \"PG_TOAST_2619\"",
+        "SELECT chunk_data FROM pg_toast.pg_toast_2619_index",
+        "SELECT chunk_data FROM pg_toast.pg_toast_1260",
+        "SELECT chunk_data FROM public.pg_toast_1260",
+        "SELECT encode(chunk_data, 'base64') FROM pg_toast.pg_toast_2619",
+        "SELECT convert_from(chunk_data, 'UTF8') FROM pg_toast.pg_toast_2619",
+        "SELECT 1 FROM app.items i JOIN pg_toast.pg_toast_2619 t ON true",
+        "SELECT 1 FROM pg_toast_temp_1.pg_toast_temp_1_x",
+        "SELECT 1 FROM pg_toast_temp_1.anything",
+        "SELECT 1 FROM pg_toast.anything_at_all",
+    ] {
+        let rejection = gate(sql).expect_err(sql);
+        assert_eq!(rejection.code, "relation_denied", "{sql}");
+        assert_eq!(rejection.message, TOAST_MESSAGE, "{sql}");
+    }
+}
+
+#[test]
+fn names_that_only_look_like_toast_tables_are_allowed() {
+    for sql in [
+        "SELECT 1 FROM app.pg_toast_items",
+        "SELECT 1 FROM pg_toast_items",
+        "SELECT 1 FROM pg_toast_2619x",
+        "SELECT 1 FROM toast_2619",
+        "SELECT 1 FROM pg_toast_index",
+    ] {
+        assert!(gate(sql).is_ok(), "{sql} should be accepted");
+    }
+}
+
+#[test]
+fn walinspect_functions_are_denied_with_the_wal_reason() {
+    for name in [
+        "pg_get_wal_block_info",
+        "pg_get_wal_record_info",
+        "pg_get_wal_records_info",
+        "pg_get_wal_records_info_till_end_of_wal",
+        "pg_get_wal_stats",
+        "pg_get_wal_stats_till_end_of_wal",
+    ] {
+        let sql = format!("SELECT * FROM {name}('0/0', '0/1')");
+        let rejection = gate(&sql).expect_err(&sql);
+        assert_eq!(rejection.code, "function_denied", "{sql}");
+        assert!(
+            rejection
+                .message
+                .contains("it returns raw write-ahead log data"),
+            "{sql}: {}",
+            rejection.message
+        );
+    }
+}
+
+const VIEW_MESSAGE: &str = "pg_stats can only be read as a plain table reference in FROM or JOIN, for example: SELECT attname, n_distinct FROM pg_stats WHERE tablename = 'orders'";
+
+#[test]
+fn three_part_statistics_name_is_refused_with_the_plain_reference_message() {
+    let rejection =
+        gate("SELECT attname FROM appdb.pg_catalog.pg_stats").expect_err("three-part name");
+    assert_eq!(rejection.code, "relation_denied");
+    assert_eq!(rejection.message, VIEW_MESSAGE);
+}
+
+#[test]
+fn schema_qualified_column_of_a_statistics_view_is_refused_with_the_column_sentence() {
+    let rejection =
+        gate("SELECT pg_catalog.pg_stats.tablename FROM pg_stats").expect_err("qualified column");
+    assert_eq!(rejection.code, "relation_denied");
+    assert_eq!(
+        rejection.message,
+        format!("{VIEW_MESSAGE} Refer to its columns as pg_stats.column or through an alias.")
+    );
+}
+
+#[test]
+fn a_comment_between_from_and_the_name_is_skipped() {
+    let block = "SELECT attname FROM /* note */ pg_stats WHERE tablename = 'orders'";
+    assert_eq!(
+        rewritten(block),
+        format!(
+            "SELECT attname FROM /* note */ {} WHERE tablename = 'orders'",
+            filtered("pg_stats", " AS pg_stats")
+        )
+    );
+    let line = "SELECT attname FROM -- note\n pg_stats WHERE tablename = 'orders'";
+    assert!(
+        rewritten(line).contains(&filtered("pg_stats", " AS pg_stats")),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_parenthesised_join_with_a_statistics_view_is_accepted_and_rewritten() {
+    let sql = "SELECT s.attname, c.relname FROM (pg_stats s JOIN pg_class c ON c.relname = s.tablename) WHERE c.relname = 'items'";
+    let accepted = rewritten(sql);
+    assert!(accepted.contains(&filtered("pg_stats", "")), "{accepted}");
+    assert!(accepted.contains(" s JOIN pg_class c"), "{accepted}");
+}
+
+#[test]
+fn every_rewritten_statement_parses_again_with_one_filter_per_reference() {
+    for (sql, references) in [
+        ("SELECT attname FROM pg_stats", 1),
+        (
+            "SELECT * FROM pg_stats s, pg_stats_ext e WHERE s.tablename = e.statistics_name",
+            2,
+        ),
+        (
+            "SELECT attname FROM pg_catalog.pg_stats AS x WHERE x.tablename = 'orders'",
+            1,
+        ),
+        (
+            "SELECT attname FROM /* c */ pg_stats /* d */ WHERE tablename = 'orders'",
+            1,
+        ),
+    ] {
+        let out = rewritten(sql);
+        assert!(
+            pg_query::parse(&out, pg_query::ParserOptions::DEFAULT).is_ok(),
+            "{out}"
+        );
+        assert_eq!(out.matches("OFFSET 0").count(), references, "{out}");
+    }
+}
+
+#[test]
+fn the_injected_filter_uses_the_pg_catalog_operators_and_types() {
+    let out = rewritten("SELECT attname FROM pg_stats");
+    assert!(out.contains("OPERATOR(pg_catalog.<>)"), "{out}");
+    assert!(out.contains("::pg_catalog.name[]"), "{out}");
+    assert!(!out.contains(" <> ALL"), "{out}");
+}

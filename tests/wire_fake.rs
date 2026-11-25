@@ -1046,7 +1046,7 @@ async fn localized_57014_after_the_statement_limit_is_a_timeout() {
     .expect_err("the server cancelled the statement");
     assert!(matches!(err, RunError::Timeout(200)), "{err:?}");
     assert!(matches!(
-        ToolError::from_run(err, "appdb", 0),
+        ToolError::from_run(err, "appdb", Some(0)),
         ToolError::Timeout(200)
     ));
 }

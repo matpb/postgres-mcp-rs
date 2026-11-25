@@ -150,19 +150,13 @@ GRANT CONNECT ON DATABASE appdb TO mcp_reader;
 GRANT USAGE ON SCHEMA public TO mcp_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO mcp_reader;
 ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT ON TABLES TO mcp_reader;
--- optional: see other sessions' queries and statement statistics
-GRANT pg_read_all_stats TO mcp_reader;
+-- optional: monitoring tools (other sessions' queries, statement statistics, settings)
+GRANT pg_monitor TO mcp_reader;
 ```
 
-This is the recommended profile. It reads the tables it is granted and nothing else. Replace `app_owner` with the role that creates the tables; default privileges apply only to objects that role creates. Tables that role creates in `public` later are readable too. For each further schema the server should see, repeat the `GRANT USAGE` and `GRANT SELECT` pair.
+This is the recommended setup. It reads the tables it is granted and nothing else. Replace `app_owner` with the role that creates the tables; default privileges apply only to objects that role creates. Tables that role creates in `public` later are readable too. For each further schema the server should see, repeat the `GRANT USAGE` and `GRANT SELECT` pair.
 
-For local development only, a broader profile is simpler:
-
-```sql
-GRANT pg_read_all_data, pg_monitor TO mcp_reader;
-```
-
-It is broader because `pg_read_all_data` reads every table in every schema, present and future, so the role can read data no application would expose. With it the role can also read sampled catalog values through pg_stats, which can include password hashes.
+Do not grant `pg_read_all_data` and do not connect as a superuser. `pg_read_all_data` reads every table in every schema, present and future, including the system catalogs that hold password hashes and stored connection passwords. The server refuses to read those catalogs and their TOAST tables, removes their rows from the statistics views, and replaces text shaped like a stored password hash in every result. These are safeguards built into the server, whatever the role may do; a narrow role is still the better setup, because a role that was never granted the data has nothing to leak. If only monitoring is missing, `pg_monitor` is enough; it grants no table data, but it shows other sessions' statement text.
 
 The server works with any role and never needs write privileges. `get_privileges` reports what the connected role can do and flags anything beyond read access, such as the ability to write, create or act as superuser.
 
@@ -534,6 +528,7 @@ For this option only, the statement is sent with the simple query protocol, and 
   "truncated": false,
   "truncatedValues": 0,
   "rawFallbacks": 0,
+  "redactedHashes": 0,
   "executionTimeMs": 2
 }
 ```
@@ -615,7 +610,8 @@ Versions tested. The test stack runs PostgreSQL 15, 18 and 19. TimescaleDB runs 
 The threat model and every layer are described in [SECURITY.md](SECURITY.md). In short:
 
 - **Database role.** The role is the real boundary. Use the read-only role above, with `default_transaction_read_only` set, and never share it with an application.
-- **Gate.** Each statement is parsed and checked against an allow-list of node types, a deny-list of functions, and lists of credential catalogs and secret settings.
+- **Gate.** Each statement is parsed and checked against an allow-list of node types, a deny-list of functions, and lists of credential catalogs and secret settings. The statistics views `pg_stats`, `pg_stats_ext` and `pg_stats_ext_exprs` are read through a filter that drops the rows of pg_authid, pg_user_mapping, pg_subscription, pg_db_role_setting, pg_statistic, pg_statistic_ext_data and pg_largeobject, with a planner fence so that a caller's predicate cannot run on a hidden row. This holds for every role, superusers included. The TOAST tables of all catalogs are refused by name, and so are the foreign server and foreign-data wrapper catalogs.
+- **Password hash scrubber.** Every tool result, resource body, completion and error text, and every log field that can carry text from the database, is scanned before it leaves the server, and text shaped like a PostgreSQL password hash in its stored form (SCRAM-SHA-256 verifier or md5 hash) is replaced with [redacted password hash]. A password literal after the word PASSWORD in statement text is masked the same way. It is always on and cannot be configured off. The audit line counts the replacements.
 - **Transaction.** Every call runs in `BEGIN READ ONLY` with statement, lock and idle timeouts, and is rolled back. A query that outlives its time limit is cancelled on the server.
 - **Session.** Each connection is checked before use and reset with `ROLLBACK` and `DISCARD ALL` after it, so no session state reaches the next caller.
 - **Caps.** Rows, values, response bytes, request bytes and SQL text are all capped.
@@ -633,7 +629,7 @@ For per-person access, policies and audit across many MCP servers, put a gateway
 Three scripts prove a change. None of them needs a CI service, because the project has no CI configuration by design. Run the first two before you open a pull request.
 
 - **`scripts/verify.sh`** needs no database. It runs `cargo fmt --check`, `cargo clippy` with warnings as errors, the library and non-database test targets (`lib`, `config`, `encode`, `gate` and `http_guard`), `cargo audit` and `cargo deny check`. The last two need `cargo-audit` and `cargo-deny` installed.
-- **`scripts/integration.sh`** starts [`docker-compose.test.yml`](docker-compose.test.yml), runs every cargo test target with `--test-threads=4`, and removes the stack afterwards. Pass `--keep` to leave the stack running for the next run. The stack has four PostgreSQL servers on loopback: `timescaledb-ha` on PostgreSQL 18 with TimescaleDB 2.32.1 on port 15432, `postgres` 19 on port 15433 (csvlog), `postgres` 15 on port 15434 and `postgres` 19 with TLS on port 15435 (`pgtls`). The `pgtls` server has a private CA, a server certificate for `localhost` and `pgtls.test.example`, and client certificates for the `mcp_cert` role. [`docker/tls-initdb/10_tls.sh`](docker/tls-initdb/10_tls.sh) generates them with `openssl` at the first start, so no key or certificate is in the repository. The TimescaleDB server also preloads `pg_stat_statements` and pgaudit. The databases are seeded with the `app`, `shop` and `types` schemas, a `metrics` schema on the TimescaleDB server, and test roles with throwaway passwords: `mcp_ro`, which has the broad profile (`pg_read_all_data` and `pg_monitor`), `mcp_strict`, which has per-schema `SELECT` grants and `pg_read_all_stats`, and `mcp_min`, which may select only from `app.items`.
+- **`scripts/integration.sh`** starts [`docker-compose.test.yml`](docker-compose.test.yml), runs every cargo test target with `--test-threads=4`, and removes the stack afterwards. Pass `--keep` to leave the stack running for the next run. The stack has four PostgreSQL servers on loopback: `timescaledb-ha` on PostgreSQL 18 with TimescaleDB 2.32.1 on port 15432, `postgres` 19 on port 15433 (csvlog), `postgres` 15 on port 15434 and `postgres` 19 with TLS on port 15435 (`pgtls`). The `pgtls` server has a private CA, a server certificate for `localhost` and `pgtls.test.example`, and client certificates for the `mcp_cert` role. [`docker/tls-initdb/10_tls.sh`](docker/tls-initdb/10_tls.sh) generates them with `openssl` at the first start, so no key or certificate is in the repository. The TimescaleDB server also preloads `pg_stat_statements` and pgaudit. The databases are seeded with the `app`, `shop` and `types` schemas, a `metrics` schema on the TimescaleDB server, and test roles with throwaway passwords: `mcp_ro`, which has the broad profile (`pg_read_all_data` and `pg_monitor`) and stays as the hostile test role, `mcp_recipe`, which has the README recipe with `pg_monitor`, `mcp_strict`, which has per-schema `SELECT` grants and `pg_read_all_stats`, and `mcp_min`, which may select only from `app.items`.
 - **`scripts/docker-smoke.sh`** builds the image as `postgres-mcp:smoke`, runs it against the test database on PostgreSQL 19, and checks the health route, the 401 without a key, `tools/list`, a `SELECT`, a refused `INSERT`, one stdio `tools/call` round trip, the absence of a shell and the read-only root filesystem.
 
 The cargo test targets are these. `lib` (the unit tests in `src/`), `config`, `encode`, `gate`, `http_guard`, `tls` and `wire_fake` need no database. `wire`, `session`, `types_exact`, `hardening`, `schema_tools`, `monitor_tools`, `timescale_tools`, `logs_tools`, `mcp_http`, `mcp_stdio`, `resources` and `tls_real` need the test stack. `tls_real` runs TLS against `pgtls` through the wire client, the pool and the binary. `tests/types_exact.rs` checks the value-encoding table above against PostgreSQL 15, 18 and 19. `tls` runs a server in-process with certificates made at test time, and `wire_fake` runs the wire client against scripted servers. The test databases are seeded from [`docker/initdb`](docker/initdb), and the tests do not run DDL, so an object that a test needs belongs in the seed.
