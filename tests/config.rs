@@ -1,13 +1,16 @@
 //! Environment-only configuration: defaults, database sources, validation messages and leak checks.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use postgres_mcp::config::{Config, ConfigError, LogFormat};
 use postgres_mcp::pg::tls::SslMode;
 use postgres_mcp::pg::wire::AuthPolicy;
+use serde_json::{Value, json};
 
 const URL: &str = "postgres://app:pw-secret@db.example.com:5433/appdb";
 
@@ -945,4 +948,590 @@ fn verify_ca_needs_sslrootcert_in_each_source() {
         ("PGSSLMODE", "verify-full"),
     ]);
     assert_eq!(full.databases[0].connect.ssl_mode, SslMode::VerifyFull);
+}
+
+// ---- Client certificates and inline PEM ----
+
+/// A self-signed certificate and its PKCS#8 key as PEM text, made at test time.
+fn pem_pair(name: &str) -> (String, String) {
+    let key = rcgen::KeyPair::generate().expect("generate key");
+    let params = rcgen::CertificateParams::new(vec![name.to_owned()]).expect("certificate params");
+    let cert = params.self_signed(&key).expect("self-signed certificate");
+    (cert.pem(), key.serialize_pem())
+}
+
+/// The PEM text with each newline written as the two characters `\n`, as an environment value carries it.
+fn escaped(pem: &str) -> String {
+    pem.replace('\n', "\\n")
+}
+
+/// Encrypted-key armour with a dummy body: only the label and the header are inspected.
+const ENCRYPTED_PKCS8: &str =
+    "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n";
+const ENCRYPTED_PKCS1: &str = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n\nAAAA\n-----END RSA PRIVATE KEY-----\n";
+
+/// The startup TLS error for `pairs`: the configuration loads, then prepare_tls refuses it.
+fn prepare_err(pairs: &[(&str, &str)]) -> String {
+    let mut config = cfg(pairs);
+    match config.prepare_tls() {
+        Ok(()) => panic!("expected a startup TLS error"),
+        Err(ConfigError(message)) => message,
+    }
+}
+
+#[test]
+fn client_certificate_needs_its_key_in_every_form() {
+    let file = TempFile::new("unused");
+    let path = file.path();
+    let url = format!("postgres://app@db.example.com/appdb?sslcert={path}");
+    assert_eq!(
+        load_err(&[("DATABASE_URL", url.as_str())]),
+        "DATABASE_URL: sslcert and sslkey must be set together"
+    );
+    let url = format!("postgres://app@db.example.com/appdb?sslkey={path}");
+    assert_eq!(
+        load_err(&[("DATABASE_URL", url.as_str())]),
+        "DATABASE_URL: sslcert and sslkey must be set together"
+    );
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLCERT", path.as_str())
+        ]),
+        "PGSSLCERT: sslcert and sslkey must be set together"
+    );
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLKEY", path.as_str())
+        ]),
+        "PGSSLKEY: sslcert and sslkey must be set together"
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","database":"db","user":"u","sslcert":"/x/c.pem"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): sslcert and sslkey must be set together"
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","database":"db","user":"u","sslkey_pem":"x"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): sslcert and sslkey must be set together"
+    );
+    assert_eq!(
+        load_err(&[
+            ("DATABASE_URL", "postgres://app@db.example.com/appdb"),
+            ("PGSSLKEY_PEM", "x")
+        ]),
+        "DATABASE_URL: sslcert and sslkey must be set together"
+    );
+}
+
+#[test]
+fn file_and_inline_variants_of_one_item_cannot_both_be_set() {
+    let file = TempFile::new("unused");
+    let path = file.path();
+    let url = format!("postgres://app@db.example.com/appdb?sslrootcert={path}");
+    assert_eq!(
+        load_err(&[("DATABASE_URL", url.as_str()), ("PGSSLROOTCERT_PEM", "x")]),
+        "DATABASE_URL: sslrootcert and sslrootcert_pem cannot both be set"
+    );
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLROOTCERT", path.as_str()),
+            ("PGSSLROOTCERT_PEM", "x"),
+        ]),
+        "PGSSLROOTCERT: sslrootcert and sslrootcert_pem cannot both be set"
+    );
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLCERT", path.as_str()),
+            ("PGSSLCERT_PEM", "x"),
+            ("PGSSLKEY", path.as_str()),
+        ]),
+        "PGSSLCERT: sslcert and sslcert_pem cannot both be set"
+    );
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLCERT", path.as_str()),
+            ("PGSSLKEY", path.as_str()),
+            ("PGSSLKEY_PEM", "x"),
+        ]),
+        "PGSSLKEY: sslkey and sslkey_pem cannot both be set"
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","database":"db","user":"u","sslrootcert":"/x/ca.pem","sslrootcert_pem":"x"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): sslrootcert and sslrootcert_pem cannot both be set"
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","database":"db","user":"u","sslcert":"/x/c.pem","sslcert_pem":"x","sslkey":"/x/k.pem"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): sslcert and sslcert_pem cannot both be set"
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","database":"db","user":"u","sslcert_pem":"x","sslkey":"/x/k.pem","sslkey_pem":"y"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): sslkey and sslkey_pem cannot both be set"
+    );
+}
+
+#[test]
+fn client_certificate_is_refused_with_sslmode_disable() {
+    assert_eq!(
+        load_err(&[(
+            "DATABASE_URL",
+            "postgres://app@db.example.com/appdb?sslmode=disable&sslcert=/x/c.pem&sslkey=/x/k.pem"
+        )]),
+        "DATABASE_URL: sslcert needs TLS: sslmode must not be disable"
+    );
+    assert_eq!(
+        load_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLMODE", "disable"),
+            ("PGSSLCERT_PEM", "x"),
+            ("PGSSLKEY_PEM", "y"),
+        ]),
+        "PGSSLMODE: sslcert needs TLS: sslmode must not be disable"
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","database":"db","user":"u","sslmode":"disable","sslcert":"/x/c.pem","sslkey":"/x/k.pem"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): sslcert needs TLS: sslmode must not be disable"
+    );
+    // A root certificate alone is not a client certificate: disable keeps working.
+    let config = cfg(&[
+        ("PGDATABASE", "pdb"),
+        ("PGUSER", "pu"),
+        ("PGSSLMODE", "disable"),
+        ("PGSSLROOTCERT_PEM", "x"),
+    ]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::Disable);
+}
+
+#[test]
+fn verify_ca_is_satisfied_by_either_root_variant() {
+    let config = cfg(&[
+        ("PGDATABASE", "pdb"),
+        ("PGUSER", "pu"),
+        ("PGSSLMODE", "verify-ca"),
+        ("PGSSLROOTCERT_PEM", "x"),
+    ]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::VerifyCa);
+    let config = cfg(&[(
+        "PG_DATABASES",
+        r#"[{"name":"a","database":"db","user":"u","sslmode":"verify-ca","sslrootcert_pem":"x"}]"#,
+    )]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::VerifyCa);
+    let config = cfg(&[
+        (
+            "DATABASE_URL",
+            "postgres://app@db.example.com/appdb?sslmode=verify-ca",
+        ),
+        ("PGSSLROOTCERT_PEM", "x"),
+    ]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::VerifyCa);
+}
+
+#[test]
+fn inline_pem_and_client_files_are_not_url_query_parameters() {
+    assert_eq!(
+        load_err(&[(
+            "DATABASE_URL",
+            "postgres://app@db.example.com/appdb?sslrootcert_pem=x"
+        )]),
+        "DATABASE_URL: unknown URL parameter \"sslrootcert_pem\""
+    );
+    assert_eq!(
+        load_err(&[(
+            "DATABASE_URL",
+            "postgres://app@db.example.com/appdb?sslcert_pem=x"
+        )]),
+        "DATABASE_URL: unknown URL parameter \"sslcert_pem\""
+    );
+    let config = cfg(&[(
+        "DATABASE_URL",
+        "postgres://app@db.example.com/appdb?sslmode=verify-full&sslcert=/x/c.pem&sslkey=/x/k.pem",
+    )]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::VerifyFull);
+}
+
+#[test]
+fn client_certificate_fields_cannot_accompany_url_but_inline_pem_can() {
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","url":"postgres://u:pw@h/db","sslcert":"/x/c.pem"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): \"sslcert\" cannot be combined with \"url\""
+    );
+    assert_eq!(
+        load_err(&[(
+            "PG_DATABASES",
+            r#"[{"name":"a","url":"postgres://u:pw@h/db","sslkey":"/x/k.pem"}]"#
+        )]),
+        "PG_DATABASES[0] (\"a\"): \"sslkey\" cannot be combined with \"url\""
+    );
+    let config = cfg(&[(
+        "PG_DATABASES",
+        r#"[{"name":"a","url":"postgres://u:pw@h/db?sslmode=verify-full","sslrootcert_pem":"x","sslcert_pem":"y","sslkey_pem":"z"}]"#,
+    )]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::VerifyFull);
+}
+
+#[test]
+fn from_lookup_does_not_read_client_files_but_prepare_tls_does() {
+    let config = cfg(&[
+        ("PGDATABASE", "pdb"),
+        ("PGUSER", "pu"),
+        ("PGSSLCERT", "/nonexistent/pgmcp-client.crt"),
+        ("PGSSLKEY", "/nonexistent/pgmcp-client.key"),
+    ]);
+    assert_eq!(config.databases[0].connect.ssl_mode, SslMode::Prefer);
+    assert_eq!(
+        prepare_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLCERT", "/nonexistent/pgmcp-client.crt"),
+            ("PGSSLKEY", "/nonexistent/pgmcp-client.key"),
+        ]),
+        "pdb: cannot read sslcert: No such file or directory (os error 2)"
+    );
+}
+
+#[test]
+fn startup_names_each_client_file_failure() {
+    let (cert_pem, key_pem) = pem_pair("client.example.com");
+    let (_, other_key) = pem_pair("other.example.com");
+    let cert = TempFile::new(&cert_pem);
+    let key = TempFile::new(&key_pem);
+    let form = |cert: &str, key: &str| {
+        prepare_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLCERT", cert),
+            ("PGSSLKEY", key),
+        ])
+    };
+    let missing = "/nonexistent/pgmcp-client.pem";
+    assert_eq!(
+        form(missing, &key.path()),
+        "pdb: cannot read sslcert: No such file or directory (os error 2)"
+    );
+    assert_eq!(
+        form(&cert.path(), missing),
+        "pdb: cannot read sslkey: No such file or directory (os error 2)"
+    );
+    let key_only = TempFile::new(&key_pem);
+    assert_eq!(
+        form(&key_only.path(), &key.path()),
+        "pdb: sslcert holds no certificate"
+    );
+    let cert_only = TempFile::new(&cert_pem);
+    assert_eq!(
+        form(&cert.path(), &cert_only.path()),
+        "pdb: sslkey holds no private key"
+    );
+    let encrypted = TempFile::new(ENCRYPTED_PKCS8);
+    assert_eq!(
+        form(&cert.path(), &encrypted.path()),
+        "pdb: sslkey is encrypted; provide an unencrypted PEM key"
+    );
+    let encrypted = TempFile::new(ENCRYPTED_PKCS1);
+    assert_eq!(
+        form(&cert.path(), &encrypted.path()),
+        "pdb: sslkey is encrypted; provide an unencrypted PEM key"
+    );
+    let other = TempFile::new(&other_key);
+    assert_eq!(
+        form(&cert.path(), &other.path()),
+        "pdb: sslkey does not match sslcert"
+    );
+    let broken = TempFile::new("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n");
+    assert_eq!(
+        form(&broken.path(), &key.path()),
+        "pdb: sslcert is not valid PEM"
+    );
+}
+
+#[test]
+fn startup_checks_inline_pem_the_same_way() {
+    let (cert_pem, key_pem) = pem_pair("client.example.com");
+    let (_, other_key) = pem_pair("other.example.com");
+    let inline = |cert: &str, key: &str| {
+        prepare_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLCERT_PEM", cert),
+            ("PGSSLKEY_PEM", key),
+        ])
+    };
+    assert_eq!(
+        inline("not a certificate", &escaped(&key_pem)),
+        "pdb: sslcert_pem holds no certificate"
+    );
+    assert_eq!(
+        inline(&escaped(&cert_pem), &escaped(&cert_pem)),
+        "pdb: sslkey_pem holds no private key"
+    );
+    assert_eq!(
+        inline(&escaped(&cert_pem), &escaped(ENCRYPTED_PKCS8)),
+        "pdb: sslkey_pem is encrypted; provide an unencrypted PEM key"
+    );
+    assert_eq!(
+        inline(&escaped(&cert_pem), &escaped(&other_key)),
+        "pdb: sslkey does not match sslcert"
+    );
+    assert_eq!(
+        prepare_err(&[
+            ("PGDATABASE", "pdb"),
+            ("PGUSER", "pu"),
+            ("PGSSLROOTCERT_PEM", "not a certificate"),
+        ]),
+        "pdb: sslrootcert_pem holds no certificate"
+    );
+    // Literal backslash-n pairs in the environment value become newlines: the pair loads and prepares.
+    let mut config = cfg(&[
+        ("PGDATABASE", "pdb"),
+        ("PGUSER", "pu"),
+        ("PGSSLMODE", "verify-full"),
+        ("PGSSLROOTCERT_PEM", &escaped(&cert_pem)),
+        ("PGSSLCERT_PEM", &escaped(&cert_pem)),
+        ("PGSSLKEY_PEM", &escaped(&key_pem)),
+    ]);
+    config.prepare_tls().expect("escaped inline PEM prepares");
+    assert!(config.databases[0].tls.is_some());
+}
+
+#[test]
+fn json_inline_pem_with_real_newlines_prepares() {
+    let (cert_pem, key_pem) = pem_pair("client.example.com");
+    let databases = json!([{
+        "name": "a",
+        "database": "db",
+        "user": "u",
+        "sslmode": "verify-full",
+        "sslrootcert_pem": cert_pem,
+        "sslcert_pem": cert_pem,
+        "sslkey_pem": key_pem,
+    }])
+    .to_string();
+    let mut config = cfg(&[("PG_DATABASES", databases.as_str())]);
+    config.prepare_tls().expect("JSON inline PEM prepares");
+    assert!(config.databases[0].tls.is_some());
+}
+
+#[test]
+fn debug_output_never_shows_key_material_or_password() {
+    let (cert_pem, key_pem) = pem_pair("client.example.com");
+    let body = key_pem
+        .lines()
+        .nth(1)
+        .expect("key has a body line")
+        .to_owned();
+    let mut config = cfg(&[
+        ("PGDATABASE", "pdb"),
+        ("PGUSER", "pu"),
+        ("PGPASSWORD", "pw-debug-secret"),
+        ("PGSSLMODE", "verify-full"),
+        ("PGSSLROOTCERT_PEM", &escaped(&cert_pem)),
+        ("PGSSLCERT_PEM", &escaped(&cert_pem)),
+        ("PGSSLKEY_PEM", &escaped(&key_pem)),
+    ]);
+    config.prepare_tls().expect("prepares");
+    let debug = format!("{config:?}");
+    assert!(!debug.contains(&body), "key body in Debug output");
+    assert!(!debug.contains("PRIVATE KEY"), "key label in Debug output");
+    assert!(
+        !debug.contains("pw-debug-secret"),
+        "password in Debug output"
+    );
+}
+
+/// Runs `http` with exactly `vars` set and returns its exit code and trimmed stderr. A server that starts is killed.
+fn startup_stderr(vars: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_postgres-mcp"));
+    cmd.arg("http")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (name, value) in vars {
+        cmd.env(name, value);
+    }
+    let mut child = cmd.spawn().expect("binary starts");
+    let Some(status) = wait_with_timeout(&mut child, Duration::from_secs(10)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the server started instead of failing its TLS configuration");
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)
+            .expect("stderr is readable");
+    }
+    (status.code(), stderr.trim_end().to_owned())
+}
+
+fn wait_with_timeout(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().expect("child can be polled") {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A PG_DATABASES value for one database named `appdb` with the given TLS fields added.
+fn appdb_json(extra: Value) -> String {
+    let mut entry = json!({
+        "name": "appdb",
+        "host": "127.0.0.1",
+        "port": 15433,
+        "database": "appdb",
+        "user": "mcp_ro",
+        "password": "test-only-ro",
+        "sslmode": "verify-full",
+    });
+    if let (Value::Object(base), Value::Object(more)) = (&mut entry, extra) {
+        base.extend(more);
+    }
+    json!([entry]).to_string()
+}
+
+#[test]
+fn nonexistent_sslkey_fails_startup_with_exit_2() {
+    let (cert_pem, _) = pem_pair("client.example.com");
+    let cert = TempFile::new(&cert_pem);
+    let databases = appdb_json(json!({
+        "sslcert": cert.path(),
+        "sslkey": "/nonexistent/pgmcp-client.key",
+    }));
+    let (code, stderr) = startup_stderr(&[("PG_DATABASES", databases.as_str())]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr,
+        "configuration error: appdb: cannot read sslkey: No such file or directory (os error 2)"
+    );
+}
+
+#[test]
+fn encrypted_sslkey_fails_startup_with_exit_2() {
+    let (cert_pem, _) = pem_pair("client.example.com");
+    let cert = TempFile::new(&cert_pem);
+    let key = TempFile::new(ENCRYPTED_PKCS8);
+    let databases = appdb_json(json!({"sslcert": cert.path(), "sslkey": key.path()}));
+    let (code, stderr) = startup_stderr(&[("PG_DATABASES", databases.as_str())]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr,
+        "configuration error: appdb: sslkey is encrypted; provide an unencrypted PEM key"
+    );
+}
+
+#[test]
+fn mismatched_sslkey_fails_startup_with_exit_2() {
+    let (cert_pem, _) = pem_pair("client.example.com");
+    let (_, other_key) = pem_pair("other.example.com");
+    let cert = TempFile::new(&cert_pem);
+    let key = TempFile::new(&other_key);
+    let databases = appdb_json(json!({"sslcert": cert.path(), "sslkey": key.path()}));
+    let (code, stderr) = startup_stderr(&[("PG_DATABASES", databases.as_str())]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr,
+        "configuration error: appdb: sslkey does not match sslcert"
+    );
+}
+
+#[test]
+fn startup_logs_one_tls_line_per_database() {
+    let (cert_pem, key_pem) = pem_pair("client.example.com");
+    let cert = TempFile::new(&cert_pem);
+    let key = TempFile::new(&key_pem);
+    let databases = json!([
+        {
+            "name": "secured",
+            "host": "127.0.0.1",
+            "port": 15433,
+            "database": "appdb",
+            "user": "mcp_cert",
+            "sslmode": "verify-full",
+            "sslrootcert_pem": cert_pem,
+            "sslcert": cert.path(),
+            "sslkey": key.path(),
+        },
+        {
+            "name": "plain",
+            "host": "127.0.0.1",
+            "port": 15433,
+            "database": "appdb",
+            "user": "mcp_ro",
+            "password": "test-only-ro",
+            "sslmode": "disable",
+        }
+    ])
+    .to_string();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_postgres-mcp"));
+    cmd.arg("stdio")
+        .env_clear()
+        .env("PG_DATABASES", &databases)
+        .env("LOG_FORMAT", "json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("binary starts");
+    // With stdin already at EOF the session ends at once with exit 1; only the startup lines are checked.
+    wait_with_timeout(&mut child, Duration::from_secs(10)).expect("stdio server exits");
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)
+            .expect("stderr is readable");
+    }
+    let lines: Vec<Value> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["fields"]["message"] == "database TLS settings")
+        .collect();
+    assert_eq!(lines.len(), 2, "{stderr}");
+    let secured = lines
+        .iter()
+        .find(|l| l["fields"]["database"] == "secured")
+        .expect("secured line");
+    assert_eq!(secured["level"], "INFO");
+    assert_eq!(secured["fields"]["tls"], "verify-full");
+    assert_eq!(secured["fields"]["custom_root"], true);
+    assert_eq!(secured["fields"]["client_cert"], true);
+    let plain = lines
+        .iter()
+        .find(|l| l["fields"]["database"] == "plain")
+        .expect("plain line");
+    assert_eq!(plain["fields"]["tls"], "disable");
+    assert_eq!(plain["fields"]["custom_root"], false);
+    assert_eq!(plain["fields"]["client_cert"], false);
+    assert!(!stderr.contains(&key_pem), "key material in the log");
 }

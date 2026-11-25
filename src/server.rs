@@ -182,7 +182,21 @@ fn env_value(name: &str) -> Result<Option<String>, String> {
 fn start(config: Result<Config, ConfigError>) -> Result<Config, ExitCode> {
     let config = config.map_err(|e| config_error(&e.0))?;
     init_logging(config.log_format).map_err(|e| config_error(&e))?;
+    log_tls_settings(&config);
     Ok(config)
+}
+
+/// One info line per database: its sslmode, and whether a root and a client certificate are configured.
+fn log_tls_settings(config: &Config) {
+    for db in &config.databases {
+        tracing::info!(
+            database = %db.name,
+            tls = db.connect.ssl_mode.as_str(),
+            custom_root = db.tls_sources.root.is_some(),
+            client_cert = db.tls_sources.client_cert.is_some(),
+            "database TLS settings"
+        );
+    }
 }
 
 async fn serve_http() -> ExitCode {

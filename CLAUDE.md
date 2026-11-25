@@ -29,7 +29,7 @@ Run from the repository root.
 - One test: `cargo test --locked --test gate allow_corpus_is_accepted`
 - Stop the test stack: `docker compose -f docker-compose.test.yml down -v`
 
-Tests that need PostgreSQL expect the test stack on `127.0.0.1` ports 15432 (TimescaleDB on PostgreSQL 18), 15433 (PostgreSQL 19) and 15434 (PostgreSQL 15). Start the stack before running them. `scripts/integration.sh` does that for you. Do not point a test at any other server.
+Tests that need PostgreSQL expect the test stack on `127.0.0.1` ports 15432 (TimescaleDB on PostgreSQL 18), 15433 (PostgreSQL 19), 15434 (PostgreSQL 15) and 15435 (PostgreSQL 19 with TLS, service `pgtls`). Start the stack before running them. `scripts/integration.sh` does that for you. Do not point a test at any other server.
 
 ## Repo map
 
@@ -43,7 +43,7 @@ Tests that need PostgreSQL expect the test stack on `127.0.0.1` ports 15432 (Tim
 - `src/pg/wire.rs`: PostgreSQL wire client: startup, auth under `AuthPolicy` (SCRAM, MD5, cleartext, trust), extended and simple query (`explain_unbound` for user text), cancel, streamed rows with value and byte caps.
 - `src/pg/session.rs`: `run_readonly`: transaction, session check, timeouts, reset.
 - `src/pg/pool.rs`: per-database semaphore pool.
-- `src/pg/tls.rs`: sslmode handling and certificate verifiers.
+- `src/pg/tls.rs`: sslmode handling, certificate verifiers, and the client certificate and key (`startup_client_config`).
 - `src/encode/`: value encoding; `mod.rs` decodes, `types.rs` holds the built-in OID table, `array.rs`, `range.rs`, `json.rs`, `columns.rs`.
 - `src/typeinfo.rs`: type lookups for non-built-in OIDs, cached per database.
 - `src/resources.rs`: MCP resources (database summary, schema and table views) and completions; enabled with the `schema` toolset.
@@ -52,8 +52,9 @@ Tests that need PostgreSQL expect the test stack on `127.0.0.1` ports 15432 (Tim
 - `src/tools/mask.rs`: best-effort masking of passwords in log text and statement text.
 - `src/tools/core.rs`, `envelope.rs`: core tools and the result envelope.
 - `src/tools/schema.rs` and `schema/`: schema tools. `monitor/`: monitor tools. `logs.rs` and `logs/`: the log tool. `timescale.rs` and `timescale/`: TimescaleDB tools.
-- `tests/`: one file per area, plus `common/mod.rs` for helpers and ports, and `gate_corpus/` for the gate cases. `wire_fake.rs` runs the wire client against scripted fake servers, `tls.rs` runs TLS in-process with generated certificates, `types_exact.rs` pins the value encoding on PostgreSQL 15, 18 and 19, and `hardening.rs` checks that hostile public functions do not reach the server's own SQL.
+- `tests/`: one file per area, plus `common/mod.rs` for helpers and ports, and `gate_corpus/` for the gate cases. `wire_fake.rs` runs the wire client against scripted fake servers, `tls.rs` runs TLS in-process with generated certificates, `tls_real.rs` runs TLS against the `pgtls` service, `types_exact.rs` pins the value encoding on PostgreSQL 15, 18 and 19, and `hardening.rs` checks that hostile public functions do not reach the server's own SQL.
 - `docker/initdb/`: seed SQL for the test stack (roles, schemas, TimescaleDB data). `55_hostile.sql` creates the hostile functions, and `56_test_objects.sql` creates the objects the tests use.
+- `docker/tls-initdb/`: first-start script for the `pgtls` service, which generates the test CA, server and client certificates and keys with `openssl`.
 - `sql/log_reader.sql`: the operator's setup for the server log functions.
 - `scripts/`: `verify.sh`, `integration.sh`, `docker-smoke.sh`.
 - `Dockerfile`, `docker-compose.yml` (example deployment), `docker-compose.test.yml` (test stack), `deny.toml` (cargo-deny policy).
@@ -79,7 +80,8 @@ Each of these looks harmless and breaks a guarantee or a test.
 - **Unqualified catalog names.** A bare `pg_class` or `format_type` in introspection SQL resolves through the role's `search_path`. Write `pg_catalog.` in front of every catalog name.
 - **Parse-tree depth.** The gate walks the tree without recursion and caps depth at 5000. Adding recursion, or raising the cap without a test, risks a stack overflow.
 - **Allow-list growth.** A new node type or function on the allow-list needs a corpus entry and a reason. Denying is the default.
-- **Test stack ports.** The ports 15432 to 15434 appear in both `docker-compose.test.yml` and `tests/common/mod.rs`. Change both or neither.
+- **Test stack ports.** The ports 15432 to 15435 appear in both `docker-compose.test.yml` and `tests/common/mod.rs`. Change both or neither.
+- **No certificate or key in the repo.** The `pgtls` service generates the test CA, certificates and keys at its first start (`docker/tls-initdb/10_tls.sh`), and the tests read them back. Never commit a `.pem`, `.crt` or `.key` file, or a key literal.
 - **Test stack required.** The integration tests fail without the stack. `verify.sh` does not need it.
 - **Container bind address.** The image sets `MCP_HOST=0.0.0.0` so Docker's port mapping works. Changing it breaks the container, and the published port must stay on `127.0.0.1`.
 - **Loopback origins.** Loopback origins are always allowed by design. Do not remove that exception without updating `SECURITY.md`.

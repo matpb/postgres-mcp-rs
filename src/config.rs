@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use rustls::ClientConfig;
 
-use crate::pg::tls::{self, SslMode};
+use crate::pg::tls::{self, PemSource, SslMode, TlsSources};
 use crate::pg::wire::{AuthPolicy, ConnectConfig};
 
 const DEFAULT_PORT: u16 = 8432;
@@ -41,12 +41,17 @@ const DATABASE_FIELDS: &[&str] = &[
     "password_file",
     "sslmode",
     "sslrootcert",
+    "sslrootcert_pem",
+    "sslcert",
+    "sslcert_pem",
+    "sslkey",
+    "sslkey_pem",
     "require_auth",
     "max_connections",
     "statement_timeout_ms",
     "lock_timeout_ms",
 ];
-/// Fields that describe the connection itself, so they cannot accompany `url`.
+/// Fields that describe the connection itself, so they cannot accompany `url`. Inline PEM fields may.
 const URL_EXCLUSIVE_FIELDS: &[&str] = &[
     "host",
     "port",
@@ -55,6 +60,8 @@ const URL_EXCLUSIVE_FIELDS: &[&str] = &[
     "password",
     "sslmode",
     "sslrootcert",
+    "sslcert",
+    "sslkey",
     "require_auth",
 ];
 
@@ -77,6 +84,11 @@ const ENV_VARS: &[&str] = &[
     "PGPASSWORD",
     "PGSSLMODE",
     "PGSSLROOTCERT",
+    "PGSSLCERT",
+    "PGSSLKEY",
+    "PGSSLROOTCERT_PEM",
+    "PGSSLCERT_PEM",
+    "PGSSLKEY_PEM",
     "PGREQUIREAUTH",
     "PGAPPNAME",
     "MAX_ROWS",
@@ -115,6 +127,8 @@ pub struct DatabaseConfig {
     pub lock_timeout_ms: u64,
     /// TLS configuration built by `Config::prepare_tls`; None until then or when sslmode is disable.
     pub tls: Option<Arc<ClientConfig>>,
+    /// The root and client certificate settings that `prepare_tls` reads; inline PEM stays redacted in Debug.
+    pub tls_sources: TlsSources,
 }
 
 impl fmt::Debug for DatabaseConfig {
@@ -198,7 +212,7 @@ struct Target {
     user: String,
     password: Option<String>,
     ssl_mode: SslMode,
-    ssl_root_cert: Option<PathBuf>,
+    tls: TlsSources,
     auth: AuthPolicy,
     /// `application_name` from a URL query, used when PGAPPNAME is unset.
     application_name: Option<String>,
@@ -232,11 +246,8 @@ impl Config {
             if db.connect.ssl_mode == SslMode::Disable {
                 continue;
             }
-            let config = tls::startup_client_config(
-                db.connect.ssl_mode,
-                db.connect.ssl_root_cert.as_deref(),
-            )
-            .map_err(|reason| ConfigError(format!("{}: {reason}", db.name)))?;
+            let config = tls::startup_client_config(db.connect.ssl_mode, &db.tls_sources)
+                .map_err(|reason| ConfigError(format!("{}: {reason}", db.name)))?;
             db.tls = Some(config);
         }
         Ok(())
@@ -366,18 +377,99 @@ fn parse_port(name: &str, raw: &str) -> Result<u16, ConfigError> {
     }
 }
 
-/// verify-ca checks the chain only, so it needs a root certificate to check against.
-fn require_root_for_verify_ca(
-    name: &str,
+/// The TLS settings of one database as written; a file and an inline value of one item stay apart.
+#[derive(Default)]
+struct TlsInputs {
+    root_file: Option<PathBuf>,
+    root_pem: Option<String>,
+    cert_file: Option<PathBuf>,
+    cert_pem: Option<String>,
+    key_file: Option<PathBuf>,
+    key_pem: Option<String>,
+}
+
+/// The setting names that TLS rule errors are reported under.
+struct TlsNames<'a> {
+    sslmode: &'a str,
+    root: &'a str,
+    cert: &'a str,
+    key: &'a str,
+}
+
+/// Applies the TLS rules of one database and returns its sources.
+fn resolve_tls(
+    names: &TlsNames,
     mode: SslMode,
-    has_root: bool,
-) -> Result<(), ConfigError> {
-    if mode == SslMode::VerifyCa && !has_root {
+    inputs: TlsInputs,
+) -> Result<TlsSources, ConfigError> {
+    let cert_set = inputs.cert_file.is_some() || inputs.cert_pem.is_some();
+    let key_set = inputs.key_file.is_some() || inputs.key_pem.is_some();
+    if cert_set != key_set {
+        let name = if cert_set { names.cert } else { names.key };
         return Err(ConfigError(format!(
-            "{name}: sslmode=verify-ca needs sslrootcert"
+            "{name}: sslcert and sslkey must be set together"
         )));
     }
-    Ok(())
+    if inputs.root_file.is_some() && inputs.root_pem.is_some() {
+        return Err(ConfigError(format!(
+            "{}: sslrootcert and sslrootcert_pem cannot both be set",
+            names.root
+        )));
+    }
+    if inputs.cert_file.is_some() && inputs.cert_pem.is_some() {
+        return Err(ConfigError(format!(
+            "{}: sslcert and sslcert_pem cannot both be set",
+            names.cert
+        )));
+    }
+    if inputs.key_file.is_some() && inputs.key_pem.is_some() {
+        return Err(ConfigError(format!(
+            "{}: sslkey and sslkey_pem cannot both be set",
+            names.key
+        )));
+    }
+    if cert_set && mode == SslMode::Disable {
+        return Err(ConfigError(format!(
+            "{}: sslcert needs TLS: sslmode must not be disable",
+            names.sslmode
+        )));
+    }
+    let has_root = inputs.root_file.is_some() || inputs.root_pem.is_some();
+    // verify-ca checks the chain only, so it needs a root certificate to check against.
+    if mode == SslMode::VerifyCa && !has_root {
+        return Err(ConfigError(format!(
+            "{}: sslmode=verify-ca needs sslrootcert",
+            names.sslmode
+        )));
+    }
+    Ok(TlsSources {
+        root: pick(inputs.root_file, inputs.root_pem),
+        client_cert: pick(inputs.cert_file, inputs.cert_pem),
+        client_key: pick(inputs.key_file, inputs.key_pem),
+    })
+}
+
+/// The one source of an item; both forms set is rejected earlier.
+fn pick(file: Option<PathBuf>, pem: Option<String>) -> Option<PemSource> {
+    match (file, pem) {
+        (Some(path), _) => Some(PemSource::File(path)),
+        (None, Some(text)) => Some(PemSource::Inline(text)),
+        (None, None) => None,
+    }
+}
+
+/// Inline PEM variables; a literal backslash-n becomes a newline, since env values cannot hold one.
+fn env_pem(get: &dyn Fn(&str) -> Option<String>) -> TlsInputs {
+    TlsInputs {
+        root_pem: var(get, "PGSSLROOTCERT_PEM").map(unescape_newlines),
+        cert_pem: var(get, "PGSSLCERT_PEM").map(unescape_newlines),
+        key_pem: var(get, "PGSSLKEY_PEM").map(unescape_newlines),
+        ..TlsInputs::default()
+    }
+}
+
+fn unescape_newlines(raw: String) -> String {
+    raw.replace("\\n", "\n")
 }
 
 /// Parses a `require_auth` comma list; each item names one method the server may use.
@@ -574,7 +666,7 @@ fn databases(
         (None, Some(json)) => json_databases("PG_DATABASES", &json, defaults, app_name),
         (None, None) => {
             if let Some(url) = var(get, "DATABASE_URL") {
-                let target = url_target("DATABASE_URL", &url)?;
+                let target = url_target("DATABASE_URL", &url, env_pem(get))?;
                 let name = resolve_name(get, &target.database, "DATABASE_URL")?;
                 Ok(vec![env_database(name, target, defaults, app_name)])
             } else if let Some(database) = var(get, "PGDATABASE") {
@@ -601,8 +693,19 @@ fn libpq_database(
         Some(raw) => parse_ssl_mode("PGSSLMODE", &raw)?,
         None => SslMode::Prefer,
     };
-    let ssl_root_cert = var(get, "PGSSLROOTCERT").map(PathBuf::from);
-    require_root_for_verify_ca("PGSSLMODE", ssl_mode, ssl_root_cert.is_some())?;
+    let inputs = TlsInputs {
+        root_file: var(get, "PGSSLROOTCERT").map(PathBuf::from),
+        cert_file: var(get, "PGSSLCERT").map(PathBuf::from),
+        key_file: var(get, "PGSSLKEY").map(PathBuf::from),
+        ..env_pem(get)
+    };
+    let names = TlsNames {
+        sslmode: "PGSSLMODE",
+        root: "PGSSLROOTCERT",
+        cert: "PGSSLCERT",
+        key: "PGSSLKEY",
+    };
+    let tls = resolve_tls(&names, ssl_mode, inputs)?;
     let auth = match var(get, "PGREQUIREAUTH") {
         Some(raw) => parse_require_auth("PGREQUIREAUTH", &raw)?,
         None => AuthPolicy::default(),
@@ -617,7 +720,7 @@ fn libpq_database(
         user,
         password: var(get, "PGPASSWORD"),
         ssl_mode,
-        ssl_root_cert,
+        tls,
         auth,
         application_name: None,
         connect_timeout: None,
@@ -656,6 +759,7 @@ fn env_database(
     app_name: Option<&str>,
 ) -> DatabaseConfig {
     let auth = target.auth.clone();
+    let tls_sources = target.tls.clone();
     DatabaseConfig {
         name,
         connect: connect_config(target, app_name),
@@ -664,10 +768,16 @@ fn env_database(
         statement_timeout_ms: defaults.statement_timeout_ms,
         lock_timeout_ms: defaults.lock_timeout_ms,
         tls: None,
+        tls_sources,
     }
 }
 
 fn connect_config(target: Target, app_name: Option<&str>) -> ConnectConfig {
+    // A root file is also passed to the wire client, which reads it only without a prepared configuration.
+    let ssl_root_cert = match &target.tls.root {
+        Some(PemSource::File(path)) => Some(path.clone()),
+        _ => None,
+    };
     let application_name = app_name
         .map(str::to_owned)
         .or(target.application_name)
@@ -694,7 +804,7 @@ fn connect_config(target: Target, app_name: Option<&str>) -> ConnectConfig {
         user: target.user,
         password: target.password,
         ssl_mode: target.ssl_mode,
-        ssl_root_cert: target.ssl_root_cert,
+        ssl_root_cert,
         connect_timeout: target
             .connect_timeout
             .unwrap_or(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)),
@@ -702,8 +812,8 @@ fn connect_config(target: Target, app_name: Option<&str>) -> ConnectConfig {
     }
 }
 
-/// Parses a `postgres://` or `postgresql://` URL. Errors never echo the URL.
-fn url_target(label: &str, raw: &str) -> Result<Target, ConfigError> {
+/// Parses a `postgres://` or `postgresql://` URL, with the inline PEM settings the caller holds. Errors never echo the URL.
+fn url_target(label: &str, raw: &str, pem: TlsInputs) -> Result<Target, ConfigError> {
     let invalid = || ConfigError(format!("{label}: not a valid postgres:// URL"));
     let url = Url::parse(raw).map_err(|_| invalid())?;
     if !matches!(url.scheme(), "postgres" | "postgresql") {
@@ -733,6 +843,8 @@ fn url_target(label: &str, raw: &str) -> Result<Target, ConfigError> {
 
     let mut sslmode = None;
     let mut sslrootcert = None;
+    let mut sslcert = None;
+    let mut sslkey = None;
     let mut require_auth = None;
     let mut application_name = None;
     let mut connect_timeout = None;
@@ -740,6 +852,8 @@ fn url_target(label: &str, raw: &str) -> Result<Target, ConfigError> {
         match key.as_ref() {
             "sslmode" => sslmode = Some(value.into_owned()),
             "sslrootcert" => sslrootcert = Some(PathBuf::from(value.as_ref())),
+            "sslcert" => sslcert = Some(PathBuf::from(value.as_ref())),
+            "sslkey" => sslkey = Some(PathBuf::from(value.as_ref())),
             "require_auth" => require_auth = Some(value.into_owned()),
             "application_name" => application_name = Some(value.into_owned()),
             "connect_timeout" => connect_timeout = Some(value.into_owned()),
@@ -754,7 +868,19 @@ fn url_target(label: &str, raw: &str) -> Result<Target, ConfigError> {
         Some(raw) => parse_ssl_mode(&format!("{label}: sslmode"), &raw)?,
         None => SslMode::Prefer,
     };
-    require_root_for_verify_ca(label, ssl_mode, sslrootcert.is_some())?;
+    let inputs = TlsInputs {
+        root_file: sslrootcert,
+        cert_file: sslcert,
+        key_file: sslkey,
+        ..pem
+    };
+    let names = TlsNames {
+        sslmode: label,
+        root: label,
+        cert: label,
+        key: label,
+    };
+    let tls = resolve_tls(&names, ssl_mode, inputs)?;
     let auth = match require_auth {
         Some(raw) => parse_require_auth(&format!("{label}: require_auth"), &raw)?,
         None => AuthPolicy::default(),
@@ -777,7 +903,7 @@ fn url_target(label: &str, raw: &str) -> Result<Target, ConfigError> {
         user,
         password,
         ssl_mode,
-        ssl_root_cert: sslrootcert,
+        tls,
         auth,
         application_name,
         connect_timeout,
@@ -887,7 +1013,7 @@ fn json_database(
                     "{label}: \"{key}\" cannot be combined with \"url\""
                 )));
             }
-            let mut target = url_target(&label, &url)?;
+            let mut target = url_target(&label, &url, json_pem(map, &label)?)?;
             if let Some(path) = json_string(map, "password_file", &label)? {
                 target.password = read_password_file(&format!("{label}: password_file"), &path)?;
             }
@@ -896,6 +1022,7 @@ fn json_database(
         None => json_discrete_target(map, &label)?,
     };
     let auth = target.auth.clone();
+    let tls_sources = target.tls.clone();
     Ok(DatabaseConfig {
         name,
         connect: connect_config(target, app_name),
@@ -904,6 +1031,17 @@ fn json_database(
         statement_timeout_ms,
         lock_timeout_ms,
         tls: None,
+        tls_sources,
+    })
+}
+
+/// The inline PEM fields of a JSON entry; they may accompany `url` as well as the discrete fields.
+fn json_pem(map: &Map<String, Value>, label: &str) -> Result<TlsInputs, ConfigError> {
+    Ok(TlsInputs {
+        root_pem: json_string(map, "sslrootcert_pem", label)?,
+        cert_pem: json_string(map, "sslcert_pem", label)?,
+        key_pem: json_string(map, "sslkey_pem", label)?,
+        ..TlsInputs::default()
     })
 }
 
@@ -934,8 +1072,19 @@ fn json_discrete_target(map: &Map<String, Value>, label: &str) -> Result<Target,
         Some(raw) => parse_ssl_mode(&format!("{label}: sslmode"), &raw)?,
         None => SslMode::Prefer,
     };
-    let ssl_root_cert = json_string(map, "sslrootcert", label)?.map(PathBuf::from);
-    require_root_for_verify_ca(label, ssl_mode, ssl_root_cert.is_some())?;
+    let inputs = TlsInputs {
+        root_file: json_string(map, "sslrootcert", label)?.map(PathBuf::from),
+        cert_file: json_string(map, "sslcert", label)?.map(PathBuf::from),
+        key_file: json_string(map, "sslkey", label)?.map(PathBuf::from),
+        ..json_pem(map, label)?
+    };
+    let names = TlsNames {
+        sslmode: label,
+        root: label,
+        cert: label,
+        key: label,
+    };
+    let tls = resolve_tls(&names, ssl_mode, inputs)?;
     let auth = match json_string(map, "require_auth", label)? {
         Some(raw) => parse_require_auth(&format!("{label}: require_auth"), &raw)?,
         None => AuthPolicy::default(),
@@ -947,7 +1096,7 @@ fn json_discrete_target(map: &Map<String, Value>, label: &str) -> Result<Target,
         user,
         password,
         ssl_mode,
-        ssl_root_cert,
+        tls,
         auth,
         application_name: None,
         connect_timeout: None,

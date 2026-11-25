@@ -176,7 +176,7 @@ The server reads only environment variables. It reads them when it starts in `ht
 |----------|---------|---------|
 | `PG_DATABASES` | unset | JSON array of database objects. The most complete form, and the only one that holds several databases. See below. |
 | `PG_DATABASES_FILE` | unset | Path to a file with the same JSON array. Cannot be combined with `PG_DATABASES`. |
-| `DATABASE_URL` | unset | One `postgres://` or `postgresql://` URL, whose query may hold only `sslmode`, `sslrootcert`, `require_auth`, `application_name` and `connect_timeout`. Takes precedence over the `PG*` variables. |
+| `DATABASE_URL` | unset | One `postgres://` or `postgresql://` URL, whose query may hold only `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `require_auth`, `application_name` and `connect_timeout`. Takes precedence over the `PG*` variables. Inline PEM for this form comes from `PGSSLROOTCERT_PEM`, `PGSSLCERT_PEM` and `PGSSLKEY_PEM`. |
 | `PG_NAME` | database name | Connection name for the `DATABASE_URL` or `PGDATABASE` form. Required when the database name has characters outside A-Z, a-z, 0-9, `_` and `-`. |
 | `PGHOST` | `127.0.0.1` | Host for the `PG*` form. This is not libpq's socket default. |
 | `PGPORT` | `5432` | Port for the `PG*` form. |
@@ -185,6 +185,11 @@ The server reads only environment variables. It reads them when it starts in `ht
 | `PGPASSWORD` | unset | Password for the `PG*` form. |
 | `PGSSLMODE` | `prefer` | TLS mode for the `PG*` form. See [TLS](#tls). |
 | `PGSSLROOTCERT` | bundled roots | PEM file of trusted CA certificates for the `PG*` form. |
+| `PGSSLCERT` | unset | Client certificate, a PEM file, for the `PG*` form. Needs `PGSSLKEY`. See [TLS with a private certificate authority](#tls-with-a-private-certificate-authority). |
+| `PGSSLKEY` | unset | Unencrypted private key, a PEM file, for `PGSSLCERT`. |
+| `PGSSLROOTCERT_PEM` | unset | Trusted CA certificates as inline PEM, for the `DATABASE_URL` and `PG*` forms. Cannot be combined with `PGSSLROOTCERT`. A literal `\n` is read as a newline. |
+| `PGSSLCERT_PEM` | unset | Client certificate as inline PEM, with `PGSSLKEY_PEM`, for the `DATABASE_URL` and `PG*` forms. Cannot be combined with `PGSSLCERT`. |
+| `PGSSLKEY_PEM` | unset | Unencrypted private key as inline PEM, with `PGSSLCERT_PEM`, for the `DATABASE_URL` and `PG*` forms. Cannot be combined with `PGSSLKEY`. |
 | `PGREQUIREAUTH` | `scram-sha-256,none` | Authentication methods the server may use for the `PG*` form. See [Authentication to PostgreSQL](#authentication-to-postgresql). |
 | `PGAPPNAME` | `postgres-mcp` | `application_name` for every connection. Overrides an `application_name` in a URL. |
 
@@ -224,11 +229,13 @@ A JSON entry takes these fields. An unknown field, or a field of the wrong type,
 | Field | Meaning |
 |-------|---------|
 | `name` | Required. The connection name, 1 to 63 characters of A-Z, a-z, 0-9, `_` or `-`. Names must be unique. |
-| `url` | A `postgres://` URL. Its query may hold only `sslmode`, `sslrootcert`, `require_auth`, `application_name` and `connect_timeout` (1 to 3600 seconds). Cannot be combined with `host`, `port`, `database`, `user`, `password`, `sslmode`, `sslrootcert` or `require_auth`. |
+| `url` | A `postgres://` URL. Its query may hold only `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `require_auth`, `application_name` and `connect_timeout` (1 to 3600 seconds). Cannot be combined with `host`, `port`, `database`, `user`, `password`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey` or `require_auth`. The inline PEM fields below may accompany it. |
 | `host`, `port` | Host (default `127.0.0.1`) and port (default 5432, 1 to 65535). |
 | `database`, `user` | Required in the discrete form. |
 | `password`, `password_file` | At most one. `password_file` is read at startup, and its trailing line break is dropped. An empty file means no password. With `url`, `password_file` replaces the password in the URL. |
 | `sslmode`, `sslrootcert` | As for the `PG*` variables. |
+| `sslcert`, `sslkey` | Client certificate and its unencrypted key, PEM files, as for `PGSSLCERT` and `PGSSLKEY`. Cannot be combined with `url`. |
+| `sslrootcert_pem`, `sslcert_pem`, `sslkey_pem` | The same items as inline PEM text, as for the `PGSSL*_PEM` variables. A JSON string holds real newlines or `\n` escapes. Each may be used with `url` or with the discrete fields. |
 | `require_auth` | The authentication methods the server may use, as for `PGREQUIREAUTH`. Cannot be combined with `url`. |
 | `max_connections` | Pooled connections for this database, 1 to 64. Default 4. |
 | `statement_timeout_ms`, `lock_timeout_ms` | Per-database timeouts, with the same bounds as the global variables below. |
@@ -247,7 +254,46 @@ The `*_FILE` variants keep secrets out of the environment. `API_KEY_FILE` reads 
 | `verify-ca` | TLS, and the certificate must chain to a trusted root. The host name is not checked. |
 | `verify-full` | TLS, and the certificate must chain to a trusted root and match the host name. |
 
-The trusted roots are the PEM file named by `sslrootcert` (or `PGSSLROOTCERT`) when set, and otherwise the bundled Mozilla root set (webpki-roots), not the operating system store. A private certificate authority therefore needs `sslrootcert`. `verify-ca` needs `sslrootcert`: without it the configuration fails with an error that ends `sslmode=verify-ca needs sslrootcert`. `verify-full` without `sslrootcert` checks against the bundled roots. The file is read once, when the server starts. A file that cannot be read, or holds no certificate, stops startup with a configuration error. Use `verify-full` for any database that is reached over a network.
+The trusted roots are the PEM file named by `sslrootcert` (or `PGSSLROOTCERT`), or the inline PEM named by `sslrootcert_pem` (or `PGSSLROOTCERT_PEM`), when one is set, and otherwise the bundled Mozilla root set (webpki-roots), not the operating system store. A private certificate authority therefore needs `sslrootcert` or its inline form. `verify-ca` needs one of them: without it the configuration fails with an error that ends `sslmode=verify-ca needs sslrootcert`. `verify-full` without a root checks against the bundled roots. Files and inline PEM are read once, when the server starts. A file that cannot be read, or PEM that holds no certificate, stops startup with a configuration error. Use `verify-full` for any database that is reached over a network.
+
+### TLS with a private certificate authority
+
+A server whose certificate is signed by your own CA is verified with that CA certificate, given as `sslrootcert`, with `sslmode=verify-full`:
+
+```bash
+export DATABASE_URL='postgres://mcp_reader:change-me-reader-password@db.example.com:5432/appdb?sslmode=verify-full&sslrootcert=/etc/ssl/private-ca.pem'
+```
+
+- The host name in the URL must be one of the names in the server certificate. An IP address fails unless the certificate lists that address. `verify-ca` checks the chain without the name, and only where that is acceptable.
+- The inline alternative avoids a mounted file. In a JSON entry use `sslrootcert_pem`. For the `DATABASE_URL` and `PG*` forms use `PGSSLROOTCERT_PEM`, where a literal `\n` is read as a newline. Give one form of an item, never both.
+- A server that requires a client certificate, with `hostssl ... clientcert=verify-full` in `pg_hba.conf` or with `cert` authentication, needs `sslcert` and `sslkey`, or `PGSSLCERT` and `PGSSLKEY`, or the `_PEM` forms. The key must be an unencrypted PEM key: PKCS#8, PKCS#1 (RSA) or SEC1 (EC). An encrypted key stops startup. The certificate file holds the leaf certificate first, and may be followed by intermediate certificates. It must match the key. The certificate is offered whenever the server asks for one. Client certificates need a `sslmode` other than `disable`. With `sslmode=prefer`, a server that refuses TLS gets a plain connection, and no certificate is sent.
+- All these settings are read once at startup. Keys are never written to the log or to an error text.
+
+Run the server in a container with the CA file mounted read-only:
+
+```bash
+docker run -d --name postgres-mcp \
+  -p 127.0.0.1:8432:8432 \
+  -v /path/to/ca.pem:/etc/postgres-mcp/ca.pem:ro \
+  -e 'DATABASE_URL=postgres://mcp_reader:change-me-reader-password@db.example.com:5432/appdb?sslmode=verify-full&sslrootcert=/etc/postgres-mcp/ca.pem' \
+  -e 'API_KEY=change-me-to-a-random-key-of-16-plus-chars' \
+  postgres-mcp:local
+```
+
+The same with a Compose `secrets:` entry, which mounts the file at `/run/secrets/db_ca`:
+
+```yaml
+services:
+  postgres-mcp:
+    image: postgres-mcp:local
+    environment:
+      DATABASE_URL: postgres://mcp_reader:change-me-reader-password@db.example.com:5432/appdb?sslmode=verify-full&sslrootcert=/run/secrets/db_ca
+    secrets:
+      - db_ca
+secrets:
+  db_ca:
+    file: ./ca.pem
+```
 
 ### Authentication to PostgreSQL
 
@@ -580,12 +626,12 @@ For per-person access, policies and audit across many MCP servers, put a gateway
 Three scripts prove a change. None of them needs a CI service, because the project has no CI configuration by design. Run the first two before you open a pull request.
 
 - **`scripts/verify.sh`** needs no database. It runs `cargo fmt --check`, `cargo clippy` with warnings as errors, the library and non-database test targets (`lib`, `config`, `encode`, `gate` and `http_guard`), `cargo audit` and `cargo deny check`. The last two need `cargo-audit` and `cargo-deny` installed.
-- **`scripts/integration.sh`** starts [`docker-compose.test.yml`](docker-compose.test.yml), runs every cargo test target with `--test-threads=4`, and removes the stack afterwards. Pass `--keep` to leave the stack running for the next run. The stack has three PostgreSQL servers on loopback: `timescaledb-ha` on PostgreSQL 18 with TimescaleDB 2.32.1 on port 15432, `postgres` 19 on port 15433 (csvlog) and `postgres` 15 on port 15434. The TimescaleDB server also preloads `pg_stat_statements` and pgaudit. The databases are seeded with the `app`, `shop` and `types` schemas, a `metrics` schema on the TimescaleDB server, and test roles with throwaway passwords: `mcp_ro`, which has the broad profile (`pg_read_all_data` and `pg_monitor`), `mcp_strict`, which has per-schema `SELECT` grants and `pg_read_all_stats`, and `mcp_min`, which may select only from `app.items`.
+- **`scripts/integration.sh`** starts [`docker-compose.test.yml`](docker-compose.test.yml), runs every cargo test target with `--test-threads=4`, and removes the stack afterwards. Pass `--keep` to leave the stack running for the next run. The stack has four PostgreSQL servers on loopback: `timescaledb-ha` on PostgreSQL 18 with TimescaleDB 2.32.1 on port 15432, `postgres` 19 on port 15433 (csvlog), `postgres` 15 on port 15434 and `postgres` 19 with TLS on port 15435 (`pgtls`). The `pgtls` server has a private CA, a server certificate for `localhost` and `pgtls.test.example`, and client certificates for the `mcp_cert` role. [`docker/tls-initdb/10_tls.sh`](docker/tls-initdb/10_tls.sh) generates them with `openssl` at the first start, so no key or certificate is in the repository. The TimescaleDB server also preloads `pg_stat_statements` and pgaudit. The databases are seeded with the `app`, `shop` and `types` schemas, a `metrics` schema on the TimescaleDB server, and test roles with throwaway passwords: `mcp_ro`, which has the broad profile (`pg_read_all_data` and `pg_monitor`), `mcp_strict`, which has per-schema `SELECT` grants and `pg_read_all_stats`, and `mcp_min`, which may select only from `app.items`.
 - **`scripts/docker-smoke.sh`** builds the image as `postgres-mcp:smoke`, runs it against the test database on PostgreSQL 19, and checks the health route, the 401 without a key, `tools/list`, a `SELECT`, a refused `INSERT`, one stdio `tools/call` round trip, the absence of a shell and the read-only root filesystem.
 
-The cargo test targets are these. `lib` (the unit tests in `src/`), `config`, `encode`, `gate`, `http_guard`, `tls` and `wire_fake` need no database. `wire`, `session`, `types_exact`, `hardening`, `schema_tools`, `monitor_tools`, `timescale_tools`, `logs_tools`, `mcp_http`, `mcp_stdio` and `resources` need the test stack. `tests/types_exact.rs` checks the value-encoding table above against PostgreSQL 15, 18 and 19. `tls` runs a server in-process with certificates made at test time, and `wire_fake` runs the wire client against scripted servers. The test databases are seeded from [`docker/initdb`](docker/initdb), and the tests do not run DDL, so an object that a test needs belongs in the seed.
+The cargo test targets are these. `lib` (the unit tests in `src/`), `config`, `encode`, `gate`, `http_guard`, `tls` and `wire_fake` need no database. `wire`, `session`, `types_exact`, `hardening`, `schema_tools`, `monitor_tools`, `timescale_tools`, `logs_tools`, `mcp_http`, `mcp_stdio`, `resources` and `tls_real` need the test stack. `tls_real` runs TLS against `pgtls` through the wire client, the pool and the binary. `tests/types_exact.rs` checks the value-encoding table above against PostgreSQL 15, 18 and 19. `tls` runs a server in-process with certificates made at test time, and `wire_fake` runs the wire client against scripted servers. The test databases are seeded from [`docker/initdb`](docker/initdb), and the tests do not run DDL, so an object that a test needs belongs in the seed.
 
-Tests that need a database connect only to the test stack on loopback ports 15432 to 15434. The library and non-database tests run without any database.
+Tests that need a database connect only to the test stack on loopback ports 15432 to 15435. The library and non-database tests run without any database.
 
 ## Troubleshooting
 
@@ -598,6 +644,9 @@ Tests that need a database connect only to the test stack on loopback ports 1543
 | HTTP 403 with `Forbidden: Host header is not allowed`, typically behind a reverse proxy | The `Host` header names a host that is neither loopback nor in `ALLOWED_HOSTS`. | Add the public host name to `ALLOWED_HOSTS`. |
 | `Database "appdb" is unavailable: authentication failed` | The password or user is wrong, or the server asks for MD5 or cleartext and `require_auth` does not allow that method. | Check the credentials. If the server uses MD5 or cleartext, list the method in `require_auth`; cleartext also needs TLS. See [Authentication to PostgreSQL](#authentication-to-postgresql). |
 | `Database "appdb" is unavailable: TLS negotiation failed` | The TLS handshake failed: the server does not offer TLS, or its certificate did not verify. | Use an `sslmode` the server supports. For `verify-ca` or `verify-full`, set `sslrootcert` to the CA that signed the server certificate; a private CA needs it. See [TLS](#tls). |
+| `Database "appdb" is unavailable: TLS negotiation failed` with `sslmode=verify-full`, and the URL names an IP address or a host that the certificate does not list | Certificate name mismatch: the host name is not one of the names in the server certificate. | Connect with a name the certificate lists, or reissue the certificate with that name. `verify-ca` checks the chain without the name. See [TLS with a private certificate authority](#tls-with-a-private-certificate-authority). |
+| `Database "appdb" is unavailable: TLS negotiation failed` with a server certificate from a private CA | Unknown issuer: `sslrootcert` is missing, or names a CA other than the one that signed the server certificate. | Set `sslrootcert`, or `sslrootcert_pem` in JSON, to the CA certificate that signed the server certificate. |
+| `Database "appdb" is unavailable: authentication failed`, when the server requires a client certificate | The client sent no certificate, or none that the server trusts. The server's reply is `connection requires a valid client certificate` and is written to the server log only. | Set `sslcert` and `sslkey` (or `PGSSLCERT` and `PGSSLKEY`, or the `_PEM` forms) to a certificate that the server's CA signed. With `clientcert=verify-full` its CN must equal the role name. A certificate from an untrusted CA gives `TLS negotiation failed` instead. |
 | Startup stops with `sslmode=verify-ca needs sslrootcert` | `verify-ca` checks the chain against a root certificate, and none was given. | Set `sslrootcert` to the CA file. |
 | `Query rejected: Parameter placeholders ($1) are not supported. Inline the value.` | The SQL contains `$1`. `execute_query` takes no bind values. | Write the values into the SQL. |
 | `Query rejected: Send exactly one statement per call; found 2.` | The call holds more than one statement. | Send one statement per call. One trailing `;` is fine. |
@@ -615,7 +664,8 @@ Tests that need a database connect only to the test stack on loopback ports 1543
 
 - **One statement per call.** A call that sends two statements is refused. `execute_query` refuses placeholders (`$1`). `explain_query` accepts them only with `generic_plan`, and then binds no values (see [Placeholders and generic plans](#placeholders-and-generic-plans)).
 - **Authentication to PostgreSQL.** SCRAM-SHA-256 is used without channel binding (SCRAM-SHA-256-PLUS is not implemented). MD5 and cleartext passwords are refused unless `require_auth` lists them, and cleartext also needs TLS. See [Authentication to PostgreSQL](#authentication-to-postgresql).
-- **Certificate checks.** `prefer` and `require` do not verify the server certificate. Use `verify-ca` or `verify-full` wherever the network is not trusted.
+- **Certificate checks.** `prefer` and `require` do not verify the server certificate. Use `verify-ca` or `verify-full` wherever the network is not trusted. A private certificate authority needs `sslrootcert` or `sslrootcert_pem`, and client certificates need an unencrypted key, as described in [TLS with a private certificate authority](#tls-with-a-private-certificate-authority).
+- **Encrypted private keys are not supported.** Give `sslkey` an unencrypted PEM key. An encrypted key stops startup.
 - **No LISTEN, NOTIFY or COPY.** The gate refuses them.
 - **Large objects.** `lo_get(oid)` reads a large object through `execute_query`, and the value limits apply to its bytes. Writing, importing and exporting large objects are refused.
 - **Transaction-mode poolers are not supported.** PgBouncer in transaction mode and similar proxies are untested. Connect the server to PostgreSQL directly or through a session pool.

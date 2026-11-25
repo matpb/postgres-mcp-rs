@@ -6,6 +6,8 @@ services:
     environment:
       # Example: postgres://reader:<password>@db.example.com:5432/app?sslmode=verify-full
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      # For a private CA, mount its file (see volumes below) and set sslrootcert to the mount path in DATABASE_URL.
+      # Client certificates are mounted the same way, and sslcert and sslkey name the mount paths.
       # Optional API key, at least 16 characters; empty leaves the endpoint open.
       API_KEY: ${API_KEY:-}
       # Optional limits, uncomment to pass them through from the host environment.
@@ -26,6 +28,8 @@ services:
     user: "65532:65532"
     tmpfs:
       - /tmp
+    # volumes:
+    #   - /path/to/ca.pem:/etc/postgres-mcp/ca.pem:ro
     restart: unless-stopped
     pids_limit: 256
     mem_limit: 512m

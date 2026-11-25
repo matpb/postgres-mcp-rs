@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use postgres_mcp::config::Config;
 use postgres_mcp::pg::pool::Pool;
-use postgres_mcp::pg::tls::SslMode;
+use postgres_mcp::pg::tls::{PemSource, SslMode, TlsSources, startup_client_config};
 use postgres_mcp::pg::wire::{AuthPolicy, ConnectConfig, Connection, WireError};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
-use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -441,4 +442,139 @@ async fn prefer_uses_tls_when_server_answers_s() {
     assert!(conn.is_ok(), "{:?}", conn.err());
     let served = task.await.expect("server");
     assert!(served.handshake_done);
+}
+
+/// A CA, a server certificate for localhost and a client certificate for mcp_cert, both signed by that CA.
+struct Mtls {
+    ca_pem: String,
+    ca_der: CertificateDer<'static>,
+    server_chain: Vec<CertificateDer<'static>>,
+    server_key: PrivateKeyDer<'static>,
+    client_pem: String,
+    client_key_pem: String,
+}
+
+fn make_mtls() -> Mtls {
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "pgmcp mtls test ca");
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+    let ca_pem = ca_cert.pem();
+    let ca_der = ca_cert.der().clone();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let server_key = KeyPair::generate().expect("server key");
+    let server_params =
+        CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+    let server = server_params
+        .signed_by(&server_key, &issuer)
+        .expect("server cert");
+
+    let client_key = KeyPair::generate().expect("client key");
+    let mut client_params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, "mcp_cert");
+    let client = client_params
+        .signed_by(&client_key, &issuer)
+        .expect("client cert");
+
+    Mtls {
+        ca_pem,
+        ca_der,
+        server_chain: vec![server.der().clone()],
+        server_key: PrivateKeyDer::from(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+        client_pem: client.pem(),
+        client_key_pem: client_key.serialize_pem(),
+    }
+}
+
+/// A server that requires a certificate signed by the CA. It reports whether the client presented one.
+async fn spawn_mtls_server(m: &Mtls) -> (u16, JoinHandle<bool>) {
+    let mut roots = RootCertStore::empty();
+    roots.add(m.ca_der.clone()).expect("the CA is a root");
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("client verifier");
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(m.server_chain.clone(), m.server_key.clone_key())
+            .expect("server cert");
+    let tls = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let task = tokio::spawn(async move {
+        let Ok((mut tcp, _)) = listener.accept().await else {
+            return false;
+        };
+        let mut ssl_request = [0u8; 8];
+        if tcp.read_exact(&mut ssl_request).await.is_err() || tcp.write_all(b"S").await.is_err() {
+            return false;
+        }
+        let Ok(mut stream) = tls.accept(tcp).await else {
+            return false;
+        };
+        let seen = stream.get_ref().1.peer_certificates().is_some();
+        let mut served = Served::default();
+        session(&mut stream, false, &mut served).await;
+        seen
+    });
+    (port, task)
+}
+
+#[tokio::test]
+async fn mutual_tls_presents_the_client_certificate_given_inline() {
+    let m = make_mtls();
+    let (port, task) = spawn_mtls_server(&m).await;
+    let tls = startup_client_config(
+        SslMode::VerifyFull,
+        &TlsSources {
+            root: Some(PemSource::Inline(m.ca_pem.clone())),
+            client_cert: Some(PemSource::Inline(m.client_pem.clone())),
+            client_key: Some(PemSource::Inline(m.client_key_pem.clone())),
+        },
+    )
+    .expect("client TLS is prepared");
+    let conn = Connection::connect_with_tls(
+        &cfg(port, "localhost", SslMode::VerifyFull, None),
+        &AuthPolicy::default(),
+        Some(tls),
+    )
+    .await;
+    assert!(conn.is_ok(), "{:?}", conn.err());
+    assert!(
+        task.await.expect("server"),
+        "the server saw no client certificate"
+    );
+}
+
+#[tokio::test]
+async fn prefer_with_a_client_certificate_falls_back_to_plain_and_sends_none() {
+    let m = make_mtls();
+    let certs = make_certs();
+    let (port, task) = spawn_server(Answer::Plain, certs.self_chain, certs.self_key, false).await;
+    let tls = startup_client_config(
+        SslMode::Prefer,
+        &TlsSources {
+            root: None,
+            client_cert: Some(PemSource::Inline(m.client_pem.clone())),
+            client_key: Some(PemSource::Inline(m.client_key_pem.clone())),
+        },
+    )
+    .expect("client TLS is prepared");
+    let conn = Connection::connect_with_tls(
+        &cfg(port, "localhost", SslMode::Prefer, None),
+        &AuthPolicy::default(),
+        Some(tls),
+    )
+    .await;
+    assert!(conn.is_ok(), "{:?}", conn.err());
+    let served = task.await.expect("server");
+    assert!(!served.handshake_done, "no TLS was negotiated");
 }

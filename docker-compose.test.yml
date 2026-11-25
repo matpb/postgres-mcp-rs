@@ -57,6 +57,20 @@ services:
       timeout: 5s
       retries: 90
 
+  # PostgreSQL 19 with TLS: the certificates are generated at first start by docker/tls-initdb, never committed.
+  pgtls:
+    image: postgres@sha256:aaa10f7ba7328b4a221a6c3184d83eef885bd16bf1f6de864757863156b0a4d1
+    environment: *pg-env
+    ports:
+      - "127.0.0.1:15435:5432"
+    volumes:
+      - ./docker/tls-initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb && psql -U postgres -d appdb -Atc 'select 1 from pgmcp_seed_done' "]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
   pg15:
     image: postgres@sha256:91b9edc40277faf94bc1e3d7ae621b185fa70f3099b94309c4731a8296114870
     environment: *pg-env

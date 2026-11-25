@@ -365,8 +365,8 @@ impl Connection {
     }
 
     async fn send(&mut self, out: &mut BytesMut) -> Result<(), WireError> {
-        self.stream.write_all(out).await?;
-        self.stream.flush().await?;
+        self.stream.write_all(out).await.map_err(transport_error)?;
+        self.stream.flush().await.map_err(transport_error)?;
         out.clear();
         Ok(())
     }
@@ -435,7 +435,11 @@ impl Connection {
                     }
                 }
             }
-            let read = self.stream.read_buf(&mut self.buf).await?;
+            let read = self
+                .stream
+                .read_buf(&mut self.buf)
+                .await
+                .map_err(transport_error)?;
             if read == 0 {
                 return Err(eof());
             }
@@ -1038,7 +1042,8 @@ async fn connect_inner(
     policy: &AuthPolicy,
     prepared: Option<Arc<ClientConfig>>,
 ) -> Result<Connection, WireError> {
-    if cfg.ssl_mode == SslMode::VerifyCa && cfg.ssl_root_cert.is_none() {
+    // A prepared configuration already holds the roots, which may be inline and so have no path here.
+    if cfg.ssl_mode == SslMode::VerifyCa && cfg.ssl_root_cert.is_none() && prepared.is_none() {
         return Err(WireError::Tls("sslmode=verify-ca needs sslrootcert".into()));
     }
     let mut tcp = TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
@@ -1149,6 +1154,17 @@ fn configured_password(cfg: &ConnectConfig) -> Result<&str, WireError> {
 
 fn protocol(e: impl fmt::Display) -> WireError {
     WireError::Protocol(e.to_string())
+}
+
+/// A socket error that carries a rustls error, such as a fatal alert, is a TLS failure rather than a lost connection.
+fn transport_error(error: io::Error) -> WireError {
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        Some(tls) => WireError::Tls(tls.to_string()),
+        None => WireError::Io(error),
+    }
 }
 
 fn unexpected(tag: u8) -> WireError {

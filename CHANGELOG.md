@@ -3,6 +3,12 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- TLS with a private certificate authority: client certificates (`sslcert` and `sslkey`, `PGSSLCERT` and `PGSSLKEY`), inline PEM (`sslrootcert_pem`, `sslcert_pem`, `sslkey_pem` and the `PGSSL*_PEM` variables), all checked once at startup, and a `pgtls` test service on PostgreSQL 19 with TLS.
+
 ## [0.1.0]
 
 ### Added

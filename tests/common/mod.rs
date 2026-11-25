@@ -19,6 +19,8 @@ pub const PORT_18: u16 = 15432;
 pub const PORT_19: u16 = 15433;
 /// PostgreSQL 15.
 pub const PORT_15: u16 = 15434;
+/// PostgreSQL 19 with TLS, a private CA and client certificates (service pgtls).
+pub const PORT_TLS: u16 = 15435;
 pub const DB_USER: &str = "mcp_ro";
 pub const DB_PASSWORD: &str = "test-only-ro";
 pub const DB_NAME: &str = "appdb";
