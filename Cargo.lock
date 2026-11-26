@@ -1278,7 +1278,7 @@ checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
 
 [[package]]
 name = "postgres-mcp-readonly"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "axum",
  "bytes",
@@ -1292,6 +1292,7 @@ dependencies = [
  "rcgen",
  "rmcp",
  "rustls",
+ "rustls-webpki",
  "schemars",
  "serde",
  "serde_json",
@@ -1307,6 +1308,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]

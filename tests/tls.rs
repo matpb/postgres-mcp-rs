@@ -6,16 +6,16 @@ use std::time::Duration;
 
 use postgres_mcp::config::Config;
 use postgres_mcp::pg::pool::Pool;
-use postgres_mcp::pg::tls::{PemSource, SslMode, TlsSources, startup_client_config};
+use postgres_mcp::pg::tls::{PemSource, SslMode, TlsSources, client_config, startup_client_config};
 use postgres_mcp::pg::wire::{AuthPolicy, ConnectConfig, Connection, WireError};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
-use rustls::{RootCertStore, ServerConfig};
+use rustls::{ClientConfig, Error as TlsError, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const PASSWORD: &str = "tls-fake-pw-4c1";
 
@@ -622,4 +622,237 @@ async fn prefer_with_a_client_certificate_falls_back_to_plain_and_sends_none() {
     assert!(conn.is_ok(), "{:?}", conn.err());
     let served = task.await.expect("server");
     assert!(!served.handshake_done, "no TLS was negotiated");
+}
+
+/// Test addresses (RFC 5737) and a reserved DNS name that no certificate here lists.
+const PINNED_IP: &str = "192.0.2.10";
+const OTHER_IP: &str = "192.0.2.11";
+const OTHER_DNS: &str = "db.example.test";
+/// The refusal of a certificate that is not the pinned one: webpki sees a CA certificate as an end entity.
+const CA_AS_END_ENTITY: &str = "invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))";
+
+/// The name refusal webpki gives for a certificate that lists only `PINNED_IP`, when asked for `name`.
+fn name_refused(name: &str) -> String {
+    format!(
+        "invalid peer certificate: certificate not valid for name \"{name}\"; certificate is only valid for IpAddress({PINNED_IP})"
+    )
+}
+
+/// A self-signed CA:TRUE certificate: its PEM, its DER and the key that signed it.
+struct SelfSignedRoot {
+    pem: String,
+    der: CertificateDer<'static>,
+    key: KeyPair,
+}
+
+/// Parameters of a CA:TRUE certificate whose only subject alternative name is `ip`.
+fn root_params(common_name: &str, ip: &str) -> CertificateParams {
+    let mut params = CertificateParams::new(vec![ip.to_string()]).expect("root params");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    params
+}
+
+fn self_signed_root(params: CertificateParams) -> SelfSignedRoot {
+    let key = KeyPair::generate().expect("root key");
+    let cert = params.self_signed(&key).expect("root cert");
+    SelfSignedRoot {
+        pem: cert.pem(),
+        der: cert.der().clone(),
+        key,
+    }
+}
+
+fn key_der(key: &KeyPair) -> PrivateKeyDer<'static> {
+    PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key.serialize_der()))
+}
+
+fn pem_sources(pem: &str) -> TlsSources {
+    TlsSources {
+        root: Some(PemSource::Inline(pem.to_owned())),
+        client_cert: None,
+        client_key: None,
+    }
+}
+
+/// A TLS server with no PostgreSQL preamble: every accepted socket runs one handshake.
+async fn spawn_tls_only_server(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let tls = acceptor(chain, key);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let tls = tls.clone();
+            tokio::spawn(async move {
+                let _ = tls.accept(tcp).await;
+            });
+        }
+    });
+    port
+}
+
+/// One client handshake to `port` with `config`, checking the server name `server`. Ok, or the TLS error text.
+async fn handshake(port: u16, config: Arc<ClientConfig>, server: &str) -> Result<(), String> {
+    let server = ServerName::try_from(server.to_owned()).expect("server name");
+    let tcp = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    TlsConnector::from(config)
+        .connect(server, tcp)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            match e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<TlsError>())
+            {
+                Some(tls) => tls.to_string(),
+                None => panic!("handshake failed without a TLS error: {e}"),
+            }
+        })
+}
+
+#[tokio::test]
+async fn verify_ca_accepts_pinned_self_signed_root_certificate() {
+    let root = self_signed_root(root_params("pgmcp pinned root", PINNED_IP));
+    let ca = TempPem::write("pinned-verify-ca", &root.pem);
+    let (port, _task) = spawn_server(
+        Answer::Tls,
+        vec![root.der.clone()],
+        key_der(&root.key),
+        false,
+    )
+    .await;
+    let conn =
+        Connection::connect(&cfg(port, "127.0.0.1", SslMode::VerifyCa, Some(ca.path()))).await;
+    assert!(conn.is_ok(), "{:?}", conn.err());
+}
+
+#[tokio::test]
+async fn verify_full_accepts_pinned_self_signed_root_by_its_ip_name() {
+    let root = self_signed_root(root_params("pgmcp pinned root", PINNED_IP));
+    let port = spawn_tls_only_server(vec![root.der.clone()], key_der(&root.key)).await;
+    let file = TempPem::write("pinned-verify-full", &root.pem);
+    let from_file = client_config(SslMode::VerifyFull, Some(file.path())).expect("file roots");
+    assert_eq!(handshake(port, from_file, PINNED_IP).await, Ok(()));
+    let from_pem =
+        startup_client_config(SslMode::VerifyFull, &pem_sources(&root.pem)).expect("inline roots");
+    assert_eq!(handshake(port, from_pem, PINNED_IP).await, Ok(()));
+}
+
+#[tokio::test]
+async fn verify_full_refuses_pinned_self_signed_root_for_another_ip_or_dns_name() {
+    let root = self_signed_root(root_params("pgmcp pinned root", PINNED_IP));
+    let port = spawn_tls_only_server(vec![root.der.clone()], key_der(&root.key)).await;
+    let config =
+        startup_client_config(SslMode::VerifyFull, &pem_sources(&root.pem)).expect("inline roots");
+    assert_eq!(
+        handshake(port, config.clone(), OTHER_IP).await,
+        Err(name_refused(OTHER_IP))
+    );
+    assert_eq!(
+        handshake(port, config, OTHER_DNS).await,
+        Err(name_refused(OTHER_DNS))
+    );
+}
+
+#[tokio::test]
+async fn verify_modes_refuse_a_different_self_signed_root_with_the_same_subject() {
+    let pinned = self_signed_root(root_params("pgmcp pinned root", PINNED_IP));
+    let other = self_signed_root(root_params("pgmcp pinned root", PINNED_IP));
+    assert_ne!(pinned.der, other.der);
+    let ca = TempPem::write("different-verify-ca", &pinned.pem);
+    let (port, _task) = spawn_server(
+        Answer::Tls,
+        vec![other.der.clone()],
+        key_der(&other.key),
+        false,
+    )
+    .await;
+    let err = Connection::connect(&cfg(port, "127.0.0.1", SslMode::VerifyCa, Some(ca.path())))
+        .await
+        .expect_err_with("a different root certificate must be refused");
+    assert_eq!(err.to_string(), format!("TLS error: {CA_AS_END_ENTITY}"));
+
+    let port = spawn_tls_only_server(vec![other.der.clone()], key_der(&other.key)).await;
+    let config = startup_client_config(SslMode::VerifyFull, &pem_sources(&pinned.pem))
+        .expect("inline roots");
+    assert_eq!(
+        handshake(port, config, PINNED_IP).await,
+        Err(CA_AS_END_ENTITY.to_owned())
+    );
+}
+
+#[tokio::test]
+async fn pinned_root_outside_its_validity_period_is_refused_in_both_modes() {
+    // (not_before, not_after, the reason rustls reports)
+    let cases = [
+        ((2019, 1, 1), (2020, 1, 1), "Expired"),
+        ((2100, 1, 1), (2101, 1, 1), "NotValidYet"),
+    ];
+    for ((y1, m1, d1), (y2, m2, d2), reason) in cases {
+        let mut params = root_params("pgmcp pinned root", PINNED_IP);
+        params.not_before = rcgen::date_time_ymd(y1, m1, d1);
+        params.not_after = rcgen::date_time_ymd(y2, m2, d2);
+        let root = self_signed_root(params);
+        let port = spawn_tls_only_server(vec![root.der.clone()], key_der(&root.key)).await;
+        let expected = format!("invalid peer certificate: {reason}");
+        for mode in [SslMode::VerifyCa, SslMode::VerifyFull] {
+            let config =
+                startup_client_config(mode, &pem_sources(&root.pem)).expect("inline roots");
+            assert_eq!(
+                handshake(port, config, PINNED_IP).await,
+                Err(expected.clone()),
+                "{mode:?} with {reason}"
+            );
+        }
+    }
+}
+
+/// A CA:TRUE root for `PINNED_IP` signs a leaf for the same name; the CA is pinned.
+#[tokio::test]
+async fn verify_full_accepts_ca_signed_leaf_when_its_ca_is_pinned_and_refuses_another_name() {
+    let ca_key = KeyPair::generate().expect("ca key");
+    let ca_params = root_params("pgmcp pinned ca", PINNED_IP);
+    let ca_pem = ca_params.self_signed(&ca_key).expect("ca cert").pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let leaf = CertificateParams::new(vec![PINNED_IP.to_string()])
+        .expect("leaf params")
+        .signed_by(&leaf_key, &issuer)
+        .expect("leaf cert");
+    let port = spawn_tls_only_server(vec![leaf.der().clone()], key_der(&leaf_key)).await;
+    let config =
+        startup_client_config(SslMode::VerifyFull, &pem_sources(&ca_pem)).expect("inline roots");
+    assert_eq!(handshake(port, config.clone(), PINNED_IP).await, Ok(()));
+    assert_eq!(
+        handshake(port, config.clone(), OTHER_IP).await,
+        Err(name_refused(OTHER_IP))
+    );
+    assert_eq!(
+        handshake(port, config, OTHER_DNS).await,
+        Err(name_refused(OTHER_DNS))
+    );
+}
+
+#[tokio::test]
+async fn bundled_roots_refuse_a_self_signed_root_certificate() {
+    let root = self_signed_root(root_params("pgmcp pinned root", PINNED_IP));
+    let port = spawn_tls_only_server(vec![root.der.clone()], key_der(&root.key)).await;
+    let config =
+        startup_client_config(SslMode::VerifyFull, &TlsSources::default()).expect("bundled roots");
+    assert_eq!(
+        handshake(port, config, PINNED_IP).await,
+        Err(CA_AS_END_ENTITY.to_owned())
+    );
+    let config = client_config(SslMode::VerifyFull, None).expect("bundled roots");
+    assert_eq!(
+        handshake(port, config, PINNED_IP).await,
+        Err(CA_AS_END_ENTITY.to_owned())
+    );
 }

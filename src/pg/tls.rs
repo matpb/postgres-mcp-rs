@@ -15,9 +15,10 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{
-    ClientConfig, DigitallySignedStruct, Error as TlsError, InconsistentKeys, RootCertStore,
-    SignatureScheme,
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, InconsistentKeys,
+    RootCertStore, SignatureScheme,
 };
+use x509_parser::parse_x509_certificate;
 
 use crate::pg::wire::WireError;
 
@@ -118,10 +119,19 @@ pub fn startup_client_config(
     build_config(mode, roots, identity)
 }
 
-fn bundled_roots() -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    roots
+/// The trusted roots, and the certificates they were read from. The latter are pinned (see `Verifier`).
+struct Roots {
+    store: RootCertStore,
+    pinned: Vec<CertificateDer<'static>>,
+}
+
+fn bundled_roots() -> Roots {
+    let mut store = RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Roots {
+        store,
+        pinned: Vec::new(),
+    }
 }
 
 /// The setting name in a message: `base` for a file, `base_pem` for inline text.
@@ -173,29 +183,31 @@ impl RootsError {
     }
 }
 
-fn read_roots_file(path: &Path) -> Result<RootCertStore, RootsError> {
+fn read_roots_file(path: &Path) -> Result<Roots, RootsError> {
     let bytes = std::fs::read(path).map_err(RootsError::Open)?;
     roots_from_pem(&bytes)
 }
 
-fn startup_roots(source: &PemSource) -> Result<RootCertStore, String> {
+fn startup_roots(source: &PemSource) -> Result<Roots, String> {
     let item = item_name(source, "sslrootcert");
     let bytes = pem_bytes(source, &item)?;
     roots_from_pem(&bytes).map_err(|e| e.startup(&item))
 }
 
-fn roots_from_pem(bytes: &[u8]) -> Result<RootCertStore, RootsError> {
-    let mut roots = RootCertStore::empty();
+fn roots_from_pem(bytes: &[u8]) -> Result<Roots, RootsError> {
+    let mut store = RootCertStore::empty();
+    let mut pinned = Vec::new();
     for cert in CertificateDer::pem_slice_iter(bytes) {
         let cert = cert.map_err(|e| RootsError::Read(e.to_string()))?;
-        roots
-            .add(cert)
+        store
+            .add(cert.clone())
             .map_err(|e| RootsError::Add(e.to_string()))?;
+        pinned.push(cert);
     }
-    if roots.is_empty() {
+    if store.is_empty() {
         return Err(RootsError::Empty);
     }
-    Ok(roots)
+    Ok(Roots { store, pinned })
 }
 
 /// The client identity from the certificate and key sources: both or neither. None when neither is set.
@@ -243,18 +255,19 @@ fn is_encrypted_pem(bytes: &[u8]) -> bool {
 
 fn build_config(
     mode: SslMode,
-    roots: RootCertStore,
+    roots: Roots,
     identity: Option<Identity>,
 ) -> Result<Arc<ClientConfig>, String> {
-    let roots = Arc::new(roots);
+    let store = Arc::new(roots.store);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let webpki = WebPkiServerVerifier::builder_with_provider(roots.clone(), provider.clone())
+    let webpki = WebPkiServerVerifier::builder_with_provider(store.clone(), provider.clone())
         .build()
         .map_err(|e| e.to_string())?;
     let verifier = Verifier {
         mode,
         provider: provider.clone(),
-        roots,
+        roots: store,
+        pinned: roots.pinned,
         webpki,
     };
     let builder = ClientConfig::builder_with_provider(provider)
@@ -288,7 +301,64 @@ struct Verifier {
     mode: SslMode,
     provider: Arc<CryptoProvider>,
     roots: Arc<RootCertStore>,
+    /// The configured root certificates, compared byte for byte with the server certificate.
+    pinned: Vec<CertificateDer<'static>>,
     webpki: Arc<WebPkiServerVerifier>,
+}
+
+impl Verifier {
+    /// True when `end_entity` is byte for byte one of the configured root certificates.
+    fn is_pinned(&self, end_entity: &CertificateDer<'_>) -> bool {
+        self.pinned
+            .iter()
+            .any(|der| der.as_ref() == end_entity.as_ref())
+    }
+
+    /// The checks for a pinned certificate, its own trust anchor: validity period, then the server
+    /// name when `server_name` is given (VerifyFull).
+    fn verify_pinned(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        server_name: Option<&ServerName<'_>>,
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        check_validity(end_entity, now)?;
+        if let Some(name) = server_name {
+            let parsed = webpki::EndEntityCert::try_from(end_entity)
+                .map_err(|_| CertificateError::BadEncoding)?;
+            parsed
+                .verify_is_valid_for_subject_name(name)
+                .map_err(name_error)?;
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+}
+
+/// The validity period of a pinned certificate: notBefore <= now <= notAfter.
+fn check_validity(end_entity: &CertificateDer<'_>, now: UnixTime) -> Result<(), rustls::Error> {
+    let (_, cert) =
+        parse_x509_certificate(end_entity.as_ref()).map_err(|_| CertificateError::BadEncoding)?;
+    let validity = cert.validity();
+    let now = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+    if now < validity.not_before.timestamp() {
+        return Err(CertificateError::NotValidYet.into());
+    }
+    if now > validity.not_after.timestamp() {
+        return Err(CertificateError::Expired.into());
+    }
+    Ok(())
+}
+
+/// The name refusal as rustls reports it, with webpki's context.
+fn name_error(error: webpki::Error) -> rustls::Error {
+    match error {
+        webpki::Error::CertNotValidForName(context) => CertificateError::NotValidForNameContext {
+            expected: context.expected,
+            presented: context.presented,
+        }
+        .into(),
+        _ => CertificateError::NotValidForName.into(),
+    }
 }
 
 impl ServerCertVerifier for Verifier {
@@ -301,23 +371,33 @@ impl ServerCertVerifier for Verifier {
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         match self.mode {
-            SslMode::VerifyFull => self.webpki.verify_server_cert(
+            SslMode::VerifyFull => match self.webpki.verify_server_cert(
                 end_entity,
                 intermediates,
                 server_name,
                 ocsp_response,
                 now,
-            ),
+            ) {
+                Err(_) if self.is_pinned(end_entity) => {
+                    self.verify_pinned(end_entity, Some(server_name), now)
+                }
+                verdict => verdict,
+            },
             SslMode::VerifyCa => {
                 let parsed = end_entity.try_into()?;
-                verify_server_cert_signed_by_trust_anchor(
+                match verify_server_cert_signed_by_trust_anchor(
                     &parsed,
                     &self.roots,
                     intermediates,
                     now,
                     self.provider.signature_verification_algorithms.all,
-                )?;
-                Ok(ServerCertVerified::assertion())
+                ) {
+                    Ok(()) => Ok(ServerCertVerified::assertion()),
+                    Err(_) if self.is_pinned(end_entity) => {
+                        self.verify_pinned(end_entity, None, now)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             SslMode::Disable | SslMode::Prefer | SslMode::Require => {
                 Ok(ServerCertVerified::assertion())

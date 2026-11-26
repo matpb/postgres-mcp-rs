@@ -3,6 +3,12 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.8]
+
+### Fixed
+
+- `verify-ca` and `verify-full` accept a self-signed server certificate that is itself the configured root certificate, as libpq does. Its validity period is checked, and `verify-full` still checks the host name.
+
 ## [0.1.7]
 
 ### Changed
